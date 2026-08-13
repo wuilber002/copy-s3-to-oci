@@ -330,7 +330,11 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = session.get(Wave, wave_id)
     if not wave:
         raise HTTPException(status_code=404, detail="Wave not found")
-    by_state = dict(session.execute(select(ObjectRecord.state, func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave_id).group_by(ObjectRecord.state)))
+    by_state = dict(session.execute(
+        select(ObjectRecord.state, func.count(ObjectRecord.id))
+        .where(ObjectRecord.wave_id == wave_id)
+        .group_by(ObjectRecord.state)
+    ).all())
     total_objects, total_bytes = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.wave_id == wave_id)).one()
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
