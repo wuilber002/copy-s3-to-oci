@@ -2,10 +2,9 @@
 package_update: true
 packages:
   - git
-  - docker-engine
+  - podman
 
 runcmd:
-  - [ systemctl, enable, --now, docker ]
   - [ mkdir, -p, /opt/s3-oci-migration ]
   - [ bash, -lc, "git clone --depth 1 --branch '${bootstrap_ref}' '${bootstrap_repository}' /opt/s3-oci-migration/release || (rm -rf /opt/s3-oci-migration/release && git clone --depth 1 '${bootstrap_repository}' /opt/s3-oci-migration/release)" ]
   - [ bash, -lc, "if [ -x /opt/s3-oci-migration/release/scripts/bootstrap.sh ]; then /opt/s3-oci-migration/release/scripts/bootstrap.sh; fi" ]
