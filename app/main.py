@@ -164,6 +164,10 @@ class SourceCreate(BaseModel):
     destination_bucket: str
 
 
+class SourceUpdate(SourceCreate):
+    pass
+
+
 class InventoryItem(BaseModel):
     object_key: str
     size_bytes: int = Field(ge=0)
@@ -209,6 +213,10 @@ class RuntimeSettingsUpdate(BaseModel):
 
 class SimulationTaskUpdate(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
+
+
+class WaveAction(BaseModel):
+    reason: str = Field(min_length=3, max_length=1000)
 
 
 app = FastAPI(title="S3 to OCI Migration", version="0.3.0")
@@ -403,6 +411,23 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
     return {"id": source.id, "name": source.name, "status": source.status}
 
 
+@app.put("/api/sources/{source_id}")
+def update_source(source_id: int, payload: SourceUpdate, session: Session = Depends(get_session)) -> dict:
+    source = source_or_404(session, source_id)
+    objects = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id)) or 0
+    waves = session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)) or 0
+    if objects or waves:
+        raise HTTPException(status_code=409, detail="A source with inventory or waves is immutable to preserve auditability")
+    duplicate = session.scalar(select(Source.id).where(Source.name == payload.name, Source.id != source_id))
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Source name already exists")
+    for field, value in payload.model_dump().items():
+        setattr(source, field, value)
+    record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
+    session.commit()
+    return {"id": source.id, "name": source.name, "status": source.status}
+
+
 @app.post("/api/sources/{source_id}/inventory/import", status_code=201)
 def import_inventory(source_id: int, payload: InventoryImport, session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
@@ -563,18 +588,18 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
 
 
 @app.post("/api/waves/{wave_id}/pause")
-def pause_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+def pause_wave(wave_id: int, payload: WaveAction, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
     if wave.status == "PAUSED":
         return {"wave_id": wave.id, "status": wave.status}
     wave.status = "PAUSED"
-    record_event(session, "WAVE_PAUSED", f"Wave '{wave.name}' paused", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "WAVE_PAUSED", f"Wave '{wave.name}' paused: {payload.reason}", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
 
 @app.post("/api/waves/{wave_id}/resume")
-def resume_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+def resume_wave(wave_id: int, payload: WaveAction, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
     if wave.status != "PAUSED":
         raise HTTPException(status_code=409, detail="Only a paused wave can be resumed")
@@ -582,13 +607,13 @@ def resume_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
     if not queued:
         session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
-    record_event(session, "WAVE_RESUMED", f"Wave '{wave.name}' resumed", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "WAVE_RESUMED", f"Wave '{wave.name}' resumed: {payload.reason}", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
 
 @app.post("/api/waves/{wave_id}/reprocess")
-def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+def reprocess_wave(wave_id: int, payload: WaveAction, session: Session = Depends(get_session)) -> dict:
     """Queue a new controlled restore submission; no external call is made here."""
     wave = wave_or_404(session, wave_id)
     if wave.status == "PAUSED":
@@ -598,7 +623,7 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
         raise HTTPException(status_code=409, detail="This wave already has a queued or running task")
     wave.status = "READY_FOR_RESTORE"
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
-    record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}'", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}': {payload.reason}", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status, "message": "Restore task queued"}
 
