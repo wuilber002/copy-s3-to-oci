@@ -14,11 +14,13 @@ if [[ ! -f "$oci_runtime_config" ]]; then
   chmod 600 "$oci_runtime_config"
 fi
 
-# The initial password is deliberately local-only. The production installer
-# replaces it after reading the OCI Vault Secret through the instance principal.
+# Vault is the source of truth. A first boot materializes the Terraform-created
+# password locally without writing its value to a command line or service log.
 if [[ ! -s "$secret_root/postgres_password" ]]; then
-  openssl rand -base64 48 > "$secret_root/postgres_password"
-  chmod 600 "$secret_root/postgres_password"
+  python3 "$install_root/scripts/fetch-oci-secret.py" \
+    --runtime-config "$oci_runtime_config" \
+    --secret-name postgres_password \
+    --output "$secret_root/postgres_password"
 fi
 
 podman network exists s3-oci-migration 2>/dev/null || podman network create s3-oci-migration

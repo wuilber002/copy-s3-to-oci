@@ -22,6 +22,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, case, create_engine, func, inspect, select, text
+from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -380,7 +381,19 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
             status = "PLACEHOLDER" if content.startswith("REPLACE_THIS_PLACEHOLDER") else "CONFIGURED"
             if status == "CONFIGURED":
                 secret_values[secret_name] = content
-            checks.append({"name": f"Secret {secret_name}", "status": status, "detail": "valor preenchido; a validação funcional é exibida nos cartões AWS" if status == "CONFIGURED" else "placeholder ainda não substituído"})
+            detail = "valor preenchido; a validação funcional é exibida nos cartões AWS" if status == "CONFIGURED" else "placeholder ainda não substituído"
+            if secret_name == "postgres_password" and status == "CONFIGURED":
+                probe_engine = create_engine(URL.create("postgresql+psycopg", username="migration", password=content, host="postgres", port=5432, database="migration"), pool_pre_ping=True)
+                try:
+                    with probe_engine.connect() as connection:
+                        connection.execute(text("SELECT 1"))
+                    status = "VALIDATED"
+                    detail = "senha do Vault autenticada no PostgreSQL local"
+                except Exception as error:
+                    detail = f"valor preenchido, mas autenticação PostgreSQL falhou: {type(error).__name__}"
+                finally:
+                    probe_engine.dispose()
+            checks.append({"name": f"Secret {secret_name}", "status": status, "detail": detail})
         except Exception as error:
             checks.append({"name": f"Secret {secret_name}", "status": "FAILED", "detail": type(error).__name__})
 

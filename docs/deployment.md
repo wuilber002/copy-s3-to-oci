@@ -57,7 +57,9 @@ A configuração de runtime com os OCIDs é criada pelo cloud-init e montada som
 
 ### Secret `postgres_password`
 
-O valor esperado é uma senha aleatória de pelo menos 32 caracteres para o usuário local `migration` do PostgreSQL. Não é uma credencial AWS e não pode ser reutilizada. Na primeira inicialização, a VM gera uma senha local e inicializa o banco com ela; para que o Vault represente a configuração efetiva e possa apoiar recuperação operacional, a Secret deve receber uma cópia exata dessa senha. Não substitua a senha no Vault por um valor novo sem executar um procedimento coordenado de rotação do PostgreSQL, pois isso impediria a aplicação de se conectar ao banco.
+O Terraform gera uma senha aleatória de 48 caracteres para o usuário local `migration`, persiste-a no OCI Vault e a VM a lê com sua identidade dinâmica antes de inicializar o PostgreSQL. Não é uma credencial AWS, não é exibida na interface e não pode ser reutilizada. O arquivo local materializado tem permissão `0600` e apenas permite que a VM volte a iniciar sem depender de uma consulta ao Vault a cada reboot. Não altere a versão no Vault diretamente: a rotação deve atualizar coordenadamente o Vault, o PostgreSQL e o arquivo local com `scripts/sync-postgres-password-from-vault.sh`.
+
+Como o valor gerado pelo provider `random` fica no state do Terraform, o state do OCI Resource Manager deve permanecer restrito aos operadores autorizados do stack.
 
 Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. O discovery produtivo será feito por listagens S3 paginadas e não haverá cadastro manual de objetos pela interface. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
 

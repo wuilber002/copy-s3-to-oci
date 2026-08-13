@@ -44,12 +44,12 @@ locals {
       Do not enter a session token. This credential is used only to assume the migration role.
       See docs/aws-setup.md before replacing this value.
     EOT
-    postgres_password     = <<-EOT
-      REPLACE_THIS_PLACEHOLDER.
-      Replace with a randomly generated password of at least 32 characters for the local PostgreSQL application user.
-      This password is not an AWS credential and must not be reused elsewhere.
-    EOT
   }
+}
+
+resource "random_password" "postgres" {
+  length  = 48
+  special = false
 }
 
 resource "oci_kms_vault" "migration" {
@@ -70,7 +70,7 @@ resource "oci_kms_key" "migration" {
   }
 }
 
-resource "oci_vault_secret" "migration" {
+resource "oci_vault_secret" "aws" {
   for_each = local.secret_placeholders
 
   compartment_id = var.secrets_compartment_ocid
@@ -91,6 +91,36 @@ resource "oci_vault_secret" "migration" {
   lifecycle {
     ignore_changes = [secret_content]
   }
+}
+
+resource "oci_vault_secret" "postgres_password" {
+  compartment_id = var.secrets_compartment_ocid
+  secret_name    = "${var.resource_name_prefix}-postgres-password"
+  vault_id       = oci_kms_vault.migration.id
+  key_id         = oci_kms_key.migration.id
+  description    = "Automatically generated password for the local migration PostgreSQL user. Rotate only through the documented procedure."
+
+  secret_content {
+    content_type = "BASE64"
+    content      = base64encode(random_password.postgres.result)
+    name         = "terraform-generated"
+    stage        = "CURRENT"
+  }
+}
+
+moved {
+  from = oci_vault_secret.migration["aws_access_key_id"]
+  to   = oci_vault_secret.aws["aws_access_key_id"]
+}
+
+moved {
+  from = oci_vault_secret.migration["aws_secret_access_key"]
+  to   = oci_vault_secret.aws["aws_secret_access_key"]
+}
+
+moved {
+  from = oci_vault_secret.migration["postgres_password"]
+  to   = oci_vault_secret.postgres_password
 }
 
 resource "oci_core_instance" "migration" {
@@ -115,7 +145,10 @@ resource "oci_core_instance" "migration" {
       bootstrap_repository = var.bootstrap_repository
       bootstrap_ref        = var.bootstrap_ref
       oci_runtime_config = jsonencode({
-        secret_ocids = { for name, secret in oci_vault_secret.migration : name => secret.id }
+        secret_ocids = merge(
+          { for name, secret in oci_vault_secret.aws : name => secret.id },
+          { postgres_password = oci_vault_secret.postgres_password.id },
+        )
       })
     }))
   }
