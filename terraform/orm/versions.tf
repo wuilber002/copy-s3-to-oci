@@ -9,7 +9,7 @@ terraform {
   }
 }
 
-# OCI Resource Manager supplies Resource Principal credentials to this provider.
-provider "oci" {
-  auth = "ResourcePrincipal"
-}
+# OCI Resource Manager injects its own authentication into the OCI provider.
+# Do not set an auth method here; forcing ResourcePrincipal prevents ORM jobs
+# from using their managed credentials.
+provider "oci" {}
