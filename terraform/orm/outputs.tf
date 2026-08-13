@@ -32,3 +32,8 @@ output "policy_statement_count" {
   value       = var.create_oci_policy ? length(local.policy_statements) : 0
   description = "Policy statements created: two common statements plus one per destination-bucket compartment."
 }
+
+output "boot_volume_backup_policy_id" {
+  value       = local.effective_backup_policy_id
+  description = "Automatic boot-volume backup policy attached to the migration VM, if configured."
+}

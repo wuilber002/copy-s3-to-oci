@@ -14,7 +14,7 @@
    Para uma PoC em subnet pública, habilite `Assign public IP to VM` somente se a security list/NSG restringir a porta 22 à rede administrativa. Em subnet privada, mantenha desligado e use o bastion/VPN do cliente.
 3. Mantenha a criação de Vault, Key e Secrets: esses recursos são obrigatórios e sempre criados.
 4. Se criar policy, informe os buckets OCI de destino em `destination_buckets_json`. Agrupe buckets no mesmo compartment sempre que possível.
-5. Aplique o stack.
+5. Aplique o stack. Por padrão, ele cria e associa uma policy de backup incremental diário do boot volume, com retenção de 14 dias. É possível informar uma policy existente em vez disso.
 6. No Console OCI, crie uma nova versão para cada Secret, substituindo o placeholder pelo valor real. Não altere o placeholder via Terraform.
 7. Confirme que a policy automática de backup está associada ao boot volume.
 

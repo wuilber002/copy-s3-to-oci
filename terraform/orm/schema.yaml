@@ -35,6 +35,8 @@ groupings:
   - title: Recovery
     variables:
       - backup_policy_id
+      - create_boot_volume_backup_policy
+      - backup_policy_compartment_ocid
 variables:
   compartment_ocid:
     title: VM compartment
@@ -149,4 +151,16 @@ variables:
   backup_policy_id:
     title: Existing boot-volume backup policy OCID (optional)
     type: string
-    description: Assign an existing automatic backup policy. Leave blank only if the customer will attach one immediately after provisioning.
+    visible: ${create_boot_volume_backup_policy == false}
+    description: Assign an existing automatic backup policy when Terraform should not create one.
+  create_boot_volume_backup_policy:
+    title: Create automatic boot-volume backup policy
+    type: boolean
+    default: true
+    required: true
+    description: Creates and attaches a daily incremental backup policy retaining 14 days.
+  backup_policy_compartment_ocid:
+    title: Backup policy compartment (optional)
+    type: oci:identity:compartment:id
+    visible: ${create_boot_volume_backup_policy}
+    description: Leave blank to create the policy in the VM compartment.

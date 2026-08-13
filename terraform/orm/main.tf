@@ -29,6 +29,8 @@ locals {
 
   policy_statements = concat(local.common_policy_statements, local.object_storage_policy_statements)
 
+  effective_backup_policy_id = var.create_boot_volume_backup_policy ? oci_core_volume_backup_policy.migration[0].id : trimspace(var.backup_policy_id)
+
   secret_placeholders = {
     aws_access_key_id     = <<-EOT
       REPLACE_THIS_PLACEHOLDER.
@@ -160,8 +162,22 @@ resource "oci_identity_policy" "migration_vm" {
   }
 }
 
+resource "oci_core_volume_backup_policy" "migration" {
+  count          = var.create_boot_volume_backup_policy ? 1 : 0
+  compartment_id = trimspace(var.backup_policy_compartment_ocid) != "" ? var.backup_policy_compartment_ocid : var.compartment_ocid
+  display_name   = "${var.resource_name_prefix}-boot-volume-backup"
+
+  schedules {
+    backup_type       = "INCREMENTAL"
+    period            = "ONE_DAY"
+    retention_seconds = 1209600 # 14 days
+    hour_of_day       = 2
+    time_zone         = "UTC"
+  }
+}
+
 resource "oci_core_volume_backup_policy_assignment" "boot_volume" {
-  count     = trimspace(var.backup_policy_id) != "" ? 1 : 0
+  count     = var.create_boot_volume_backup_policy || trimspace(var.backup_policy_id) != "" ? 1 : 0
   asset_id  = oci_core_instance.migration.boot_volume_id
-  policy_id = var.backup_policy_id
+  policy_id = local.effective_backup_policy_id
 }

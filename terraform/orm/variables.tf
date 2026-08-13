@@ -141,7 +141,19 @@ variable "destination_buckets_json" {
 }
 
 variable "backup_policy_id" {
-  description = "Optional existing OCI boot-volume backup policy OCID. Leave blank to configure it manually after provisioning."
+  description = "Optional existing OCI boot-volume backup policy OCID. Used only when create_boot_volume_backup_policy is false."
+  type        = string
+  default     = ""
+}
+
+variable "create_boot_volume_backup_policy" {
+  description = "Create and attach a daily OCI boot-volume backup policy with 14-day retention."
+  type        = bool
+  default     = true
+}
+
+variable "backup_policy_compartment_ocid" {
+  description = "Compartment where the new boot-volume backup policy is created."
   type        = string
   default     = ""
 }

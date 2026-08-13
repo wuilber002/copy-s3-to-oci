@@ -1,0 +1,23 @@
+name: Validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.0
+      - name: Compile Python application
+        run: python3 -m py_compile app/main.py
+      - name: Format Terraform
+        run: terraform -chdir=terraform/orm fmt -check
+      - name: Initialize Terraform without backend
+        run: terraform -chdir=terraform/orm init -backend=false
+      - name: Validate Terraform
+        run: terraform -chdir=terraform/orm validate
