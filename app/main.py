@@ -76,6 +76,9 @@ class Source(Base):
     aws_region: Mapped[str] = mapped_column(String(64))
     destination_bucket: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="CONFIGURED")
+    discovery_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    discovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    discovery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="source")
     waves: Mapped[list[Wave]] = relationship(back_populates="source")
@@ -115,6 +118,11 @@ class Wave(Base):
     restore_days: Mapped[int] = mapped_column(Integer)
     restore_tier: Mapped[str] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(32), default="DRAFT")
+    batch_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    manifest_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    poll_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     source: Mapped[Source] = relationship(back_populates="waves")
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="wave")
@@ -161,6 +169,9 @@ class RuntimeSettings(Base):
     simulation_enabled: Mapped[bool] = mapped_column(default=False)
     aws_migration_role_arn: Mapped[str] = mapped_column(String(2048), default="")
     aws_batch_role_arn: Mapped[str] = mapped_column(String(2048), default="")
+    aws_control_bucket: Mapped[str] = mapped_column(String(255), default="")
+    aws_control_prefix: Mapped[str] = mapped_column(String(1024), default="s3-oci-control/")
+    real_worker_enabled: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -221,6 +232,9 @@ class RuntimeSettingsUpdate(BaseModel):
     simulation_enabled: bool = False
     aws_migration_role_arn: str = Field(default="", max_length=2048, pattern=r"^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/.+")
     aws_batch_role_arn: str = Field(default="", max_length=2048, pattern=r"^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/.+")
+    aws_control_bucket: str = Field(default="", max_length=255, pattern=r"^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+    aws_control_prefix: str = Field(default="s3-oci-control/", max_length=1024)
+    real_worker_enabled: bool = False
 
 
 class SimulationTaskUpdate(BaseModel):
@@ -239,7 +253,7 @@ class IntegrityEvidence(BaseModel):
     error: str | None = Field(default=None, max_length=4000)
 
 
-app = FastAPI(title="S3 to OCI Migration", version="0.3.0")
+app = FastAPI(title="S3 to OCI Migration", version="0.4.0")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
@@ -259,8 +273,15 @@ def create_schema() -> None:
     runtime_columns = {
         "aws_migration_role_arn": "VARCHAR(2048) NOT NULL DEFAULT ''",
         "aws_batch_role_arn": "VARCHAR(2048) NOT NULL DEFAULT ''",
+        "aws_control_bucket": "VARCHAR(255) NOT NULL DEFAULT ''",
+        "aws_control_prefix": "VARCHAR(1024) NOT NULL DEFAULT 's3-oci-control/'",
+        "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
+    existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
+    existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
     with engine.begin() as connection:
         for column, sql_type in expected_columns.items():
             if column not in existing_columns:
@@ -268,6 +289,12 @@ def create_schema() -> None:
         for column, sql_type in runtime_columns.items():
             if column not in existing_runtime_columns:
                 connection.execute(text(f"ALTER TABLE runtime_settings ADD COLUMN {column} {sql_type}"))
+        for column, sql_type in source_columns.items():
+            if column not in existing_source_columns:
+                connection.execute(text(f"ALTER TABLE sources ADD COLUMN {column} {sql_type}"))
+        for column, sql_type in wave_columns.items():
+            if column not in existing_wave_columns:
+                connection.execute(text(f"ALTER TABLE waves ADD COLUMN {column} {sql_type}"))
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -314,7 +341,8 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "default_wave_size_bytes": settings.default_wave_size_bytes, "default_restore_days": settings.default_restore_days,
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
             "simulation_enabled": settings.simulation_enabled, "aws_migration_role_arn": settings.aws_migration_role_arn,
-            "aws_batch_role_arn": settings.aws_batch_role_arn, "updated_at": settings.updated_at}
+            "aws_batch_role_arn": settings.aws_batch_role_arn, "aws_control_bucket": settings.aws_control_bucket,
+            "aws_control_prefix": settings.aws_control_prefix, "real_worker_enabled": settings.real_worker_enabled, "updated_at": settings.updated_at}
 
 
 def read_oci_runtime_config() -> dict:
@@ -402,6 +430,8 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
     batch_role_arn = settings.aws_batch_role_arn.strip()
     checks.append({"name": "Configuração role AWS de migração", "status": "CONFIGURED" if migration_role_arn else "NOT_CONFIGURED", "detail": "ARN preenchido na tela Configurações" if migration_role_arn else "preencha o ARN na tela Configurações"})
     checks.append({"name": "Configuração role AWS Batch Operations", "status": "CONFIGURED" if batch_role_arn else "NOT_CONFIGURED", "detail": "ARN preenchido; validação ocorrerá ao criar o primeiro job" if batch_role_arn else "preencha o ARN na tela Configurações"})
+    control_bucket = settings.aws_control_bucket.strip()
+    checks.append({"name": "Bucket AWS de controle", "status": "CONFIGURED" if control_bucket else "NOT_CONFIGURED", "detail": "bucket configurado; a autorização será testada sem gravar objetos" if control_bucket else "preencha o bucket de manifestos e relatórios"})
     aws_required = ["aws_access_key_id", "aws_secret_access_key"]
     if all(name in secret_values for name in aws_required) and migration_role_arn:
         try:
@@ -409,12 +439,23 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
             aws_region = session.scalar(select(Source.aws_region).order_by(Source.id)) or "us-east-1"
             sts = boto3.client("sts", region_name=aws_region, aws_access_key_id=secret_values["aws_access_key_id"], aws_secret_access_key=secret_values["aws_secret_access_key"])
             sts.get_caller_identity()
-            sts.assume_role(RoleArn=migration_role_arn, RoleSessionName="s3-oci-readiness", DurationSeconds=900)
+            assumed = sts.assume_role(RoleArn=migration_role_arn, RoleSessionName="s3-oci-readiness", DurationSeconds=900)["Credentials"]
             for check in checks:
                 if check["name"] in {"Secret aws_access_key_id", "Secret aws_secret_access_key", "Configuração role AWS de migração"}:
                     check["status"] = "VALIDATED"
                     check["detail"] = "validada no teste AWS STS e AssumeRole"
             checks.append({"name": "Credenciais AWS e role de migração", "status": "VALIDATED", "detail": "GetCallerIdentity e AssumeRole concluídos"})
+            if control_bucket:
+                try:
+                    s3 = boto3.client("s3", region_name=aws_region, aws_access_key_id=assumed["AccessKeyId"], aws_secret_access_key=assumed["SecretAccessKey"], aws_session_token=assumed["SessionToken"])
+                    s3.head_bucket(Bucket=control_bucket)
+                    for check in checks:
+                        if check["name"] == "Bucket AWS de controle":
+                            check["status"], check["detail"] = "VALIDATED", "HeadBucket concluído; sem escrita"
+                except Exception as error:
+                    for check in checks:
+                        if check["name"] == "Bucket AWS de controle":
+                            check["status"], check["detail"] = "CONFIGURED", f"configurado, mas HeadBucket falhou: {type(error).__name__}"
         except Exception as error:
             checks.append({"name": "Credenciais AWS e role de migração", "status": "CONFIGURED", "detail": f"preenchidas, mas teste falhou: {type(error).__name__}"})
     else:
@@ -476,7 +517,9 @@ def update_settings(payload: RuntimeSettingsUpdate, session: Session = Depends(g
 @app.get("/api/sources")
 def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
-             "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status}
+             "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
+             "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
+             "discovery_error": s.discovery_error}
             for s in session.scalars(select(Source).order_by(Source.id))]
 
 
@@ -528,6 +571,22 @@ def import_inventory(source_id: int, payload: InventoryImport, session: Session 
     return {"inserted": inserted, "skipped_duplicates": len(payload.items) - inserted}
 
 
+@app.post("/api/sources/{source_id}/discovery")
+def request_discovery(source_id: int, session: Session = Depends(get_session)) -> dict:
+    source = source_or_404(session, source_id)
+    if source.status == "DISCOVERING":
+        raise HTTPException(status_code=409, detail="Discovery already running for this source")
+    if session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)):
+        raise HTTPException(status_code=409, detail="Discovery is immutable after waves are created")
+    source.status = "DISCOVERY_QUEUED"
+    source.discovery_requested_at = utcnow()
+    source.discovery_completed_at = None
+    source.discovery_error = None
+    record_event(session, "DISCOVERY_QUEUED", f"AWS discovery queued for source '{source.name}'", source_id=source.id)
+    session.commit()
+    return {"source_id": source.id, "status": source.status}
+
+
 @app.get("/api/sources/{source_id}/summary")
 def source_summary(source_id: int, session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
@@ -537,7 +596,10 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
         .where(ObjectRecord.source_id == source_id)
         .group_by(ObjectRecord.state)
     ).all())
-    return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states}
+    source = source_or_404(session, source_id)
+    return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states,
+            "discovery": {"status": source.status, "requested_at": source.discovery_requested_at,
+                          "completed_at": source.discovery_completed_at, "error": source.discovery_error}}
 
 
 @app.get("/api/sources/{source_id}/inventory")
@@ -644,7 +706,8 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
         .order_by(Wave.id)
     )
     return [{"id": wave.id, "name": wave.name, "status": wave.status, "restore_tier": wave.restore_tier,
-             "restore_days": wave.restore_days, "objects": count, "bytes": size} for wave, count, size in rows]
+             "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
+             "last_poll_at": wave.last_poll_at} for wave, count, size in rows]
 
 
 @app.get("/api/waves/{wave_id}/objects")
@@ -696,6 +759,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
         ).where(ObjectRecord.wave_id == wave_id)
     ).one()
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
+            "batch": {"job_id": wave.batch_job_id, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 

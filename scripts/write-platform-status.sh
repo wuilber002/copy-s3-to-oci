@@ -31,11 +31,12 @@ if [[ -n "$latest_backup" ]]; then
 fi
 
 temporary_file=$(mktemp "$runtime_root/status.XXXXXX")
-printf '{"available":true,"generated_at":"%s","services":{"migration_systemd":"%s","postgres_container":"%s","app_container":"%s","postgres_backup_timer":"%s","platform_status_timer":"%s","simulated_worker":"%s"},"last_postgres_backup":%s}\n' \
+printf '{"available":true,"generated_at":"%s","services":{"migration_systemd":"%s","postgres_container":"%s","app_container":"%s","real_worker":"%s","postgres_backup_timer":"%s","platform_status_timer":"%s","simulated_worker":"%s"},"last_postgres_backup":%s}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   "$(unit_state s3-oci-migration.service)" \
   "$(container_state s3-oci-postgres)" \
   "$(container_state s3-oci-app)" \
+  "$(container_state s3-oci-real-worker)" \
   "$(unit_state s3-oci-backup-postgres.timer)" \
   "$(unit_state s3-oci-platform-status.timer)" \
   "$(unit_state s3-oci-simulated-worker.service)" \

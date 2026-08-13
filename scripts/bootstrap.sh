@@ -24,7 +24,7 @@ if [[ ! -s "$secret_root/postgres_password" ]]; then
 fi
 
 podman network exists s3-oci-migration 2>/dev/null || podman network create s3-oci-migration
-podman rm -f s3-oci-app s3-oci-postgres 2>/dev/null || true
+podman rm -f s3-oci-app s3-oci-postgres s3-oci-real-worker 2>/dev/null || true
 
 podman run -d --name s3-oci-postgres --replace --restart unless-stopped \
   --network s3-oci-migration --network-alias postgres \
@@ -54,6 +54,17 @@ podman run -d --name s3-oci-app --replace --restart unless-stopped \
   -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,Z" \
   localhost/s3-oci-migration:latest
 
+# Kept separate from the API: cloud calls are made only by this durable worker.
+# It remains idle until the operator explicitly enables it in the web console.
+podman run -d --name s3-oci-real-worker --replace --restart unless-stopped \
+  --network s3-oci-migration \
+  -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
+  -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
+  -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
+  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,Z" \
+  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,Z" \
+  localhost/s3-oci-migration:latest python3 -m app.real_worker
+
 cat >/etc/systemd/system/s3-oci-migration.service <<'EOF'
 [Unit]
 Description=S3 to OCI migration platform
@@ -64,7 +75,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/s3-oci-migration/release/scripts/bootstrap.sh
-ExecStop=/usr/bin/podman stop -t 30 s3-oci-app s3-oci-postgres
+ExecStop=/usr/bin/podman stop -t 30 s3-oci-app s3-oci-real-worker s3-oci-postgres
 
 [Install]
 WantedBy=multi-user.target

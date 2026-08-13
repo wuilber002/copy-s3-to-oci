@@ -25,7 +25,7 @@ Insira a access key e a secret access key nos Secrets OCI correspondentes. Não 
 
 Crie a role indicada no campo **ARN da role AWS de migração** em **Configurações**. A trust policy deve autorizar o principal de bootstrap a executar `sts:AssumeRole`.
 
-A policy de permissões da role deve ser limitada ao bucket e prefixo de origem. Inclua `s3:ListBucket`, `s3:GetBucketLocation`, `s3:GetObject`, `s3:GetObjectVersion` quando houver versionamento, e `s3:RestoreObject` para conteúdo Glacier.
+A policy de permissões da role deve ser limitada ao bucket e prefixo de origem. Inclua `s3:ListBucket`, `s3:GetBucketLocation`, `s3:GetObject`, `s3:GetObjectVersion` quando houver versionamento, `s3:GetObjectTagging` e `s3:RestoreObject` para conteúdo Glacier.
 
 ## 3. Role do S3 Batch Operations
 

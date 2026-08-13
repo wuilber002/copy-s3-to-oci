@@ -10,7 +10,7 @@ O procedimento de recursos AWS por AWS CloudShell/CLI está em [docs/aws-cli-set
 
 A console separa o trabalho em **Painel** (status e alertas do dia a dia), **Migrações** (fontes, inventário, ondas, fila e auditoria) e **Configurações** (ícone de engrenagem; parâmetros globais e pré-check OCI).
 
-Ela não executa chamadas AWS ou OCI a partir do navegador. Os adaptadores/workers de discovery, S3 Batch Operations, restore, transferência e verificação de integridade ainda serão conectados quando as credenciais e os recursos AWS estiverem disponíveis.
+Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker AWS/OCI real** executa discovery, S3 Batch Operations, polling, cópia e verificação; por segurança começa instalado, porém ocioso. A operação externa só começa após configurar a AWS, preencher o bucket de controle e habilitá-lo explicitamente em **Configurações**.
 
 ## Garantias de desenho
 
@@ -19,7 +19,8 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. Os adaptadores/worke
 - Vault, Key e Secrets OCI sempre criados pelo Terraform, com placeholders instrutivos.
 - Credenciais AWS de bootstrap somente com access key/secret key; a aplicação assume uma role AWS de menor privilégio.
 - Restore em lote via S3 Batch Operations; chamadas AWS por objeto são evitadas sempre que houver alternativa bulk.
-- Evidência de integridade por objeto: checksum de origem e destino, algoritmo, data de verificação e falha são persistidos no PostgreSQL. O worker real usará SHA-256 em streaming; ETag S3 não é tratado como MD5 universal.
+- Evidência de integridade por objeto: checksum SHA-256 calculado na leitura da origem e novamente no objeto OCI, algoritmo, data de verificação e falha são persistidos no PostgreSQL. ETag S3 não é tratado como MD5 universal.
+- Metadados S3 são copiados para metadados OCI quando compatíveis; tags são preservadas integralmente no PostgreSQL e em uma representação JSON limitada nos metadados OCI.
 - Ondas de no máximo 10 TB; referência inicial de VM: 8 OCPUs, 32 GB RAM e 500 GB de boot volume.
 
 ## Estrutura

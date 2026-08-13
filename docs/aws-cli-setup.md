@@ -132,13 +132,13 @@ cat >"$WORKDIR/migration-policy.json" <<EOF
     {
       "Sid": "ReadAndRestoreSourceObjects",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:RestoreObject"],
+      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging", "s3:RestoreObject"],
       "Resource": "${SOURCE_OBJECT_ARN}"
     },
     {
       "Sid": "LocateControlBucket",
       "Effect": "Allow",
-      "Action": "s3:GetBucketLocation",
+      "Action": ["s3:ListBucket", "s3:GetBucketLocation"],
       "Resource": "${CONTROL_BUCKET_ARN}"
     },
     {

@@ -43,7 +43,7 @@ A console é o plano de controle local e persiste suas operações no PostgreSQL
 
 Os formulários e indicadores principais possuem ícones `i` de ajuda contextual. Eles descrevem limites, impacto operacional e, quando aplicável, impactos de custo e prazo de restore. A ajuda está disponível por mouse e teclado.
 
-Os parâmetros operacionais são persistidos no PostgreSQL. O worker simulado é uma ferramenta de PoC: fica instalado, mas inerte por padrão, e só processa tarefas quando a opção explícita for habilitada pela console. Ele nunca chama AWS ou OCI; apenas percorre os estados fictícios de restore, polling e transferência para validar leases, retomada e auditoria.
+Os parâmetros operacionais são persistidos no PostgreSQL. O **worker AWS/OCI real** é um container separado da API e fica inerte por padrão; somente depois da habilitação explícita ele assume discovery e tarefas duráveis de restore, polling e transferência. O worker simulado é uma ferramenta de PoC e nunca chama AWS ou OCI.
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 
@@ -61,7 +61,9 @@ O Terraform gera uma senha aleatória de 48 caracteres para o usuário local `mi
 
 Como o valor gerado pelo provider `random` fica no state do Terraform, o state do OCI Resource Manager deve permanecer restrito aos operadores autorizados do stack.
 
-Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. O discovery produtivo será feito por listagens S3 paginadas e não haverá cadastro manual de objetos pela interface. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
+O discovery produtivo usa somente `ListObjectsV2` paginado: registra chave, tamanho, ETag, classe de armazenamento e última modificação sem restaurar, baixar, fazer `HeadObject` ou listar tags. Metadados e tags são lidos somente no momento da cópia de cada objeto já restaurado. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
+
+Em caso de desligamento, reinicie `s3-oci-migration.service`. PostgreSQL mantém inventário, fila, leases e evidências; tarefas com lease expirado são reassumidas pelo worker. O backup lógico diário é complementar ao backup de volume OCI e pode ser restaurado conforme o procedimento de recuperação desta documentação.
 
 ## Instalação de release
 

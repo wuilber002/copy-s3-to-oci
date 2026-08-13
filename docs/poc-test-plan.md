@@ -24,13 +24,13 @@ Validar o ciclo completo sem gerar custo de recuperação durante discovery e an
 ## Roteiro
 
 1. Cadastrar a origem, a role AWS de migração e o bucket/prefixo de controle de S3 Batch Operations.
-2. Executar discovery e registrar a quantidade, tamanhos, chaves, versão, ETag, metadata e tags retornadas pelo S3.
+2. Executar discovery e registrar quantidade, tamanhos, chaves, ETag, classe e última modificação retornados pela listagem S3.
 3. Conferir que discovery não executou `GetObject`, `RestoreObject` ou `HeadObject` por objeto.
 4. Criar uma onda contendo todo o inventário e gerar o manifesto CSV imutável.
 5. Criar uma única S3 Batch Operations Restore job em modo Bulk.
 6. Acompanhar a job com backoff; depois acompanhar disponibilidade com listagens paginadas que incluam `RestoreStatus`.
 7. Durante o restore, reiniciar a VM uma vez e confirmar que a job e o estado local são retomados sem criar uma nova job de restore.
-8. Transferir os objetos restaurados em streaming para OCI e calcular SHA-256/MD5 durante a leitura.
+8. Transferir os objetos restaurados em streaming para OCI, capturar metadados/tags e calcular SHA-256 durante a leitura; baixar o objeto OCI uma vez para calcular e comparar o SHA-256 de destino.
 9. Durante a transferência, reiniciar a VM uma vez; confirmar retomada idempotente, sem marcar objetos incompletos como concluídos.
 10. Executar reconciliação final.
 
@@ -38,7 +38,7 @@ Validar o ciclo completo sem gerar custo de recuperação durante discovery e an
 
 - 17.277 objetos descobertos e 17.277 objetos verificados no OCI;
 - soma de bytes de origem e destino idêntica;
-- SHA-256 idêntico por objeto; MD5 registrado para auditoria;
+- SHA-256 idêntico por objeto;
 - chaves dos objetos preservadas;
 - metadata/tags preservados no objeto OCI quando compatíveis e sempre preservados no manifesto;
 - uma única Batch Operations job de restore para a onda;
