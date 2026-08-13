@@ -31,3 +31,5 @@ Depois, acesse `http://127.0.0.1:8080`. A porta da aplicação não deve ser lib
 ## Instalação de release
 
 O procedimento final baixa uma release versionada do GitHub e verifica o checksum antes da instalação. A release inclui imagens Docker e dependências; a VM não depende de Docker Hub, PyPI ou `apt` durante a instalação ou execução.
+
+Na Oracle Linux, o bootstrap utiliza Podman nativo e registra `s3-oci-migration.service` no systemd. Os containers `s3-oci-postgres` e `s3-oci-app` usam volumes persistentes no boot volume. A API é publicada apenas em `127.0.0.1:8080`.

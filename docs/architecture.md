@@ -20,13 +20,17 @@ Para o caso inicial de 600 TB, ondas de 10 TB e rota de 1,2 Gbps:
 | Recurso | Recomendação |
 | --- | --- |
 | Shape | VM.Standard.E5.Flex, ou flex x86 equivalente disponível |
-| CPU | 8 OCPUs |
-| Memória | 32 GB |
+| CPU | 8 OCPUs em produção; 2 OCPUs na PoC de 220 MB |
+| Memória | 32 GB em produção; 8 GB na PoC de 220 MB |
 | Boot volume | 500 GB |
 | Workers de transferência iniciais | 4 |
 
 Em 1,2 Gbps, 10 TB levam cerca de 18,5 h no limite teórico; planeje 22–30 h. A retenção padrão de restore deve ser 4 dias.
 
+O tamanho mínimo de laboratório é 2 OCPUs/8 GB. Ele suporta PostgreSQL, a interface e poucos workers para validar o fluxo, mas não é indicado para ondas de 10 TB nem para usar todo o link de 1,2 Gbps.
+
 ## Recuperação
 
 PostgreSQL, backups lógicos locais, WAL, logs e releases residem no boot volume persistente. Uma policy automática de backup do boot volume deve ser associada à VM, com retenção mínima de 14 dias. Backup local acelera restauração, mas o backup do volume protege contra perda da VM ou do disco.
+
+O `user_data` do cloud-init é intencionalmente ignorado em atualizações Terraform: ele só executa no primeiro boot. Uma atualização de release nunca pode substituir uma VM que contém o banco de controle.
