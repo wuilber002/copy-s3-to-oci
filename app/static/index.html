@@ -43,11 +43,11 @@
   <main id="view-migrations" class="view">
   <section class="card"><h2>Nova origem</h2>
     <form id="source-form" class="grid">
-      <input id="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,127}" placeholder="Nome (ex.: arquivo-legado)">
-      <input id="bucket" required placeholder="Bucket S3">
-      <input id="prefix" placeholder="Prefixo S3 (opcional)">
-      <input id="region" required placeholder="Região AWS (ex.: us-east-1)">
-      <input id="dest" required placeholder="Bucket OCI de destino">
+      <label class="field">Nome da origem <span class="help" tabindex="0" data-help="Nome interno e único para identificar esta migração. Não altera o bucket S3 nem cria recursos na AWS. Use letras, números, hífen ou sublinhado.">i</span><input id="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,127}" placeholder="Ex.: arquivo-legado"></label>
+      <label class="field">Bucket S3 <span class="help" tabindex="0" data-help="Nome exato do bucket AWS S3 que contém os objetos de origem. Não inclua s3://, barras ou o prefixo neste campo.">i</span><input id="bucket" required placeholder="Ex.: meu-bucket-origem"></label>
+      <label class="field">Prefixo S3 (opcional) <span class="help" tabindex="0" data-help="Restringe a migração a uma ‘pasta lógica’ dentro do bucket, por exemplo dados/2024/. Deixe vazio para considerar todo o bucket. Prefixos não são diretórios reais no S3.">i</span><input id="prefix" placeholder="Ex.: dados/2024/"></label>
+      <label class="field">Região AWS <span class="help" tabindex="0" data-help="Região onde o bucket S3 está localizado, por exemplo us-east-1 ou sa-east-1. Ela é necessária para criar o cliente AWS, o restore em lote e as chamadas de baixo custo corretamente.">i</span><input id="region" required placeholder="Ex.: us-east-1"></label>
+      <label class="field">Bucket OCI de destino <span class="help" tabindex="0" data-help="Nome exato do bucket OCI Object Storage que receberá os objetos. Ele deve existir, estar incluído na policy da VM e passar no pré-check OCI antes da migração real.">i</span><input id="dest" required placeholder="Ex.: bucket-destino"></label>
       <button>Cadastrar origem</button>
     </form>
   </section>
