@@ -173,4 +173,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now s3-oci-simulated-worker.service
+# The simulated worker requires this service. Do not synchronously wait for it
+# here or systemd would wait for this oneshot unit to finish before it can mark
+# the dependency active. The non-blocking start runs after this unit is active.
+systemctl enable s3-oci-simulated-worker.service
+systemctl start --no-block s3-oci-simulated-worker.service
