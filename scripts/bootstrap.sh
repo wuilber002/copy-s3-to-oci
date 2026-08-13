@@ -57,12 +57,18 @@ podman run -d --name s3-oci-app --replace --restart unless-stopped \
 # The API startup performs safe additive schema migrations. Wait for it before
 # starting the worker, otherwise a freshly deployed worker could query a new
 # column a few seconds before that migration has completed.
+app_ready=false
 for attempt in $(seq 1 30); do
   if curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null; then
+    app_ready=true
     break
   fi
   sleep 2
 done
+if [[ "$app_ready" != true ]]; then
+  echo "API did not become healthy; real worker will not start" >&2
+  exit 1
+fi
 
 # Kept separate from the API: cloud calls are made only by this durable worker.
 # It remains idle until the operator explicitly enables it in the web console.
