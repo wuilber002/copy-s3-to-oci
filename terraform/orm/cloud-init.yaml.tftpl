@@ -4,6 +4,13 @@ packages:
   - git
   - podman
 
+write_files:
+  - path: /etc/s3-oci-migration/oci-runtime.json
+    owner: root:root
+    permissions: '0600'
+    content: |
+      ${oci_runtime_config}
+
 runcmd:
   - [ mkdir, -p, /opt/s3-oci-migration ]
   - [ bash, -lc, "git clone --depth 1 --branch '${bootstrap_ref}' '${bootstrap_repository}' /opt/s3-oci-migration/release || (rm -rf /opt/s3-oci-migration/release && git clone --depth 1 '${bootstrap_repository}' /opt/s3-oci-migration/release)" ]

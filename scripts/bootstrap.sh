@@ -5,9 +5,14 @@ install_root=/opt/s3-oci-migration/release
 data_root=/var/lib/s3-oci-migration
 secret_root=/etc/s3-oci-migration/secrets
 runtime_root=/run/s3-oci-migration
+oci_runtime_config=/etc/s3-oci-migration/oci-runtime.json
 
 mkdir -p "$data_root/postgres" "$secret_root" "$runtime_root"
 chmod 700 "$secret_root"
+if [[ ! -f "$oci_runtime_config" ]]; then
+  printf '{"secret_ocids":{}}\n' >"$oci_runtime_config"
+  chmod 600 "$oci_runtime_config"
+fi
 
 # The initial password is deliberately local-only. The production installer
 # replaces it after reading the OCI Vault Secret through the instance principal.
@@ -41,8 +46,10 @@ podman run -d --name s3-oci-app --replace --restart unless-stopped \
   -p 127.0.0.1:8080:8080 \
   -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
+  -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
   -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,Z" \
   -v "$runtime_root:/run/platform-status:ro,Z" \
+  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,Z" \
   localhost/s3-oci-migration:latest
 
 cat >/etc/systemd/system/s3-oci-migration.service <<'EOF'

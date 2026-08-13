@@ -14,6 +14,7 @@ import os
 import csv
 import io
 import json
+import base64
 import shutil
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -37,6 +38,7 @@ database_url = os.environ["DATABASE_URL"]
 password = read_secret(os.environ["POSTGRES_PASSWORD_FILE"])
 database_url = database_url.replace("migration@", f"migration:{password}@")
 platform_status_file = os.environ.get("PLATFORM_STATUS_FILE", "/run/platform-status/status.json")
+oci_runtime_config_file = os.environ.get("OCI_RUNTIME_CONFIG_FILE", "/run/oci-runtime/oci-runtime.json")
 engine = create_engine(database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
@@ -264,6 +266,11 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "simulation_enabled": settings.simulation_enabled, "updated_at": settings.updated_at}
 
 
+def read_oci_runtime_config() -> dict:
+    with open(oci_runtime_config_file, encoding="utf-8") as config_file:
+        return json.load(config_file)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     with open("app/static/index.html", encoding="utf-8") as page:
@@ -290,6 +297,53 @@ def platform_status() -> dict:
             "services": {},
             "last_postgres_backup": None,
         }
+
+
+@app.get("/api/readiness")
+def oci_readiness(session: Session = Depends(get_session)) -> dict:
+    """Explicit OCI pre-check. It returns only readiness states, never secret values."""
+    checks: list[dict] = []
+    try:
+        runtime_config = read_oci_runtime_config()
+        secret_ocids = runtime_config.get("secret_ocids", {})
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+        return {"ready": False, "checks": [{"name": "Configuração OCI", "status": "NOT_CONFIGURED", "detail": type(error).__name__}]}
+    try:
+        import oci
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        secrets_client = oci.secrets.SecretsClient({}, signer=signer)
+        object_storage_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
+    except Exception as error:  # SDK exposes several auth-specific exception types.
+        return {"ready": False, "checks": [{"name": "Identidade dinâmica OCI", "status": "FAILED", "detail": type(error).__name__}]}
+
+    expected_secrets = ["aws_access_key_id", "aws_secret_access_key", "aws_role_arn", "postgres_password"]
+    for secret_name in expected_secrets:
+        secret_ocid = secret_ocids.get(secret_name)
+        if not secret_ocid:
+            checks.append({"name": f"Secret {secret_name}", "status": "NOT_CONFIGURED", "detail": "OCID ausente"})
+            continue
+        try:
+            bundle = secrets_client.get_secret_bundle(secret_ocid).data
+            encoded_content = bundle.secret_bundle_content.content
+            content = base64.b64decode(encoded_content).decode("utf-8").strip()
+            status = "PLACEHOLDER" if content.startswith("REPLACE_THIS_PLACEHOLDER") else "READY"
+            checks.append({"name": f"Secret {secret_name}", "status": status, "detail": "valor presente" if status == "READY" else "placeholder ainda não substituído"})
+        except Exception as error:
+            checks.append({"name": f"Secret {secret_name}", "status": "FAILED", "detail": type(error).__name__})
+
+    try:
+        namespace = object_storage_client.get_namespace().data
+        checks.append({"name": "Namespace OCI Object Storage", "status": "READY", "detail": namespace})
+        for bucket_name in sorted({source.destination_bucket for source in session.scalars(select(Source))}):
+            try:
+                object_storage_client.list_objects(namespace, bucket_name, limit=1)
+                checks.append({"name": f"Bucket OCI {bucket_name}", "status": "READY", "detail": "leitura autorizada"})
+            except Exception as error:
+                checks.append({"name": f"Bucket OCI {bucket_name}", "status": "FAILED", "detail": type(error).__name__})
+    except Exception as error:
+        checks.append({"name": "OCI Object Storage", "status": "FAILED", "detail": type(error).__name__})
+    ready = all(check["status"] == "READY" for check in checks)
+    return {"ready": ready, "checks": checks}
 
 
 @app.get("/api/operations")

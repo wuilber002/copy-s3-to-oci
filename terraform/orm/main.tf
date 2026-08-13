@@ -114,6 +114,9 @@ resource "oci_core_instance" "migration" {
     user_data = base64encode(templatefile("${path.module}/cloud-init.yaml.tftpl", {
       bootstrap_repository = var.bootstrap_repository
       bootstrap_ref        = var.bootstrap_ref
+      oci_runtime_config = jsonencode({
+        secret_ocids = { for name, secret in oci_vault_secret.migration : name => secret.id }
+      })
     }))
   }
 
