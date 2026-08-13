@@ -116,9 +116,9 @@ resource "oci_core_instance" "migration" {
   }
 
   source_details {
-    source_type             = "image"
-    source_id               = var.image_ocid
-    boot_volume_size_in_gbs = var.boot_volume_size_in_gbs
+    source_type                     = "image"
+    source_id                       = var.image_ocid
+    boot_volume_size_in_gbs         = var.boot_volume_size_in_gbs
     is_preserve_boot_volume_enabled = true
   }
 
