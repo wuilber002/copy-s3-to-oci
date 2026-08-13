@@ -2,6 +2,8 @@
 
 Terraform não cria nenhum recurso na AWS. Antes de cadastrar uma origem na interface web, o cliente deve criar os itens abaixo.
 
+Para o procedimento completo, reproduzível e com comandos para AWS CloudShell/AWS CLI, incluindo cleanup dos arquivos temporários e remoção opcional da PoC, consulte [AWS por CLI](aws-cli-setup.md).
+
 ## 1. Credencial de bootstrap
 
 Crie um IAM user ou principal de automação com uma access key de longa duração, limitada exclusivamente a assumir a role da migração:
