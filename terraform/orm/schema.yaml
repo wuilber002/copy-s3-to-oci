@@ -17,6 +17,8 @@ groupings:
       - ssh_public_key
       - assign_public_ip
       - resource_name_prefix
+      - bootstrap_repository
+      - bootstrap_ref
   - title: Vault and Secrets (always created)
     variables:
       - vault_compartment_ocid
@@ -88,6 +90,16 @@ variables:
     title: Resource name prefix
     type: string
     default: s3-oci-migration
+    required: true
+  bootstrap_repository:
+    title: Bootstrap GitHub repository
+    type: string
+    default: https://github.com/wuilber002/copy-s3-to-oci.git
+    required: true
+  bootstrap_ref:
+    title: Bootstrap release ref
+    type: string
+    default: main
     required: true
   vault_compartment_ocid:
     title: Vault compartment

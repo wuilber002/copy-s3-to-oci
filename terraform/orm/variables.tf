@@ -35,24 +35,24 @@ variable "instance_shape" {
 }
 
 variable "ocpus" {
-  description = "OCPUs for the migration VM. Recommended: 8."
+  description = "OCPUs for the migration VM. PoC minimum: 2; production recommendation: 8."
   type        = number
   default     = 8
 
   validation {
-    condition     = var.ocpus >= 4
-    error_message = "Use at least 4 OCPUs; 8 OCPUs is recommended for a 1.2 Gbps migration link."
+    condition     = var.ocpus >= 2
+    error_message = "Use at least 2 OCPUs. Use 8 OCPUs for a 1.2 Gbps production migration link."
   }
 }
 
 variable "memory_in_gbs" {
-  description = "Memory for the migration VM. Recommended: 32 GB."
+  description = "Memory for the migration VM. PoC minimum: 8 GB; production recommendation: 32 GB."
   type        = number
   default     = 32
 
   validation {
-    condition     = var.memory_in_gbs >= 16
-    error_message = "Use at least 16 GB RAM; 32 GB is recommended for this workload."
+    condition     = var.memory_in_gbs >= 8
+    error_message = "Use at least 8 GB RAM. Use 32 GB for a 1.2 Gbps production migration link."
   }
 }
 
@@ -144,4 +144,16 @@ variable "backup_policy_id" {
   description = "Optional existing OCI boot-volume backup policy OCID. Leave blank to configure it manually after provisioning."
   type        = string
   default     = ""
+}
+
+variable "bootstrap_repository" {
+  description = "Public GitHub repository containing the signed/verified application release."
+  type        = string
+  default     = "https://github.com/wuilber002/copy-s3-to-oci.git"
+}
+
+variable "bootstrap_ref" {
+  description = "Git ref installed by cloud-init. Use a release tag in production."
+  type        = string
+  default     = "main"
 }
