@@ -61,3 +61,27 @@ EOF
 
 systemctl daemon-reload
 systemctl enable s3-oci-migration.service
+
+install -m 0750 "$install_root/scripts/backup-postgres.sh" /usr/local/sbin/s3-oci-backup-postgres
+cat >/etc/systemd/system/s3-oci-backup-postgres.service <<'EOF'
+[Unit]
+Description=Local PostgreSQL backup for S3 to OCI migration platform
+After=s3-oci-migration.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s3-oci-backup-postgres
+EOF
+cat >/etc/systemd/system/s3-oci-backup-postgres.timer <<'EOF'
+[Unit]
+Description=Daily local PostgreSQL backup for S3 to OCI migration platform
+
+[Timer]
+OnCalendar=*-*-* 02:15:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now s3-oci-backup-postgres.timer
