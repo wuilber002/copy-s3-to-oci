@@ -158,6 +158,8 @@ class RuntimeSettings(Base):
     default_restore_tier: Mapped[str] = mapped_column(String(16), default="BULK")
     task_lease_seconds: Mapped[int] = mapped_column(Integer, default=300)
     simulation_enabled: Mapped[bool] = mapped_column(default=False)
+    aws_migration_role_arn: Mapped[str] = mapped_column(String(2048), default="")
+    aws_batch_role_arn: Mapped[str] = mapped_column(String(2048), default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -216,6 +218,8 @@ class RuntimeSettingsUpdate(BaseModel):
     default_restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
     task_lease_seconds: int = Field(ge=30, le=3600)
     simulation_enabled: bool = False
+    aws_migration_role_arn: str = Field(default="", max_length=2048, pattern=r"^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/.+")
+    aws_batch_role_arn: str = Field(default="", max_length=2048, pattern=r"^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/.+")
 
 
 class SimulationTaskUpdate(BaseModel):
@@ -251,10 +255,18 @@ def create_schema() -> None:
         "integrity_error": "TEXT",
     }
     existing_columns = {column["name"] for column in inspect(engine).get_columns("objects")}
+    runtime_columns = {
+        "aws_migration_role_arn": "VARCHAR(2048) NOT NULL DEFAULT ''",
+        "aws_batch_role_arn": "VARCHAR(2048) NOT NULL DEFAULT ''",
+    }
+    existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     with engine.begin() as connection:
         for column, sql_type in expected_columns.items():
             if column not in existing_columns:
                 connection.execute(text(f"ALTER TABLE objects ADD COLUMN {column} {sql_type}"))
+        for column, sql_type in runtime_columns.items():
+            if column not in existing_runtime_columns:
+                connection.execute(text(f"ALTER TABLE runtime_settings ADD COLUMN {column} {sql_type}"))
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -300,7 +312,8 @@ def settings_dict(settings: RuntimeSettings) -> dict:
     return {"transfer_workers": settings.transfer_workers, "max_throughput_mbps": settings.max_throughput_mbps,
             "default_wave_size_bytes": settings.default_wave_size_bytes, "default_restore_days": settings.default_restore_days,
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
-            "simulation_enabled": settings.simulation_enabled, "updated_at": settings.updated_at}
+            "simulation_enabled": settings.simulation_enabled, "aws_migration_role_arn": settings.aws_migration_role_arn,
+            "aws_batch_role_arn": settings.aws_batch_role_arn, "updated_at": settings.updated_at}
 
 
 def read_oci_runtime_config() -> dict:
@@ -353,7 +366,7 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
     except Exception as error:  # SDK exposes several auth-specific exception types.
         return {"ready": False, "checks": [{"name": "Identidade dinâmica OCI", "status": "FAILED", "detail": type(error).__name__}]}
 
-    expected_secrets = ["aws_access_key_id", "aws_secret_access_key", "aws_role_arn", "aws_batch_role_arn", "postgres_password"]
+    expected_secrets = ["aws_access_key_id", "aws_secret_access_key", "postgres_password"]
     secret_values: dict[str, str] = {}
     for secret_name in expected_secrets:
         secret_ocid = secret_ocids.get(secret_name)
@@ -371,24 +384,28 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
         except Exception as error:
             checks.append({"name": f"Secret {secret_name}", "status": "FAILED", "detail": type(error).__name__})
 
-    aws_required = ["aws_access_key_id", "aws_secret_access_key", "aws_role_arn", "aws_batch_role_arn"]
-    if all(name in secret_values for name in aws_required):
+    settings = runtime_settings(session)
+    migration_role_arn = settings.aws_migration_role_arn.strip()
+    batch_role_arn = settings.aws_batch_role_arn.strip()
+    checks.append({"name": "Configuração role AWS de migração", "status": "CONFIGURED" if migration_role_arn else "NOT_CONFIGURED", "detail": "ARN preenchido na tela Configurações" if migration_role_arn else "preencha o ARN na tela Configurações"})
+    checks.append({"name": "Configuração role AWS Batch Operations", "status": "CONFIGURED" if batch_role_arn else "NOT_CONFIGURED", "detail": "ARN preenchido; validação ocorrerá ao criar o primeiro job" if batch_role_arn else "preencha o ARN na tela Configurações"})
+    aws_required = ["aws_access_key_id", "aws_secret_access_key"]
+    if all(name in secret_values for name in aws_required) and migration_role_arn:
         try:
             import boto3
             aws_region = session.scalar(select(Source.aws_region).order_by(Source.id)) or "us-east-1"
             sts = boto3.client("sts", region_name=aws_region, aws_access_key_id=secret_values["aws_access_key_id"], aws_secret_access_key=secret_values["aws_secret_access_key"])
             sts.get_caller_identity()
-            sts.assume_role(RoleArn=secret_values["aws_role_arn"], RoleSessionName="s3-oci-readiness", DurationSeconds=900)
+            sts.assume_role(RoleArn=migration_role_arn, RoleSessionName="s3-oci-readiness", DurationSeconds=900)
             for check in checks:
-                if check["name"] in {"Secret aws_access_key_id", "Secret aws_secret_access_key", "Secret aws_role_arn"}:
+                if check["name"] in {"Secret aws_access_key_id", "Secret aws_secret_access_key", "Configuração role AWS de migração"}:
                     check["status"] = "VALIDATED"
                     check["detail"] = "validada no teste AWS STS e AssumeRole"
             checks.append({"name": "Credenciais AWS e role de migração", "status": "VALIDATED", "detail": "GetCallerIdentity e AssumeRole concluídos"})
-            checks.append({"name": "Role Batch Operations", "status": "CONFIGURED", "detail": "ARN preenchido; validação ocorrerá ao criar o primeiro job"})
         except Exception as error:
             checks.append({"name": "Credenciais AWS e role de migração", "status": "CONFIGURED", "detail": f"preenchidas, mas teste falhou: {type(error).__name__}"})
     else:
-        checks.append({"name": "Credenciais AWS e role de migração", "status": "PLACEHOLDER", "detail": "preencha todas as quatro Secrets AWS para validar"})
+        checks.append({"name": "Credenciais AWS e role de migração", "status": "NOT_CONFIGURED", "detail": "preencha as duas Secrets AWS e o ARN da role de migração"})
 
     try:
         namespace = object_storage_client.get_namespace().data

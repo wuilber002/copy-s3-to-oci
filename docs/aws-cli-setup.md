@@ -169,7 +169,7 @@ aws iam put-role-policy \
   --policy-document "file://$WORKDIR/migration-policy.json"
 ```
 
-Registre o ARN retornado abaixo em uma nova versão da Secret OCI `aws_role_arn`:
+Copie o ARN retornado abaixo para o campo **Configurações → ARN da role AWS de migração** na interface web. ARN não é segredo e não deve ser colocado no Vault:
 
 ```bash
 aws iam get-role --role-name "$MIGRATION_ROLE" --query 'Role.Arn' --output text
@@ -229,7 +229,7 @@ aws iam put-role-policy \
 aws iam get-role --role-name "$BATCH_ROLE" --query 'Role.Arn' --output text
 ```
 
-Registre esse último ARN em uma nova versão da Secret OCI `aws_batch_role_arn`.
+Copie esse último ARN para **Configurações → ARN da role AWS Batch Operations**. ARN não é segredo e não deve ser colocado no Vault.
 
 ## 5. Verificar e validar na plataforma
 
@@ -241,7 +241,7 @@ aws iam get-role --role-name "$BATCH_ROLE" --query 'Role.AssumeRolePolicyDocumen
 aws s3api head-bucket --bucket "$CONTROL_BUCKET" --region "$AWS_REGION"
 ```
 
-Depois de preencher as quatro Secrets AWS no OCI Vault, acesse a interface web por túnel SSH e use **Painel → Credenciais e integrações → Validar agora**. O pré-check faz somente `GetCallerIdentity` e `AssumeRole` para a role de migração. Ele não faz discovery, restore, download ou upload.
+Depois de preencher as duas Secrets AWS no OCI Vault e os dois ARNs em **Configurações**, acesse a interface web por túnel SSH e use **Painel → Credenciais e integrações → Validar agora**. O pré-check faz somente `GetCallerIdentity` e `AssumeRole` para a role de migração. Ele não faz discovery, restore, download ou upload.
 
 ## Cleanup ao terminar o procedimento
 

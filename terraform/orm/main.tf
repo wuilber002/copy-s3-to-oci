@@ -35,26 +35,13 @@ locals {
     aws_access_key_id     = <<-EOT
       REPLACE_THIS_PLACEHOLDER.
       Enter the AWS Access Key ID for the bootstrap IAM principal.
-      This principal must be permitted only to call sts:AssumeRole on the role ARN stored in aws-role-arn.
+      This principal must be permitted only to call sts:AssumeRole on the migration role configured in the web interface.
       See docs/aws-setup.md before replacing this value.
     EOT
     aws_secret_access_key = <<-EOT
       REPLACE_THIS_PLACEHOLDER.
       Enter the AWS Secret Access Key paired with aws-access-key-id.
       Do not enter a session token. This credential is used only to assume the migration role.
-      See docs/aws-setup.md before replacing this value.
-    EOT
-    aws_role_arn          = <<-EOT
-      REPLACE_THIS_PLACEHOLDER.
-      Enter the ARN of the AWS IAM role used by the migration.
-      Format: arn:aws:iam::<account-id>:role/<role-name>
-      See docs/aws-setup.md before replacing this value.
-    EOT
-    aws_batch_role_arn    = <<-EOT
-      REPLACE_THIS_PLACEHOLDER.
-      Enter the ARN of the AWS IAM role trusted by batchoperations.s3.amazonaws.com.
-      This role initiates restores from the immutable S3 Batch Operations manifest and writes its completion report.
-      Format: arn:aws:iam::<account-id>:role/<batch-role-name>
       See docs/aws-setup.md before replacing this value.
     EOT
     postgres_password     = <<-EOT
@@ -97,6 +84,12 @@ resource "oci_vault_secret" "migration" {
     content      = base64encode(trimspace(each.value))
     name         = "initial-placeholder"
     stage        = "CURRENT"
+  }
+
+  # The initial version is only an instruction. The operator replaces it in
+  # Vault; subsequent Terraform runs must never rotate it back to a placeholder.
+  lifecycle {
+    ignore_changes = [secret_content]
   }
 }
 

@@ -23,13 +23,13 @@ Insira a access key e a secret access key nos Secrets OCI correspondentes. Não 
 
 ## 2. Role de migração
 
-Crie a role indicada no Secret `aws-role-arn`. A trust policy deve autorizar o principal de bootstrap a executar `sts:AssumeRole`.
+Crie a role indicada no campo **ARN da role AWS de migração** em **Configurações**. A trust policy deve autorizar o principal de bootstrap a executar `sts:AssumeRole`.
 
 A policy de permissões da role deve ser limitada ao bucket e prefixo de origem. Inclua `s3:ListBucket`, `s3:GetBucketLocation`, `s3:GetObject`, `s3:GetObjectVersion` quando houver versionamento, e `s3:RestoreObject` para conteúdo Glacier.
 
 ## 3. Role do S3 Batch Operations
 
-Crie uma role separada para a S3 Batch Operations iniciar restores. Ela deve confiar em `batchoperations.s3.amazonaws.com`, ter permissão de `s3:RestoreObject` na origem e acesso de leitura ao manifesto e escrita ao relatório de conclusão no bucket de controle.
+Crie uma role separada para a S3 Batch Operations iniciar restores e informe seu ARN no campo **ARN da role AWS Batch Operations** em **Configurações**. Ela deve confiar em `batchoperations.s3.amazonaws.com`, ter permissão de `s3:RestoreObject` na origem e acesso de leitura ao manifesto e escrita ao relatório de conclusão no bucket de controle.
 
 ## 4. Bucket de controle Batch Operations
 

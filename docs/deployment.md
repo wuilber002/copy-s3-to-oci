@@ -51,7 +51,7 @@ O cartão **Credenciais e integrações** no Painel e o botão **Executar pré-c
 
 - **Vermelho** (`PLACEHOLDER`): o valor ainda é o texto instrutivo criado pelo Terraform, ou há uma configuração ausente.
 - **Amarelo** (`CONFIGURED`): o valor foi preenchido, porém não existe uma validação segura sem executar uma operação real. A role de Batch Operations só será validada ao criar o primeiro job Batch.
-- **Verde** (`VALIDATED` ou `READY`): credencial/integracão testada com sucesso. As três Secrets da credencial AWS e a role de migração ficam verdes após STS e `AssumeRole`; namespace e bucket OCI ficam verdes após a leitura autorizada.
+- **Verde** (`VALIDATED` ou `READY`): credencial/integracão testada com sucesso. As duas Secrets da credencial AWS e o ARN da role de migração ficam verdes após STS e `AssumeRole`; namespace e bucket OCI ficam verdes após a leitura autorizada.
 
 A configuração de runtime com os OCIDs é criada pelo cloud-init e montada somente-leitura no container.
 
