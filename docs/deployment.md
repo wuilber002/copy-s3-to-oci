@@ -34,6 +34,7 @@ A console é o plano de controle local e persiste suas operações no PostgreSQL
 
 - cadastro e seleção de uma origem S3 e de seu bucket OCI de destino;
 - totais e amostra paginada do inventário que foi descoberto;
+- importação manual, em JSON, de até 10.000 itens por vez para a PoC. Essa função não deve ser usada como discovery produtivo; o worker de discovery usará listagens S3 paginadas e não fará `HeadObject` por objeto;
 - criação de ondas de no máximo 10 TB, com tier e duração de restore;
 - download do manifesto CSV da onda, já com as chaves codificadas para S3 Batch Operations;
 - relatório de objetos, bytes, estados, tarefas, tentativas e erros por onda;
