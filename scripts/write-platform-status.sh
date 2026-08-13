@@ -24,7 +24,10 @@ if latest_backup_file=$(find "$backup_root" -maxdepth 1 -type f -name 'migration
 fi
 backup_json=null
 if [[ -n "$latest_backup" ]]; then
-  backup_json=$(printf '"%s"' "$latest_backup")
+  backup_json=$(printf '{"path":"%s","modified_at":"%s","size_bytes":%s}' \
+    "$latest_backup" \
+    "$(date -u -r "$latest_backup" +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(stat -c %s "$latest_backup")")
 fi
 
 temporary_file=$(mktemp "$runtime_root/status.XXXXXX")
