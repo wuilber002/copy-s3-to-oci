@@ -15,6 +15,7 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. Os adaptadores/worke
 - Vault, Key e Secrets OCI sempre criados pelo Terraform, com placeholders instrutivos.
 - Credenciais AWS de bootstrap somente com access key/secret key; a aplicação assume uma role AWS de menor privilégio.
 - Restore em lote via S3 Batch Operations; chamadas AWS por objeto são evitadas sempre que houver alternativa bulk.
+- Evidência de integridade por objeto: checksum de origem e destino, algoritmo, data de verificação e falha são persistidos no PostgreSQL. O worker real usará SHA-256 em streaming; ETag S3 não é tratado como MD5 universal.
 - Ondas de no máximo 10 TB; referência inicial de VM: 8 OCPUs, 32 GB RAM e 500 GB de boot volume.
 
 ## Estrutura

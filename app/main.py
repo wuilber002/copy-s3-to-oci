@@ -21,7 +21,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, case, create_engine, func, inspect, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -93,6 +93,11 @@ class ObjectRecord(Base):
     last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     metadata_json: Mapped[str] = mapped_column(Text, default="{}")
     tags_json: Mapped[str] = mapped_column(Text, default="{}")
+    source_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    destination_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    checksum_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    integrity_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    integrity_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     state: Mapped[str] = mapped_column(String(32), default=ObjectState.DISCOVERED)
     wave_id: Mapped[int | None] = mapped_column(ForeignKey("waves.id"), nullable=True, index=True)
     source: Mapped[Source] = relationship(back_populates="objects")
@@ -177,6 +182,8 @@ class InventoryItem(BaseModel):
     last_modified: datetime | None = None
     metadata_json: str = "{}"
     tags_json: str = "{}"
+    source_checksum: str | None = None
+    checksum_algorithm: str | None = None
 
 
 class InventoryImport(BaseModel):
@@ -219,6 +226,14 @@ class WaveAction(BaseModel):
     reason: str = Field(min_length=3, max_length=1000)
 
 
+class IntegrityEvidence(BaseModel):
+    source_checksum: str | None = Field(default=None, max_length=256)
+    destination_checksum: str | None = Field(default=None, max_length=256)
+    checksum_algorithm: str = Field(pattern="^(SHA256|MD5)$")
+    verified: bool
+    error: str | None = Field(default=None, max_length=4000)
+
+
 app = FastAPI(title="S3 to OCI Migration", version="0.3.0")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
@@ -226,6 +241,20 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 @app.on_event("startup")
 def create_schema() -> None:
     Base.metadata.create_all(engine)
+    # Lightweight additive migrations keep the single-VM PoC upgradeable. No
+    # destructive schema operation is performed automatically.
+    expected_columns = {
+        "source_checksum": "VARCHAR(256)",
+        "destination_checksum": "VARCHAR(256)",
+        "checksum_algorithm": "VARCHAR(32)",
+        "integrity_verified_at": "TIMESTAMP WITH TIME ZONE",
+        "integrity_error": "TEXT",
+    }
+    existing_columns = {column["name"] for column in inspect(engine).get_columns("objects")}
+    with engine.begin() as connection:
+        for column, sql_type in expected_columns.items():
+            if column not in existing_columns:
+                connection.execute(text(f"ALTER TABLE objects ADD COLUMN {column} {sql_type}"))
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -480,7 +509,32 @@ def object_detail(object_id: int, session: Session = Depends(get_session)) -> di
     return {"id": obj.id, "source_id": obj.source_id, "wave_id": obj.wave_id, "key": obj.object_key,
             "version_id": obj.version_id, "size_bytes": obj.size_bytes, "etag": obj.etag,
             "storage_class": obj.storage_class, "last_modified": obj.last_modified, "state": obj.state,
-            "metadata": json.loads(obj.metadata_json), "tags": json.loads(obj.tags_json)}
+            "metadata": json.loads(obj.metadata_json), "tags": json.loads(obj.tags_json),
+            "integrity": {"source_checksum": obj.source_checksum, "destination_checksum": obj.destination_checksum,
+                          "algorithm": obj.checksum_algorithm, "verified_at": obj.integrity_verified_at,
+                          "error": obj.integrity_error}}
+
+
+@app.put("/api/objects/{object_id}/integrity")
+def record_integrity(object_id: int, payload: IntegrityEvidence, session: Session = Depends(get_session)) -> dict:
+    """Persist verification evidence. Production transfer worker is its only intended caller."""
+    obj = session.get(ObjectRecord, object_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Object not found")
+    if payload.verified and (not payload.source_checksum or not payload.destination_checksum):
+        raise HTTPException(status_code=422, detail="Verified evidence requires both source and destination checksums")
+    obj.source_checksum = payload.source_checksum
+    obj.destination_checksum = payload.destination_checksum
+    obj.checksum_algorithm = payload.checksum_algorithm
+    obj.integrity_verified_at = utcnow() if payload.verified else None
+    obj.integrity_error = payload.error
+    if payload.verified:
+        obj.state = ObjectState.VERIFIED
+    elif payload.error:
+        obj.state = ObjectState.FAILED
+    record_event(session, "INTEGRITY_RECORDED", f"Integrity evidence recorded for object {obj.id}: {'verified' if payload.verified else 'failed'}", source_id=obj.source_id, wave_id=obj.wave_id)
+    session.commit()
+    return {"id": obj.id, "state": obj.state, "verified_at": obj.integrity_verified_at}
 
 
 @app.get("/api/sources/{source_id}/inventory.csv")
@@ -583,7 +637,14 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
         .group_by(ObjectRecord.state)
     ).all())
     total_objects, total_bytes = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.wave_id == wave_id)).one()
+    integrity_verified, integrity_failed = session.execute(
+        select(
+            func.coalesce(func.sum(case((ObjectRecord.integrity_verified_at.is_not(None), 1), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.integrity_error.is_not(None), 1), else_=0)), 0),
+        ).where(ObjectRecord.wave_id == wave_id)
+    ).one()
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
+            "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 
 
