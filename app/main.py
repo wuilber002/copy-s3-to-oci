@@ -11,8 +11,12 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Generator
 import os
+import csv
+import io
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, create_engine, func, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
@@ -157,7 +161,14 @@ class ClaimRequest(BaseModel):
     lease_seconds: int = Field(default=300, ge=30, le=3600)
 
 
-app = FastAPI(title="S3 to OCI Migration", version="0.2.0")
+class TaskUpdate(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+    error: str | None = Field(default=None, max_length=8000)
+    retry_after_seconds: int = Field(default=300, ge=30, le=86400)
+
+
+app = FastAPI(title="S3 to OCI Migration", version="0.3.0")
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
 @app.on_event("startup")
@@ -175,6 +186,19 @@ def source_or_404(session: Session, source_id: int) -> Source:
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
     return source
+
+
+def task_or_404(session: Session, task_id: int) -> Task:
+    task = session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard() -> str:
+    with open("app/static/index.html", encoding="utf-8") as page:
+        return page.read()
 
 
 @app.get("/healthz")
@@ -225,6 +249,17 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
     return {"source_id": source_id, "objects": count, "bytes": bytes_total}
 
 
+@app.get("/api/sources/{source_id}/inventory")
+def list_inventory(source_id: int, limit: int = 100, offset: int = 0, session: Session = Depends(get_session)) -> dict:
+    source_or_404(session, source_id)
+    limit = min(max(limit, 1), 1000)
+    query = select(ObjectRecord).where(ObjectRecord.source_id == source_id).order_by(ObjectRecord.object_key).offset(offset).limit(limit)
+    rows = session.scalars(query)
+    return {"items": [{"id": obj.id, "key": obj.object_key, "version_id": obj.version_id,
+                       "size_bytes": obj.size_bytes, "storage_class": obj.storage_class, "state": obj.state,
+                       "wave_id": obj.wave_id} for obj in rows], "limit": limit, "offset": offset}
+
+
 @app.post("/api/sources/{source_id}/waves", status_code=201)
 def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
@@ -256,6 +291,51 @@ def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(
     return {"id": wave.id, "name": wave.name, "objects": assigned, "bytes": assigned_bytes, "status": wave.status}
 
 
+@app.get("/api/sources/{source_id}/waves")
+def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[dict]:
+    source_or_404(session, source_id)
+    rows = session.execute(
+        select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0))
+        .outerjoin(ObjectRecord, ObjectRecord.wave_id == Wave.id)
+        .where(Wave.source_id == source_id)
+        .group_by(Wave.id)
+        .order_by(Wave.id)
+    )
+    return [{"id": wave.id, "name": wave.name, "status": wave.status, "restore_tier": wave.restore_tier,
+             "restore_days": wave.restore_days, "objects": count, "bytes": size} for wave, count, size in rows]
+
+
+@app.get("/api/waves/{wave_id}/manifest.csv")
+def wave_manifest(wave_id: int, session: Session = Depends(get_session)) -> StreamingResponse:
+    wave = session.get(Wave, wave_id)
+    if not wave:
+        raise HTTPException(status_code=404, detail="Wave not found")
+    source = wave.source
+    content = io.StringIO()
+    writer = csv.writer(content, lineterminator="\n")
+    for obj in session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave_id).order_by(ObjectRecord.object_key)):
+        # S3 Batch Operations manifests require URL-encoded object keys. The
+        # AWS adapter uploads this immutable text unchanged when credentials exist.
+        from urllib.parse import quote
+        row = [source.s3_bucket, quote(obj.object_key, safe="/")]
+        if obj.version_id:
+            row.append(obj.version_id)
+        writer.writerow(row)
+    filename = f"wave-{wave_id}-manifest.csv"
+    return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+
+@app.get("/api/waves/{wave_id}/report")
+def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    wave = session.get(Wave, wave_id)
+    if not wave:
+        raise HTTPException(status_code=404, detail="Wave not found")
+    by_state = dict(session.execute(select(ObjectRecord.state, func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave_id).group_by(ObjectRecord.state)))
+    total_objects, total_bytes = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.wave_id == wave_id)).one()
+    return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
+            "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
+
+
 @app.post("/api/tasks/claim")
 def claim_task(payload: ClaimRequest, session: Session = Depends(get_session)) -> dict | None:
     now = utcnow()
@@ -270,3 +350,52 @@ def claim_task(payload: ClaimRequest, session: Session = Depends(get_session)) -
     task.lease_expires_at = now + timedelta(seconds=payload.lease_seconds)
     session.commit()
     return {"task_id": task.id, "kind": task.kind, "wave_id": task.wave_id, "attempt": task.attempts, "lease_expires_at": task.lease_expires_at}
+
+
+@app.post("/api/tasks/{task_id}/heartbeat")
+def heartbeat_task(task_id: int, payload: ClaimRequest, session: Session = Depends(get_session)) -> dict:
+    task = task_or_404(session, task_id)
+    if task.state != TaskState.RUNNING or task.worker_id != payload.worker_id:
+        raise HTTPException(status_code=409, detail="Task is not leased by this worker")
+    task.lease_expires_at = utcnow() + timedelta(seconds=payload.lease_seconds)
+    session.commit()
+    return {"task_id": task.id, "lease_expires_at": task.lease_expires_at}
+
+
+@app.post("/api/tasks/{task_id}/succeed")
+def succeed_task(task_id: int, payload: TaskUpdate, session: Session = Depends(get_session)) -> dict:
+    task = task_or_404(session, task_id)
+    if task.state != TaskState.RUNNING or task.worker_id != payload.worker_id:
+        raise HTTPException(status_code=409, detail="Task is not leased by this worker")
+    task.state = TaskState.SUCCEEDED
+    task.lease_expires_at = None
+    task.error = None
+    session.commit()
+    return {"task_id": task.id, "state": task.state}
+
+
+@app.post("/api/tasks/{task_id}/fail")
+def fail_task(task_id: int, payload: TaskUpdate, session: Session = Depends(get_session)) -> dict:
+    task = task_or_404(session, task_id)
+    if task.state != TaskState.RUNNING or task.worker_id != payload.worker_id:
+        raise HTTPException(status_code=409, detail="Task is not leased by this worker")
+    task.state = TaskState.READY
+    task.available_at = utcnow() + timedelta(seconds=payload.retry_after_seconds)
+    task.lease_expires_at = None
+    task.error = payload.error or "Worker reported failure"
+    session.commit()
+    return {"task_id": task.id, "state": task.state, "available_at": task.available_at}
+
+
+@app.post("/api/tasks/recover")
+def recover_expired_tasks(session: Session = Depends(get_session)) -> dict:
+    now = utcnow()
+    expired = list(session.scalars(select(Task).where(Task.state == TaskState.RUNNING, Task.lease_expires_at < now).with_for_update(skip_locked=True)))
+    for task in expired:
+        task.state = TaskState.READY
+        task.available_at = now
+        task.worker_id = None
+        task.lease_expires_at = None
+        task.error = "Lease expired; task recovered after worker interruption"
+    session.commit()
+    return {"recovered": len(expired)}

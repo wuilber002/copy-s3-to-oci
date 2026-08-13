@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>S3 → OCI Migration</title>
+  <style>
+    body{font:16px system-ui,sans-serif;background:#101827;color:#e7eefb;margin:0;padding:2rem;max-width:1080px}h1{margin-top:0}.card{background:#182237;padding:1.25rem;border-radius:10px;margin:1rem 0}input,button{padding:.55rem;margin:.2rem;border-radius:5px;border:1px solid #52627e}input{background:#0d1524;color:#fff}button{background:#3b82f6;color:#fff;cursor:pointer}pre{overflow:auto;background:#0d1524;padding:1rem;border-radius:6px}.hint{color:#b7c6e0}
+  </style>
+</head>
+<body>
+  <h1>S3 → OCI Migration</h1>
+  <p class="hint">Controle local. Nenhuma chamada AWS é feita nesta tela.</p>
+  <div class="card"><h2>Nova origem</h2>
+    <input id="name" placeholder="nome"><input id="bucket" placeholder="bucket S3"><input id="prefix" placeholder="prefixo"><input id="region" placeholder="região AWS"><input id="dest" placeholder="bucket OCI"><button onclick="createSource()">Cadastrar</button>
+  </div>
+  <div class="card"><h2>Fontes</h2><button onclick="load()">Atualizar</button><pre id="out">Carregando…</pre></div>
+  <script>
+    async function load(){document.querySelector('#out').textContent=JSON.stringify(await (await fetch('/api/sources')).json(),null,2)}
+    async function createSource(){const b=id=>document.querySelector(id).value;const r=await fetch('/api/sources',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:b('#name'),s3_bucket:b('#bucket'),s3_prefix:b('#prefix'),aws_region:b('#region'),destination_bucket:b('#dest')})});if(!r.ok)alert(await r.text());await load()}
+    load()
+  </script>
+</body></html>
