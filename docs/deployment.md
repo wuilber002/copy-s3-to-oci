@@ -55,6 +55,10 @@ O cartão **Credenciais e integrações** no Painel e o botão **Executar pré-c
 
 A configuração de runtime com os OCIDs é criada pelo cloud-init e montada somente-leitura no container.
 
+### Secret `postgres_password`
+
+O valor esperado é uma senha aleatória de pelo menos 32 caracteres para o usuário local `migration` do PostgreSQL. Não é uma credencial AWS e não pode ser reutilizada. Na primeira inicialização, a VM gera uma senha local e inicializa o banco com ela; para que o Vault represente a configuração efetiva e possa apoiar recuperação operacional, a Secret deve receber uma cópia exata dessa senha. Não substitua a senha no Vault por um valor novo sem executar um procedimento coordenado de rotação do PostgreSQL, pois isso impediria a aplicação de se conectar ao banco.
+
 Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. O discovery produtivo será feito por listagens S3 paginadas e não haverá cadastro manual de objetos pela interface. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
 
 ## Instalação de release
