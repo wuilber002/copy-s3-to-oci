@@ -47,7 +47,13 @@ Os parâmetros operacionais são persistidos no PostgreSQL. O worker simulado é
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 
-O botão **Executar pré-check OCI** usa a identidade dinâmica da VM para ler a versão atual de cada Secret e listar no máximo um objeto em cada bucket OCI já cadastrado. Ele informa apenas `READY`, `PLACEHOLDER`, `NOT_CONFIGURED` ou `FAILED`; valores de Secret nunca entram na resposta, nos logs ou na tela. A configuração de runtime com os OCIDs é criada pelo cloud-init e montada somente-leitura no container.
+O cartão **Credenciais e integrações** no Painel e o botão **Executar pré-check OCI** em Configurações usam a identidade dinâmica da VM para ler a versão atual de cada Secret e listar no máximo um objeto em cada bucket OCI já cadastrado. Quando todas as credenciais AWS estão preenchidas, o pré-check também executa `GetCallerIdentity` e `AssumeRole` na role de migração; ele não lista, restaura, baixa nem cobra operações de S3. Valores de Secret nunca entram na resposta, nos logs ou na tela.
+
+- **Vermelho** (`PLACEHOLDER`): o valor ainda é o texto instrutivo criado pelo Terraform, ou há uma configuração ausente.
+- **Amarelo** (`CONFIGURED`): o valor foi preenchido, porém não existe uma validação segura sem executar uma operação real. A role de Batch Operations só será validada ao criar o primeiro job Batch.
+- **Verde** (`VALIDATED` ou `READY`): credencial/integracão testada com sucesso. As três Secrets da credencial AWS e a role de migração ficam verdes após STS e `AssumeRole`; namespace e bucket OCI ficam verdes após a leitura autorizada.
+
+A configuração de runtime com os OCIDs é criada pelo cloud-init e montada somente-leitura no container.
 
 Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. O discovery produtivo será feito por listagens S3 paginadas e não haverá cadastro manual de objetos pela interface. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
 

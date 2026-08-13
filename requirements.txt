@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 sqlalchemy==2.0.36
 psycopg[binary]==3.2.3
 oci==2.182.0
+boto3==1.42.44

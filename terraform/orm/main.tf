@@ -50,6 +50,13 @@ locals {
       Format: arn:aws:iam::<account-id>:role/<role-name>
       See docs/aws-setup.md before replacing this value.
     EOT
+    aws_batch_role_arn    = <<-EOT
+      REPLACE_THIS_PLACEHOLDER.
+      Enter the ARN of the AWS IAM role trusted by batchoperations.s3.amazonaws.com.
+      This role initiates restores from the immutable S3 Batch Operations manifest and writes its completion report.
+      Format: arn:aws:iam::<account-id>:role/<batch-role-name>
+      See docs/aws-setup.md before replacing this value.
+    EOT
     postgres_password     = <<-EOT
       REPLACE_THIS_PLACEHOLDER.
       Replace with a randomly generated password of at least 32 characters for the local PostgreSQL application user.

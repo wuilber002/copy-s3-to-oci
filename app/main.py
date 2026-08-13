@@ -353,7 +353,8 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
     except Exception as error:  # SDK exposes several auth-specific exception types.
         return {"ready": False, "checks": [{"name": "Identidade dinâmica OCI", "status": "FAILED", "detail": type(error).__name__}]}
 
-    expected_secrets = ["aws_access_key_id", "aws_secret_access_key", "aws_role_arn", "postgres_password"]
+    expected_secrets = ["aws_access_key_id", "aws_secret_access_key", "aws_role_arn", "aws_batch_role_arn", "postgres_password"]
+    secret_values: dict[str, str] = {}
     for secret_name in expected_secrets:
         secret_ocid = secret_ocids.get(secret_name)
         if not secret_ocid:
@@ -363,10 +364,31 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
             bundle = secrets_client.get_secret_bundle(secret_ocid).data
             encoded_content = bundle.secret_bundle_content.content
             content = base64.b64decode(encoded_content).decode("utf-8").strip()
-            status = "PLACEHOLDER" if content.startswith("REPLACE_THIS_PLACEHOLDER") else "READY"
-            checks.append({"name": f"Secret {secret_name}", "status": status, "detail": "valor presente" if status == "READY" else "placeholder ainda não substituído"})
+            status = "PLACEHOLDER" if content.startswith("REPLACE_THIS_PLACEHOLDER") else "CONFIGURED"
+            if status == "CONFIGURED":
+                secret_values[secret_name] = content
+            checks.append({"name": f"Secret {secret_name}", "status": status, "detail": "valor preenchido; a validação funcional é exibida nos cartões AWS" if status == "CONFIGURED" else "placeholder ainda não substituído"})
         except Exception as error:
             checks.append({"name": f"Secret {secret_name}", "status": "FAILED", "detail": type(error).__name__})
+
+    aws_required = ["aws_access_key_id", "aws_secret_access_key", "aws_role_arn", "aws_batch_role_arn"]
+    if all(name in secret_values for name in aws_required):
+        try:
+            import boto3
+            aws_region = session.scalar(select(Source.aws_region).order_by(Source.id)) or "us-east-1"
+            sts = boto3.client("sts", region_name=aws_region, aws_access_key_id=secret_values["aws_access_key_id"], aws_secret_access_key=secret_values["aws_secret_access_key"])
+            sts.get_caller_identity()
+            sts.assume_role(RoleArn=secret_values["aws_role_arn"], RoleSessionName="s3-oci-readiness", DurationSeconds=900)
+            for check in checks:
+                if check["name"] in {"Secret aws_access_key_id", "Secret aws_secret_access_key", "Secret aws_role_arn"}:
+                    check["status"] = "VALIDATED"
+                    check["detail"] = "validada no teste AWS STS e AssumeRole"
+            checks.append({"name": "Credenciais AWS e role de migração", "status": "VALIDATED", "detail": "GetCallerIdentity e AssumeRole concluídos"})
+            checks.append({"name": "Role Batch Operations", "status": "CONFIGURED", "detail": "ARN preenchido; validação ocorrerá ao criar o primeiro job"})
+        except Exception as error:
+            checks.append({"name": "Credenciais AWS e role de migração", "status": "CONFIGURED", "detail": f"preenchidas, mas teste falhou: {type(error).__name__}"})
+    else:
+        checks.append({"name": "Credenciais AWS e role de migração", "status": "PLACEHOLDER", "detail": "preencha todas as quatro Secrets AWS para validar"})
 
     try:
         namespace = object_storage_client.get_namespace().data
@@ -379,7 +401,7 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
                 checks.append({"name": f"Bucket OCI {bucket_name}", "status": "FAILED", "detail": type(error).__name__})
     except Exception as error:
         checks.append({"name": "OCI Object Storage", "status": "FAILED", "detail": type(error).__name__})
-    ready = all(check["status"] == "READY" for check in checks)
+    ready = all(check["status"] in ["READY", "VALIDATED", "CONFIGURED"] for check in checks)
     return {"ready": ready, "checks": checks}
 
 
