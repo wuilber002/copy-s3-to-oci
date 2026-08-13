@@ -447,6 +447,29 @@ def list_inventory(source_id: int, limit: int = 100, offset: int = 0, session: S
             "limit": limit, "offset": offset, "total": total}
 
 
+@app.get("/api/objects/{object_id}")
+def object_detail(object_id: int, session: Session = Depends(get_session)) -> dict:
+    obj = session.get(ObjectRecord, object_id)
+    if not obj:
+        raise HTTPException(status_code=404, detail="Object not found")
+    return {"id": obj.id, "source_id": obj.source_id, "wave_id": obj.wave_id, "key": obj.object_key,
+            "version_id": obj.version_id, "size_bytes": obj.size_bytes, "etag": obj.etag,
+            "storage_class": obj.storage_class, "last_modified": obj.last_modified, "state": obj.state,
+            "metadata": json.loads(obj.metadata_json), "tags": json.loads(obj.tags_json)}
+
+
+@app.get("/api/sources/{source_id}/inventory.csv")
+def export_inventory(source_id: int, session: Session = Depends(get_session)) -> StreamingResponse:
+    source_or_404(session, source_id)
+    content = io.StringIO()
+    writer = csv.writer(content, lineterminator="\n")
+    writer.writerow(["object_key", "version_id", "size_bytes", "etag", "storage_class", "last_modified", "state", "wave_id", "metadata_json", "tags_json"])
+    for obj in session.scalars(select(ObjectRecord).where(ObjectRecord.source_id == source_id).order_by(ObjectRecord.object_key)):
+        writer.writerow([obj.object_key, obj.version_id or "", obj.size_bytes, obj.etag or "", obj.storage_class or "",
+                         obj.last_modified.isoformat() if obj.last_modified else "", obj.state, obj.wave_id or "", obj.metadata_json, obj.tags_json])
+    return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="source-{source_id}-inventory.csv"'})
+
+
 @app.post("/api/sources/{source_id}/waves", status_code=201)
 def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
@@ -581,13 +604,29 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
 
 
 @app.get("/api/tasks")
-def list_tasks(limit: int = 100, session: Session = Depends(get_session)) -> list[dict]:
+def list_tasks(limit: int = 100, state: TaskState | None = None, wave_id: int | None = None, session: Session = Depends(get_session)) -> list[dict]:
     limit = min(max(limit, 1), 500)
-    tasks = session.scalars(select(Task).order_by(Task.available_at, Task.id).limit(limit))
+    query = select(Task)
+    if state is not None:
+        query = query.where(Task.state == state)
+    if wave_id is not None:
+        query = query.where(Task.wave_id == wave_id)
+    tasks = session.scalars(query.order_by(Task.available_at, Task.id).limit(limit))
     return [{"id": task.id, "wave_id": task.wave_id, "kind": task.kind, "state": task.state,
              "attempts": task.attempts, "available_at": task.available_at,
              "lease_expires_at": task.lease_expires_at, "worker_id": task.worker_id, "error": task.error}
             for task in tasks]
+
+
+@app.get("/api/tasks.csv")
+def export_tasks(session: Session = Depends(get_session)) -> StreamingResponse:
+    content = io.StringIO()
+    writer = csv.writer(content, lineterminator="\n")
+    writer.writerow(["id", "wave_id", "kind", "state", "attempts", "available_at", "lease_expires_at", "worker_id", "error"])
+    for task in session.scalars(select(Task).order_by(Task.id)):
+        writer.writerow([task.id, task.wave_id, task.kind, task.state, task.attempts, task.available_at.isoformat(),
+                         task.lease_expires_at.isoformat() if task.lease_expires_at else "", task.worker_id or "", task.error or ""])
+    return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="tasks.csv"'})
 
 
 @app.get("/api/events")
@@ -601,6 +640,16 @@ def list_events(limit: int = 100, source_id: int | None = None, wave_id: int | N
     events = session.scalars(query.order_by(Event.created_at.desc(), Event.id.desc()).limit(limit))
     return [{"id": event.id, "kind": event.kind, "message": event.message, "source_id": event.source_id,
              "wave_id": event.wave_id, "created_at": event.created_at} for event in events]
+
+
+@app.get("/api/events.csv")
+def export_events(session: Session = Depends(get_session)) -> StreamingResponse:
+    content = io.StringIO()
+    writer = csv.writer(content, lineterminator="\n")
+    writer.writerow(["id", "created_at", "kind", "source_id", "wave_id", "message"])
+    for event in session.scalars(select(Event).order_by(Event.created_at.desc(), Event.id.desc())):
+        writer.writerow([event.id, event.created_at.isoformat(), event.kind, event.source_id or "", event.wave_id or "", event.message])
+    return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="events.csv"'})
 
 
 @app.post("/api/tasks/claim")
