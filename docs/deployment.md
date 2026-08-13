@@ -28,6 +28,20 @@ ssh -N -L 8080:127.0.0.1:8080 <usuario>@<ip-ou-hostname-da-vm>
 
 Depois, acesse `http://127.0.0.1:8080`. A porta da aplicação não deve ser liberada no NSG/security list.
 
+### Operação da console
+
+A console é o plano de controle local e persiste suas operações no PostgreSQL da VM. Ela oferece:
+
+- cadastro e seleção de uma origem S3 e de seu bucket OCI de destino;
+- totais e amostra paginada do inventário que foi descoberto;
+- criação de ondas de no máximo 10 TB, com tier e duração de restore;
+- download do manifesto CSV da onda, já com as chaves codificadas para S3 Batch Operations;
+- relatório de objetos, bytes, estados, tarefas, tentativas e erros por onda;
+- pausa, retomada e reprocessamento controlado de ondas; e
+- saúde do banco/fila e espaço livre do volume, além de recuperação de tarefas cujo lease expirou após interrupção.
+
+Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
+
 ## Instalação de release
 
 O procedimento final baixa uma release versionada do GitHub e verifica o checksum antes da instalação. A release inclui imagens Docker e dependências; a VM não depende de Docker Hub, PyPI ou `apt` durante a instalação ou execução.

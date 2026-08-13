@@ -4,19 +4,70 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>S3 → OCI Migration</title>
   <style>
-    body{font:16px system-ui,sans-serif;background:#101827;color:#e7eefb;margin:0;padding:2rem;max-width:1080px}h1{margin-top:0}.card{background:#182237;padding:1.25rem;border-radius:10px;margin:1rem 0}input,button{padding:.55rem;margin:.2rem;border-radius:5px;border:1px solid #52627e}input{background:#0d1524;color:#fff}button{background:#3b82f6;color:#fff;cursor:pointer}pre{overflow:auto;background:#0d1524;padding:1rem;border-radius:6px}.hint{color:#b7c6e0}
+    :root{color-scheme:dark}*{box-sizing:border-box}body{font:15px system-ui,sans-serif;background:#101827;color:#e7eefb;margin:0;padding:2rem;max-width:1440px}h1,h2,h3{margin:.2rem 0 .8rem}.hint{color:#b7c6e0}.warning{color:#facc15}.card{background:#182237;padding:1.2rem;border-radius:10px;margin:1rem 0;box-shadow:0 1px 3px #0004}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:.8rem}.metric{background:#0d1524;padding:.8rem;border-radius:7px}.metric b{display:block;font-size:1.3rem;margin-top:.25rem}input,select,button{padding:.58rem;border-radius:5px;border:1px solid #52627e;font:inherit}input,select{background:#0d1524;color:#fff;width:100%}button{background:#3b82f6;color:#fff;cursor:pointer}button.secondary{background:#34425c}button.warn{background:#a16207}button.danger{background:#a33}button:disabled{opacity:.5;cursor:wait}.row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap}.row>*{flex:1;min-width:120px}.row button{flex:0 0 auto}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:.55rem;border-bottom:1px solid #334155;vertical-align:top}th{color:#b7c6e0}code,pre{overflow:auto;background:#0d1524;padding:.8rem;border-radius:6px}.hidden{display:none}a{color:#93c5fd}.status{min-height:1.2rem}.ok{color:#86efac}.error{color:#fca5a5}@media(max-width:650px){body{padding:1rem}table{display:block;overflow:auto}}
   </style>
 </head>
 <body>
   <h1>S3 → OCI Migration</h1>
-  <p class="hint">Controle local. Nenhuma chamada AWS é feita nesta tela.</p>
-  <div class="card"><h2>Nova origem</h2>
-    <input id="name" placeholder="nome"><input id="bucket" placeholder="bucket S3"><input id="prefix" placeholder="prefixo"><input id="region" placeholder="região AWS"><input id="dest" placeholder="bucket OCI"><button onclick="createSource()">Cadastrar</button>
-  </div>
-  <div class="card"><h2>Fontes</h2><button onclick="load()">Atualizar</button><pre id="out">Carregando…</pre></div>
-  <script>
-    async function load(){document.querySelector('#out').textContent=JSON.stringify(await (await fetch('/api/sources')).json(),null,2)}
-    async function createSource(){const b=id=>document.querySelector(id).value;const r=await fetch('/api/sources',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:b('#name'),s3_bucket:b('#bucket'),s3_prefix:b('#prefix'),aws_region:b('#region'),destination_bucket:b('#dest')})});if(!r.ok)alert(await r.text());await load()}
-    load()
-  </script>
+  <p class="hint">Console operacional local. A tela não chama AWS nem OCI diretamente; workers controlados executam as integrações posteriormente.</p>
+  <p id="message" class="status" aria-live="polite"></p>
+
+  <section class="card"><h2>Saúde da plataforma</h2><div id="health" class="grid">Carregando…</div><p class="hint">Inclui o espaço do volume local, onde estão PostgreSQL e seus backups. O backup de volume é acompanhado no Console OCI.</p></section>
+
+  <section class="card"><h2>Nova origem</h2>
+    <form id="source-form" class="grid">
+      <input id="name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,127}" placeholder="Nome (ex.: arquivo-legado)">
+      <input id="bucket" required placeholder="Bucket S3">
+      <input id="prefix" placeholder="Prefixo S3 (opcional)">
+      <input id="region" required placeholder="Região AWS (ex.: us-east-1)">
+      <input id="dest" required placeholder="Bucket OCI de destino">
+      <button>Cadastrar origem</button>
+    </form>
+  </section>
+
+  <section class="card"><h2>Fontes e inventário</h2>
+    <div class="row"><select id="source-select" onchange="selectSource()"><option value="">Selecione uma origem</option></select><button class="secondary" onclick="refreshAll()">Atualizar</button></div>
+    <div id="source-summary" class="hint">Cadastre ou selecione uma origem.</div>
+    <h3>Objetos descobertos</h3><div id="inventory"></div>
+  </section>
+
+  <section class="card"><h2>Criar onda</h2>
+    <form id="wave-form" class="grid">
+      <input id="wave-name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,127}" placeholder="Nome da onda">
+      <input id="wave-tb" type="number" min="0.001" max="10" step="0.001" value="10" required title="Máximo de 10 TB">
+      <input id="restore-days" type="number" min="1" max="30" value="7" required>
+      <select id="restore-tier"><option value="BULK">BULK</option><option value="STANDARD">STANDARD</option></select>
+      <button>Criar onda (máx. 10 TB)</button>
+    </form>
+    <p class="hint">A criação seleciona objetos ainda descobertos. Ela gera uma tarefa persistente; o restore só será submetido pelo worker AWS após sua configuração.</p>
+  </section>
+
+  <section class="card"><h2>Ondas</h2><div id="waves">Selecione uma origem.</div></section>
+  <section class="card"><h2>Relatório da onda selecionada</h2><div id="report" class="hint">Selecione “Relatório” em uma onda.</div></section>
+  <section class="card"><h2>Fila durável</h2><div class="row"><button class="secondary" onclick="recoverTasks()">Recuperar tarefas com lease expirado</button><button class="secondary" onclick="loadTasks()">Atualizar fila</button></div><div id="tasks"></div></section>
+
+<script>
+let selectedSource = '', selectedWave = '';
+const $ = s => document.querySelector(s);
+const fmt = n => new Intl.NumberFormat('pt-BR').format(n || 0);
+const bytes = n => { n=Number(n||0); const u=['B','KB','MB','GB','TB','PB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++} return `${n.toLocaleString('pt-BR',{maximumFractionDigits:2})} ${u[i]}`};
+function say(text, bad=false){const e=$('#message');e.textContent=text;e.className=`status ${bad?'error':'ok'}`;setTimeout(()=>{if(e.textContent===text)e.textContent=''},7000)}
+async function api(path, options={}){const r=await fetch(path,options);if(!r.ok){let d=await r.text();try{d=JSON.parse(d).detail||d}catch{}throw new Error(d)}return r.status===204?null:r.json()}
+function escape(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+
+async function loadHealth(){try{const d=await api('/api/operations');$('#health').innerHTML=[['Fontes',d.sources],['Objetos',fmt(d.objects)],['Inventário',bytes(d.bytes)],['Fila pronta',d.tasks.READY||0],['Fila em execução',d.tasks.RUNNING||0],['Espaço livre',bytes(d.disk.free)]].map(([k,v])=>`<div class="metric">${k}<b>${v}</b></div>`).join('')}catch(e){say(`Saúde: ${e.message}`,true)}}
+async function loadSources(){const rows=await api('/api/sources');const s=$('#source-select');const old=selectedSource;s.innerHTML='<option value="">Selecione uma origem</option>'+rows.map(x=>`<option value="${x.id}">${escape(x.name)} — s3://${escape(x.s3_bucket)}/${escape(x.s3_prefix)}</option>`).join('');if(old&&rows.some(x=>String(x.id)===String(old))){s.value=old}else{selectedSource=''} }
+async function selectSource(){selectedSource=$('#source-select').value;selectedWave='';$('#report').innerHTML='Selecione “Relatório” em uma onda.';if(!selectedSource){$('#source-summary').textContent='Cadastre ou selecione uma origem.';$('#inventory').innerHTML='';$('#waves').textContent='Selecione uma origem.';return}await Promise.all([loadSummary(),loadInventory(),loadWaves()])}
+async function loadSummary(){const d=await api(`/api/sources/${selectedSource}/summary`);const by=Object.entries(d.object_states).map(([k,v])=>`${k}: ${fmt(v)}`).join(' · ')||'sem objetos';$('#source-summary').innerHTML=`<p><b>${fmt(d.objects)}</b> objetos · <b>${bytes(d.bytes)}</b></p><p class="hint">${escape(by)}</p>`}
+async function loadInventory(){const d=await api(`/api/sources/${selectedSource}/inventory?limit=100`);const rows=d.items.map(x=>`<tr><td title="${escape(x.key)}">${escape(x.key)}</td><td>${bytes(x.size_bytes)}</td><td>${escape(x.storage_class||'—')}</td><td>${escape(x.state)}</td><td>${x.wave_id||'—'}</td></tr>`).join('');$('#inventory').innerHTML=`<p class="hint">Exibindo até 100 de ${fmt(d.total)} objetos.</p><table><thead><tr><th>Chave</th><th>Tamanho</th><th>Classe</th><th>Estado</th><th>Onda</th></tr></thead><tbody>${rows||'<tr><td colspan="5">Nenhum objeto. O discovery AWS ainda não foi executado.</td></tr>'}</tbody></table>`}
+async function loadWaves(){const rows=await api(`/api/sources/${selectedSource}/waves`);$('#waves').innerHTML=rows.length?`<table><thead><tr><th>Nome</th><th>Status</th><th>Objetos</th><th>Tamanho</th><th>Restore</th><th>Ações</th></tr></thead><tbody>${rows.map(x=>`<tr><td>${escape(x.name)}<br><small>#${x.id}</small></td><td>${escape(x.status)}</td><td>${fmt(x.objects)}</td><td>${bytes(x.bytes)}</td><td>${escape(x.restore_tier)} / ${x.restore_days}d</td><td class="row"><button class="secondary" onclick="report(${x.id})">Relatório</button><a href="/api/waves/${x.id}/manifest.csv">Manifesto CSV</a><button class="warn" onclick="waveAction(${x.id},'pause')">Pausar</button><button onclick="waveAction(${x.id},'resume')">Retomar</button><button class="secondary" onclick="waveAction(${x.id},'reprocess')">Reprocessar</button></td></tr>`).join('')}</tbody></table>`:'Nenhuma onda criada.'}
+async function report(id){selectedWave=id;const [d,o]=await Promise.all([api(`/api/waves/${id}/report`),api(`/api/waves/${id}/objects?limit=20`)]);const states=Object.entries(d.object_states).map(([k,v])=>`${escape(k)}: ${fmt(v)}`).join(' · ');const ts=d.tasks.map(t=>`<li>#${t.id} ${escape(t.kind)} — <b>${escape(t.state)}</b>, tentativas: ${t.attempts}${t.error?`<br><small class="error">${escape(t.error)}</small>`:''}</li>`).join('')||'<li>Sem tarefas</li>';const objects=o.items.map(x=>`<li>${escape(x.key)} — ${bytes(x.size_bytes)} — ${escape(x.state)}</li>`).join('')||'<li>Sem objetos</li>';$('#report').innerHTML=`<p><b>Onda #${d.wave_id}</b> · ${escape(d.status)} · ${fmt(d.objects)} objetos · ${bytes(d.bytes)}</p><p>${states||'Sem estados de objeto.'}</p><h3>Tarefas</h3><ul>${ts}</ul><h3>Primeiros ${o.items.length} objetos</h3><ul>${objects}</ul>`}
+async function waveAction(id, action){try{const d=await api(`/api/waves/${id}/${action}`,{method:'POST'});say(action==='reprocess'?'Tarefa de restore enfileirada.':'Onda atualizada: '+d.status);await Promise.all([loadWaves(),loadTasks(),loadHealth()]);if(selectedWave===id)await report(id)}catch(e){say(e.message,true)}}
+async function loadTasks(){try{const rows=await api('/api/tasks');$('#tasks').innerHTML=`<table><thead><tr><th>ID</th><th>Onda</th><th>Tipo</th><th>Estado</th><th>Tentativas</th><th>Disponível</th><th>Erro</th></tr></thead><tbody>${rows.map(t=>`<tr><td>${t.id}</td><td>${t.wave_id}</td><td>${escape(t.kind)}</td><td>${escape(t.state)}</td><td>${t.attempts}</td><td>${t.available_at?new Date(t.available_at).toLocaleString('pt-BR'):'—'}</td><td>${escape(t.error||'—')}</td></tr>`).join('')||'<tr><td colspan="7">Fila vazia.</td></tr>'}</tbody></table>`}catch(e){say(e.message,true)}}
+async function recoverTasks(){try{const d=await api('/api/tasks/recover',{method:'POST'});say(`${d.recovered} tarefa(s) recuperada(s).`);await Promise.all([loadTasks(),loadHealth()])}catch(e){say(e.message,true)}}
+$('#source-form').addEventListener('submit',async e=>{e.preventDefault();try{const b=id=>$(id).value.trim();const d=await api('/api/sources',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:b('#name'),s3_bucket:b('#bucket'),s3_prefix:b('#prefix'),aws_region:b('#region'),destination_bucket:b('#dest')})});selectedSource=d.id;e.target.reset();await loadSources();$('#source-select').value=selectedSource;await selectSource();say('Origem cadastrada.')}catch(err){say(err.message,true)}});
+$('#wave-form').addEventListener('submit',async e=>{e.preventDefault();if(!selectedSource)return say('Selecione uma origem antes de criar a onda.',true);try{const tb=Number($('#wave-tb').value);const d=await api(`/api/sources/${selectedSource}/waves`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({name:$('#wave-name').value.trim(),max_bytes:Math.floor(tb*1024**4),restore_days:Number($('#restore-days').value),restore_tier:$('#restore-tier').value})});say(`Onda ${d.name} criada com ${fmt(d.objects)} objetos (${bytes(d.bytes)}).`);e.target.reset();$('#wave-tb').value=10;$('#restore-days').value=7;await Promise.all([loadSummary(),loadInventory(),loadWaves(),loadTasks(),loadHealth()])}catch(err){say(err.message,true)}});
+async function refreshAll(){await loadHealth();await loadSources();if(selectedSource){$('#source-select').value=selectedSource;await selectSource()}await loadTasks()}
+refreshAll();
+</script>
 </body></html>

@@ -13,6 +13,7 @@ from typing import Generator
 import os
 import csv
 import io
+import shutil
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -188,6 +189,13 @@ def source_or_404(session: Session, source_id: int) -> Source:
     return source
 
 
+def wave_or_404(session: Session, wave_id: int) -> Wave:
+    wave = session.get(Wave, wave_id)
+    if not wave:
+        raise HTTPException(status_code=404, detail="Wave not found")
+    return wave
+
+
 def task_or_404(session: Session, task_id: int) -> Task:
     task = session.get(Task, task_id)
     if not task:
@@ -205,6 +213,29 @@ def dashboard() -> str:
 def healthcheck(session: Session = Depends(get_session)) -> dict:
     session.execute(select(1))
     return {"status": "ok"}
+
+
+@app.get("/api/operations")
+def operations_overview(session: Session = Depends(get_session)) -> dict:
+    """Local operational status; deliberately does not contact AWS or OCI."""
+    session.execute(select(1))
+    source_count = session.scalar(select(func.count(Source.id))) or 0
+    object_count, bytes_total = session.execute(
+        select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0))
+    ).one()
+    task_counts = dict(session.execute(
+        select(Task.state, func.count(Task.id)).group_by(Task.state)
+    ).all())
+    volume = shutil.disk_usage("/")
+    return {
+        "status": "ok",
+        "time": utcnow(),
+        "sources": source_count,
+        "objects": object_count,
+        "bytes": bytes_total,
+        "tasks": task_counts,
+        "disk": {"total": volume.total, "used": volume.used, "free": volume.free},
+    }
 
 
 @app.get("/api/sources")
@@ -246,7 +277,12 @@ def import_inventory(source_id: int, payload: InventoryImport, session: Session 
 def source_summary(source_id: int, session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
     count, bytes_total = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.source_id == source_id)).one()
-    return {"source_id": source_id, "objects": count, "bytes": bytes_total}
+    states = dict(session.execute(
+        select(ObjectRecord.state, func.count(ObjectRecord.id))
+        .where(ObjectRecord.source_id == source_id)
+        .group_by(ObjectRecord.state)
+    ).all())
+    return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states}
 
 
 @app.get("/api/sources/{source_id}/inventory")
@@ -255,9 +291,11 @@ def list_inventory(source_id: int, limit: int = 100, offset: int = 0, session: S
     limit = min(max(limit, 1), 1000)
     query = select(ObjectRecord).where(ObjectRecord.source_id == source_id).order_by(ObjectRecord.object_key).offset(offset).limit(limit)
     rows = session.scalars(query)
+    total = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id)) or 0
     return {"items": [{"id": obj.id, "key": obj.object_key, "version_id": obj.version_id,
                        "size_bytes": obj.size_bytes, "storage_class": obj.storage_class, "state": obj.state,
-                       "wave_id": obj.wave_id} for obj in rows], "limit": limit, "offset": offset}
+                       "last_modified": obj.last_modified, "etag": obj.etag, "wave_id": obj.wave_id} for obj in rows],
+            "limit": limit, "offset": offset, "total": total}
 
 
 @app.post("/api/sources/{source_id}/waves", status_code=201)
@@ -305,6 +343,19 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
              "restore_days": wave.restore_days, "objects": count, "bytes": size} for wave, count, size in rows]
 
 
+@app.get("/api/waves/{wave_id}/objects")
+def wave_objects(wave_id: int, limit: int = 100, offset: int = 0, session: Session = Depends(get_session)) -> dict:
+    wave_or_404(session, wave_id)
+    limit = min(max(limit, 1), 1000)
+    total = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave_id)) or 0
+    rows = session.scalars(
+        select(ObjectRecord).where(ObjectRecord.wave_id == wave_id).order_by(ObjectRecord.object_key).offset(offset).limit(limit)
+    )
+    return {"items": [{"id": obj.id, "key": obj.object_key, "size_bytes": obj.size_bytes,
+                        "state": obj.state, "etag": obj.etag, "storage_class": obj.storage_class}
+                      for obj in rows], "total": total, "limit": limit, "offset": offset}
+
+
 @app.get("/api/waves/{wave_id}/manifest.csv")
 def wave_manifest(wave_id: int, session: Session = Depends(get_session)) -> StreamingResponse:
     wave = session.get(Wave, wave_id)
@@ -327,9 +378,7 @@ def wave_manifest(wave_id: int, session: Session = Depends(get_session)) -> Stre
 
 @app.get("/api/waves/{wave_id}/report")
 def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
-    wave = session.get(Wave, wave_id)
-    if not wave:
-        raise HTTPException(status_code=404, detail="Wave not found")
+    wave = wave_or_404(session, wave_id)
     by_state = dict(session.execute(
         select(ObjectRecord.state, func.count(ObjectRecord.id))
         .where(ObjectRecord.wave_id == wave_id)
@@ -340,12 +389,60 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 
 
+@app.post("/api/waves/{wave_id}/pause")
+def pause_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    wave = wave_or_404(session, wave_id)
+    if wave.status == "PAUSED":
+        return {"wave_id": wave.id, "status": wave.status}
+    wave.status = "PAUSED"
+    session.commit()
+    return {"wave_id": wave.id, "status": wave.status}
+
+
+@app.post("/api/waves/{wave_id}/resume")
+def resume_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    wave = wave_or_404(session, wave_id)
+    if wave.status != "PAUSED":
+        raise HTTPException(status_code=409, detail="Only a paused wave can be resumed")
+    wave.status = "READY_FOR_RESTORE"
+    queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
+    if not queued:
+        session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
+    session.commit()
+    return {"wave_id": wave.id, "status": wave.status}
+
+
+@app.post("/api/waves/{wave_id}/reprocess")
+def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    """Queue a new controlled restore submission; no external call is made here."""
+    wave = wave_or_404(session, wave_id)
+    if wave.status == "PAUSED":
+        raise HTTPException(status_code=409, detail="Resume the wave before reprocessing it")
+    queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
+    if queued:
+        raise HTTPException(status_code=409, detail="This wave already has a queued or running task")
+    wave.status = "READY_FOR_RESTORE"
+    session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
+    session.commit()
+    return {"wave_id": wave.id, "status": wave.status, "message": "Restore task queued"}
+
+
+@app.get("/api/tasks")
+def list_tasks(limit: int = 100, session: Session = Depends(get_session)) -> list[dict]:
+    limit = min(max(limit, 1), 500)
+    tasks = session.scalars(select(Task).order_by(Task.available_at, Task.id).limit(limit))
+    return [{"id": task.id, "wave_id": task.wave_id, "kind": task.kind, "state": task.state,
+             "attempts": task.attempts, "available_at": task.available_at,
+             "lease_expires_at": task.lease_expires_at, "worker_id": task.worker_id, "error": task.error}
+            for task in tasks]
+
+
 @app.post("/api/tasks/claim")
 def claim_task(payload: ClaimRequest, session: Session = Depends(get_session)) -> dict | None:
     now = utcnow()
     expired = Task.state == TaskState.RUNNING
     available = (Task.state == TaskState.READY) | (expired & (Task.lease_expires_at < now))
-    task = session.scalar(select(Task).where(available, Task.available_at <= now).order_by(Task.available_at, Task.id).with_for_update(skip_locked=True).limit(1))
+    task = session.scalar(select(Task).join(Wave).where(available, Task.available_at <= now, Wave.status != "PAUSED").order_by(Task.available_at, Task.id).with_for_update(skip_locked=True).limit(1))
     if not task:
         return None
     task.state = TaskState.RUNNING
