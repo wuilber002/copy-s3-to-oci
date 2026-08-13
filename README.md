@@ -6,6 +6,8 @@ Plataforma de migração controlada de objetos AWS S3, incluindo Glacier Deep Ar
 
 O repositório contém a infraestrutura para OCI Resource Manager e uma console web local para operar o plano de migração. A console permite cadastrar fontes, consultar inventário paginado, criar ondas de até 10 TB, baixar manifestos CSV para S3 Batch Operations, exportar relatórios, pausar/retomar/reprocessar ondas e acompanhar a fila durável, a saúde local, o estado dos serviços da VM, a prontidão OCI e o histórico operacional.
 
+A console separa o trabalho em **Painel** (status e alertas do dia a dia), **Migrações** (fontes, inventário, ondas, fila e auditoria) e **Configurações** (ícone de engrenagem; parâmetros globais e pré-check OCI).
+
 Ela não executa chamadas AWS ou OCI a partir do navegador. Os adaptadores/workers de discovery, S3 Batch Operations, restore, transferência e verificação de integridade ainda serão conectados quando as credenciais e os recursos AWS estiverem disponíveis.
 
 ## Garantias de desenho
