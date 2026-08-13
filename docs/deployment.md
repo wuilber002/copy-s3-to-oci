@@ -34,14 +34,16 @@ A console é o plano de controle local e persiste suas operações no PostgreSQL
 
 - cadastro e seleção de uma origem S3 e de seu bucket OCI de destino;
 - totais e amostra paginada do inventário que foi descoberto;
-- importação manual, em JSON, de até 10.000 itens por vez para a PoC. Essa função não deve ser usada como discovery produtivo; o worker de discovery usará listagens S3 paginadas e não fará `HeadObject` por objeto;
 - criação de ondas de no máximo 10 TB, com tier e duração de restore;
 - download do manifesto CSV da onda, já com as chaves codificadas para S3 Batch Operations;
 - relatório de objetos, bytes, estados, tarefas, tentativas e erros por onda;
 - pausa, retomada e reprocessamento controlado de ondas; e
-- saúde do banco/fila e espaço livre do volume, além de recuperação de tarefas cujo lease expirou após interrupção.
+- saúde do banco/fila e espaço livre do volume, além de recuperação de tarefas cujo lease expirou após interrupção; e
+- histórico operacional persistente para ações administrativas e de fila.
 
-Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
+O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
+
+Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. O discovery produtivo será feito por listagens S3 paginadas e não haverá cadastro manual de objetos pela interface. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
 
 ## Instalação de release
 

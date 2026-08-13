@@ -13,6 +13,7 @@ from typing import Generator
 import os
 import csv
 import io
+import json
 import shutil
 
 from fastapi import Depends, FastAPI, HTTPException
@@ -35,6 +36,7 @@ def read_secret(path: str) -> str:
 database_url = os.environ["DATABASE_URL"]
 password = read_secret(os.environ["POSTGRES_PASSWORD_FILE"])
 database_url = database_url.replace("migration@", f"migration:{password}@")
+platform_status_file = os.environ.get("PLATFORM_STATUS_FILE", "/run/platform-status/status.json")
 engine = create_engine(database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
@@ -127,6 +129,17 @@ class Task(Base):
     wave: Mapped[Wave] = relationship(back_populates="tasks")
 
 
+class Event(Base):
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_id: Mapped[int | None] = mapped_column(ForeignKey("sources.id"), nullable=True, index=True)
+    wave_id: Mapped[int | None] = mapped_column(ForeignKey("waves.id"), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(64), index=True)
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
 class SourceCreate(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$")
     s3_bucket: str
@@ -203,6 +216,10 @@ def task_or_404(session: Session, task_id: int) -> Task:
     return task
 
 
+def record_event(session: Session, kind: str, message: str, source_id: int | None = None, wave_id: int | None = None) -> None:
+    session.add(Event(kind=kind, message=message, source_id=source_id, wave_id=wave_id))
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     with open("app/static/index.html", encoding="utf-8") as page:
@@ -213,6 +230,22 @@ def dashboard() -> str:
 def healthcheck(session: Session = Depends(get_session)) -> dict:
     session.execute(select(1))
     return {"status": "ok"}
+
+
+@app.get("/api/platform/status")
+def platform_status() -> dict:
+    """Read host service state from an unprivileged, read-only status file."""
+    try:
+        with open(platform_status_file, encoding="utf-8") as status_file:
+            return json.load(status_file)
+    except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+        return {
+            "generated_at": None,
+            "available": False,
+            "message": f"Host status unavailable: {error}",
+            "services": {},
+            "last_postgres_backup": None,
+        }
 
 
 @app.get("/api/operations")
@@ -251,6 +284,8 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
         raise HTTPException(status_code=409, detail="Source name already exists")
     source = Source(**payload.model_dump())
     session.add(source)
+    session.flush()
+    record_event(session, "SOURCE_CREATED", f"Source '{source.name}' configured", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
 
@@ -269,6 +304,7 @@ def import_inventory(source_id: int, payload: InventoryImport, session: Session 
             continue
         session.add(ObjectRecord(source_id=source_id, **item.model_dump()))
         inserted += 1
+    record_event(session, "INVENTORY_IMPORTED", f"Imported {inserted} inventory record(s); skipped {len(payload.items) - inserted} duplicate(s)", source_id=source_id)
     session.commit()
     return {"inserted": inserted, "skipped_duplicates": len(payload.items) - inserted}
 
@@ -325,6 +361,7 @@ def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(
         raise HTTPException(status_code=409, detail="No discovered objects fit in this wave")
     wave.status = "READY_FOR_RESTORE"
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
+    record_event(session, "WAVE_CREATED", f"Wave '{wave.name}' created with {assigned} object(s) and {assigned_bytes} byte(s)", source_id=source_id, wave_id=wave.id)
     session.commit()
     return {"id": wave.id, "name": wave.name, "objects": assigned, "bytes": assigned_bytes, "status": wave.status}
 
@@ -395,6 +432,7 @@ def pause_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     if wave.status == "PAUSED":
         return {"wave_id": wave.id, "status": wave.status}
     wave.status = "PAUSED"
+    record_event(session, "WAVE_PAUSED", f"Wave '{wave.name}' paused", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
@@ -408,6 +446,7 @@ def resume_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
     if not queued:
         session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
+    record_event(session, "WAVE_RESUMED", f"Wave '{wave.name}' resumed", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
@@ -423,6 +462,7 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
         raise HTTPException(status_code=409, detail="This wave already has a queued or running task")
     wave.status = "READY_FOR_RESTORE"
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
+    record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}'", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status, "message": "Restore task queued"}
 
@@ -437,6 +477,19 @@ def list_tasks(limit: int = 100, session: Session = Depends(get_session)) -> lis
             for task in tasks]
 
 
+@app.get("/api/events")
+def list_events(limit: int = 100, source_id: int | None = None, wave_id: int | None = None, session: Session = Depends(get_session)) -> list[dict]:
+    limit = min(max(limit, 1), 500)
+    query = select(Event)
+    if source_id is not None:
+        query = query.where(Event.source_id == source_id)
+    if wave_id is not None:
+        query = query.where(Event.wave_id == wave_id)
+    events = session.scalars(query.order_by(Event.created_at.desc(), Event.id.desc()).limit(limit))
+    return [{"id": event.id, "kind": event.kind, "message": event.message, "source_id": event.source_id,
+             "wave_id": event.wave_id, "created_at": event.created_at} for event in events]
+
+
 @app.post("/api/tasks/claim")
 def claim_task(payload: ClaimRequest, session: Session = Depends(get_session)) -> dict | None:
     now = utcnow()
@@ -449,6 +502,7 @@ def claim_task(payload: ClaimRequest, session: Session = Depends(get_session)) -
     task.worker_id = payload.worker_id
     task.attempts += 1
     task.lease_expires_at = now + timedelta(seconds=payload.lease_seconds)
+    record_event(session, "TASK_CLAIMED", f"Task {task.id} claimed by worker '{payload.worker_id}'", wave_id=task.wave_id)
     session.commit()
     return {"task_id": task.id, "kind": task.kind, "wave_id": task.wave_id, "attempt": task.attempts, "lease_expires_at": task.lease_expires_at}
 
@@ -471,6 +525,7 @@ def succeed_task(task_id: int, payload: TaskUpdate, session: Session = Depends(g
     task.state = TaskState.SUCCEEDED
     task.lease_expires_at = None
     task.error = None
+    record_event(session, "TASK_SUCCEEDED", f"Task {task.id} succeeded", wave_id=task.wave_id)
     session.commit()
     return {"task_id": task.id, "state": task.state}
 
@@ -484,6 +539,7 @@ def fail_task(task_id: int, payload: TaskUpdate, session: Session = Depends(get_
     task.available_at = utcnow() + timedelta(seconds=payload.retry_after_seconds)
     task.lease_expires_at = None
     task.error = payload.error or "Worker reported failure"
+    record_event(session, "TASK_RETRY_QUEUED", f"Task {task.id} returned to queue: {task.error}", wave_id=task.wave_id)
     session.commit()
     return {"task_id": task.id, "state": task.state, "available_at": task.available_at}
 
@@ -498,5 +554,6 @@ def recover_expired_tasks(session: Session = Depends(get_session)) -> dict:
         task.worker_id = None
         task.lease_expires_at = None
         task.error = "Lease expired; task recovered after worker interruption"
+        record_event(session, "TASK_RECOVERED", f"Task {task.id} recovered after lease expiration", wave_id=task.wave_id)
     session.commit()
     return {"recovered": len(expired)}

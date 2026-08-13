@@ -4,8 +4,9 @@ set -euo pipefail
 install_root=/opt/s3-oci-migration/release
 data_root=/var/lib/s3-oci-migration
 secret_root=/etc/s3-oci-migration/secrets
+runtime_root=/run/s3-oci-migration
 
-mkdir -p "$data_root/postgres" "$secret_root"
+mkdir -p "$data_root/postgres" "$secret_root" "$runtime_root"
 chmod 700 "$secret_root"
 
 # The initial password is deliberately local-only. The production installer
@@ -41,6 +42,7 @@ podman run -d --name s3-oci-app --replace --restart unless-stopped \
   -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,Z" \
+  -v "$runtime_root:/run/platform-status:ro,Z" \
   localhost/s3-oci-migration:latest
 
 cat >/etc/systemd/system/s3-oci-migration.service <<'EOF'
@@ -85,3 +87,29 @@ WantedBy=timers.target
 EOF
 systemctl daemon-reload
 systemctl enable --now s3-oci-backup-postgres.timer
+
+install -m 0750 "$install_root/scripts/write-platform-status.sh" /usr/local/sbin/s3-oci-write-platform-status
+cat >/etc/systemd/system/s3-oci-platform-status.service <<'EOF'
+[Unit]
+Description=Write S3 to OCI migration platform status
+After=s3-oci-migration.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s3-oci-write-platform-status
+EOF
+cat >/etc/systemd/system/s3-oci-platform-status.timer <<'EOF'
+[Unit]
+Description=Refresh S3 to OCI migration platform status
+
+[Timer]
+OnBootSec=30
+OnUnitActiveSec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now s3-oci-platform-status.timer
+/usr/local/sbin/s3-oci-write-platform-status
