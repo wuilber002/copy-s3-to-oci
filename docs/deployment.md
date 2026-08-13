@@ -41,6 +41,8 @@ A console é o plano de controle local e persiste suas operações no PostgreSQL
 - saúde do banco/fila e espaço livre do volume, além de recuperação de tarefas cujo lease expirou após interrupção; e
 - histórico operacional persistente para ações administrativas e de fila.
 
+Os parâmetros operacionais são persistidos no PostgreSQL. O worker simulado é uma ferramenta de PoC: fica instalado, mas inerte por padrão, e só processa tarefas quando a opção explícita for habilitada pela console. Ele nunca chama AWS ou OCI; apenas percorre os estados fictícios de restore, polling e transferência para validar leases, retomada e auditoria.
+
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 
 Neste estágio, discovery, restore, cópia e verificação ainda dependem do worker AWS/OCI, que será habilitado após a configuração dos Secrets e do ambiente AWS. O discovery produtivo será feito por listagens S3 paginadas e não haverá cadastro manual de objetos pela interface. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.

@@ -140,6 +140,20 @@ class Event(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class RuntimeSettings(Base):
+    __tablename__ = "runtime_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    transfer_workers: Mapped[int] = mapped_column(Integer, default=4)
+    max_throughput_mbps: Mapped[int] = mapped_column(Integer, default=1100)
+    default_wave_size_bytes: Mapped[int] = mapped_column(BigInteger, default=10 * 1024**4)
+    default_restore_days: Mapped[int] = mapped_column(Integer, default=7)
+    default_restore_tier: Mapped[str] = mapped_column(String(16), default="BULK")
+    task_lease_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    simulation_enabled: Mapped[bool] = mapped_column(default=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class SourceCreate(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$")
     s3_bucket: str
@@ -181,6 +195,20 @@ class TaskUpdate(BaseModel):
     retry_after_seconds: int = Field(default=300, ge=30, le=86400)
 
 
+class RuntimeSettingsUpdate(BaseModel):
+    transfer_workers: int = Field(ge=1, le=64)
+    max_throughput_mbps: int = Field(ge=1, le=1200)
+    default_wave_size_bytes: int = Field(gt=0, le=10 * 1024**4)
+    default_restore_days: int = Field(ge=1, le=30)
+    default_restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
+    task_lease_seconds: int = Field(ge=30, le=3600)
+    simulation_enabled: bool = False
+
+
+class SimulationTaskUpdate(BaseModel):
+    worker_id: str = Field(min_length=1, max_length=128)
+
+
 app = FastAPI(title="S3 to OCI Migration", version="0.3.0")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
@@ -218,6 +246,22 @@ def task_or_404(session: Session, task_id: int) -> Task:
 
 def record_event(session: Session, kind: str, message: str, source_id: int | None = None, wave_id: int | None = None) -> None:
     session.add(Event(kind=kind, message=message, source_id=source_id, wave_id=wave_id))
+
+
+def runtime_settings(session: Session) -> RuntimeSettings:
+    settings = session.get(RuntimeSettings, 1)
+    if not settings:
+        settings = RuntimeSettings(id=1)
+        session.add(settings)
+        session.commit()
+    return settings
+
+
+def settings_dict(settings: RuntimeSettings) -> dict:
+    return {"transfer_workers": settings.transfer_workers, "max_throughput_mbps": settings.max_throughput_mbps,
+            "default_wave_size_bytes": settings.default_wave_size_bytes, "default_restore_days": settings.default_restore_days,
+            "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
+            "simulation_enabled": settings.simulation_enabled, "updated_at": settings.updated_at}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -269,6 +313,21 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
         "tasks": task_counts,
         "disk": {"total": volume.total, "used": volume.used, "free": volume.free},
     }
+
+
+@app.get("/api/settings")
+def get_settings(session: Session = Depends(get_session)) -> dict:
+    return settings_dict(runtime_settings(session))
+
+
+@app.put("/api/settings")
+def update_settings(payload: RuntimeSettingsUpdate, session: Session = Depends(get_session)) -> dict:
+    settings = runtime_settings(session)
+    for field, value in payload.model_dump().items():
+        setattr(settings, field, value)
+    record_event(session, "SETTINGS_UPDATED", "Operational transfer settings updated")
+    session.commit()
+    return settings_dict(settings)
 
 
 @app.get("/api/sources")
@@ -515,6 +574,47 @@ def heartbeat_task(task_id: int, payload: ClaimRequest, session: Session = Depen
     task.lease_expires_at = utcnow() + timedelta(seconds=payload.lease_seconds)
     session.commit()
     return {"task_id": task.id, "lease_expires_at": task.lease_expires_at}
+
+
+@app.post("/api/tasks/{task_id}/simulate")
+def simulate_task(task_id: int, payload: SimulationTaskUpdate, session: Session = Depends(get_session)) -> dict:
+    """Advance a task without any AWS/OCI call; restricted to explicit PoC mode."""
+    settings = runtime_settings(session)
+    if not settings.simulation_enabled:
+        raise HTTPException(status_code=409, detail="Simulation mode is disabled")
+    task = task_or_404(session, task_id)
+    if task.state != TaskState.RUNNING or task.worker_id != payload.worker_id:
+        raise HTTPException(status_code=409, detail="Task is not leased by this worker")
+    wave = task.wave
+    objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
+    next_kind: str | None = None
+    if task.kind == "SUBMIT_BATCH_RESTORE":
+        for obj in objects:
+            if obj.state == ObjectState.WAVE_ASSIGNED:
+                obj.state = ObjectState.RESTORE_REQUESTED
+        wave.status = "RESTORE_REQUESTED"
+        next_kind = "POLL_RESTORE"
+    elif task.kind == "POLL_RESTORE":
+        for obj in objects:
+            if obj.state in [ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING]:
+                obj.state = ObjectState.RESTORED
+        wave.status = "RESTORED"
+        next_kind = "TRANSFER_WAVE"
+    elif task.kind == "TRANSFER_WAVE":
+        for obj in objects:
+            if obj.state == ObjectState.RESTORED:
+                obj.state = ObjectState.VERIFIED
+        wave.status = "VERIFIED"
+    else:
+        raise HTTPException(status_code=422, detail=f"Task kind '{task.kind}' is not supported by simulation")
+    task.state = TaskState.SUCCEEDED
+    task.lease_expires_at = None
+    task.error = None
+    if next_kind:
+        session.add(Task(wave_id=wave.id, kind=next_kind))
+    record_event(session, "TASK_SIMULATED", f"Simulated {task.kind} for wave '{wave.name}'", source_id=wave.source_id, wave_id=wave.id)
+    session.commit()
+    return {"task_id": task.id, "state": task.state, "wave_id": wave.id, "wave_status": wave.status, "next_task": next_kind}
 
 
 @app.post("/api/tasks/{task_id}/succeed")

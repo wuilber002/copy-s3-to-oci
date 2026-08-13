@@ -113,3 +113,22 @@ EOF
 systemctl daemon-reload
 systemctl enable --now s3-oci-platform-status.timer
 /usr/local/sbin/s3-oci-write-platform-status
+
+install -m 0750 "$install_root/scripts/simulated-worker.py" /usr/local/sbin/s3-oci-simulated-worker
+cat >/etc/systemd/system/s3-oci-simulated-worker.service <<'EOF'
+[Unit]
+Description=S3 to OCI migration simulated worker (PoC only)
+After=s3-oci-migration.service
+Requires=s3-oci-migration.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/s3-oci-simulated-worker
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now s3-oci-simulated-worker.service
