@@ -72,6 +72,12 @@ variable "ssh_public_key" {
   type        = string
 }
 
+variable "assign_public_ip" {
+  description = "Assign a public IPv4 address to the VM. Enable only when the selected subnet and security rules restrict SSH appropriately."
+  type        = bool
+  default     = false
+}
+
 variable "resource_name_prefix" {
   description = "Prefix used in names of all created resources."
   type        = string

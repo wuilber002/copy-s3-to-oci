@@ -104,7 +104,7 @@ resource "oci_core_instance" "migration" {
 
   create_vnic_details {
     subnet_id        = var.subnet_ocid
-    assign_public_ip = false
+    assign_public_ip = var.assign_public_ip
   }
 
   metadata = {

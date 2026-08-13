@@ -11,6 +11,7 @@
 
 1. Crie um Stack a partir de `terraform/orm` neste repositório.
 2. Preencha o formulário. Use 8 OCPUs, 32 GB e boot volume de 500 GB como ponto de partida.
+   Para uma PoC em subnet pública, habilite `Assign public IP to VM` somente se a security list/NSG restringir a porta 22 à rede administrativa. Em subnet privada, mantenha desligado e use o bastion/VPN do cliente.
 3. Mantenha a criação de Vault, Key e Secrets: esses recursos são obrigatórios e sempre criados.
 4. Se criar policy, informe os buckets OCI de destino em `destination_buckets_json`. Agrupe buckets no mesmo compartment sempre que possível.
 5. Aplique o stack.

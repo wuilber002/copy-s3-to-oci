@@ -15,6 +15,7 @@ groupings:
       - memory_in_gbs
       - boot_volume_size_in_gbs
       - ssh_public_key
+      - assign_public_ip
       - resource_name_prefix
   - title: Vault and Secrets (always created)
     variables:
@@ -78,6 +79,11 @@ variables:
     title: SSH public key
     type: string
     required: true
+  assign_public_ip:
+    title: Assign public IP to VM
+    type: boolean
+    default: false
+    description: Enable only for a public subnet with SSH ingress restricted to the administrator network. The web interface remains localhost-only.
   resource_name_prefix:
     title: Resource name prefix
     type: string
