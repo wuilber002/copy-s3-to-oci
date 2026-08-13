@@ -1,0 +1,134 @@
+title: S3 Glacier to OCI Object Storage Migration
+description: Provisions one Linux VM, OCI Vault/Key/Secrets, and optional least-privilege instance-principal IAM resources.
+schemaVersion: 1.1.0
+version: 0.1.0
+locale: en
+groupings:
+  - title: VM configuration
+    variables:
+      - compartment_ocid
+      - availability_domain
+      - subnet_ocid
+      - image_ocid
+      - instance_shape
+      - ocpus
+      - memory_in_gbs
+      - boot_volume_size_in_gbs
+      - ssh_public_key
+      - resource_name_prefix
+  - title: Vault and Secrets (always created)
+    variables:
+      - vault_compartment_ocid
+      - key_compartment_ocid
+      - secrets_compartment_ocid
+  - title: Instance principal and OCI policy
+    variables:
+      - create_dynamic_group
+      - dynamic_group_name
+      - existing_dynamic_group_name
+      - create_oci_policy
+      - policy_compartment_ocid
+      - destination_buckets_json
+  - title: Recovery
+    variables:
+      - backup_policy_id
+variables:
+  compartment_ocid:
+    title: VM compartment
+    type: oci:identity:compartment:id
+    required: true
+  availability_domain:
+    title: Availability domain
+    type: oci:identity:availabilitydomain:name
+    dependsOn:
+      compartmentId: ${compartment_ocid}
+    required: true
+  subnet_ocid:
+    title: Existing subnet
+    type: oci:core:subnet:id
+    dependsOn:
+      compartmentId: ${compartment_ocid}
+    required: true
+    description: The customer is responsible for HTTPS egress to AWS S3, AWS STS, OCI Vault, OCI Object Storage, and GitHub Releases.
+  image_ocid:
+    title: Linux image OCID
+    type: string
+    required: true
+  instance_shape:
+    title: VM shape
+    type: string
+    default: VM.Standard.E5.Flex
+    required: true
+  ocpus:
+    title: OCPUs
+    type: number
+    default: 8
+    required: true
+  memory_in_gbs:
+    title: Memory (GB)
+    type: number
+    default: 32
+    required: true
+  boot_volume_size_in_gbs:
+    title: Boot volume size (GB)
+    type: number
+    default: 500
+    required: true
+  ssh_public_key:
+    title: SSH public key
+    type: string
+    required: true
+  resource_name_prefix:
+    title: Resource name prefix
+    type: string
+    default: s3-oci-migration
+    required: true
+  vault_compartment_ocid:
+    title: Vault compartment
+    type: oci:identity:compartment:id
+    required: true
+  key_compartment_ocid:
+    title: Key compartment
+    type: oci:identity:compartment:id
+    required: true
+  secrets_compartment_ocid:
+    title: Secrets compartment
+    type: oci:identity:compartment:id
+    required: true
+  create_dynamic_group:
+    title: Create dynamic group
+    type: boolean
+    default: true
+    required: true
+  dynamic_group_name:
+    title: New dynamic group name (optional)
+    type: string
+    description: Leave blank to use <resource-name-prefix>-vm.
+    visible: ${create_dynamic_group}
+  existing_dynamic_group_name:
+    title: Existing dynamic group name
+    type: string
+    required: true
+    visible: ${create_dynamic_group == false}
+  create_oci_policy:
+    title: Create OCI policy
+    type: boolean
+    default: true
+    required: true
+    description: Warning: OCI limits the number of policy statements by compartment. This stack uses one Object Storage statement per distinct destination-bucket compartment, plus two common statements.
+  policy_compartment_ocid:
+    title: Policy compartment
+    type: oci:identity:compartment:id
+    required: true
+    visible: ${create_oci_policy}
+    description: Must be the tenancy root or a parent compartment that governs all destination-bucket compartments.
+  destination_buckets_json:
+    title: Destination buckets JSON
+    type: string
+    required: true
+    visible: ${create_oci_policy}
+    description: '[{"name":"destination-a","compartment_id":"ocid1.compartment..."}]. Buckets in the same compartment become one policy statement.'
+  backup_policy_id:
+    title: Existing boot-volume backup policy OCID (optional)
+    type: string
+    description: Assign an existing automatic backup policy. Leave blank only if the customer will attach one immediately after provisioning.

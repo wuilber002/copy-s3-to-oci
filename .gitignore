@@ -1,0 +1,10 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+.tenancy_oci_auth/
+.env
+*.pem
+*.key
+releases/
