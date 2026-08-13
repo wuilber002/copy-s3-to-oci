@@ -35,12 +35,18 @@ podman run -d --name s3-oci-postgres --replace --restart unless-stopped \
   -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,Z" \
   docker.io/library/postgres:16-alpine
 
+postgres_ready=false
 for attempt in $(seq 1 30); do
   if podman exec s3-oci-postgres pg_isready -U migration -d migration >/dev/null 2>&1; then
+    postgres_ready=true
     break
   fi
   sleep 2
 done
+if [[ "$postgres_ready" != true ]]; then
+  echo "PostgreSQL did not become ready" >&2
+  exit 1
+fi
 
 podman build -t localhost/s3-oci-migration:latest "$install_root"
 podman run -d --name s3-oci-app --replace --restart unless-stopped \
