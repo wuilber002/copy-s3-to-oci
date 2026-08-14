@@ -166,7 +166,7 @@ def submit_restore(session, task: Task, settings) -> None:
     )
     wave.batch_job_id, wave.manifest_key, wave.manifest_etag, wave.status = job["JobId"], manifest_key, response["ETag"].strip('"'), "RESTORE_REQUESTED"
     for obj in archives:
-        obj.state = ObjectState.RESTORE_REQUESTED
+        obj.state, obj.restore_requested_at = ObjectState.RESTORE_REQUESTED, utcnow()
     event(session, "BATCH_RESTORE_SUBMITTED", f"Batch job {wave.batch_job_id} submitted for {len(archives)} archive object(s)", source_id=source.id, wave_id=wave.id)
     succeed(session, task, "POLL_RESTORE")
 

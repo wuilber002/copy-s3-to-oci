@@ -113,6 +113,7 @@ class ObjectRecord(Base):
     source_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
     destination_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
     checksum_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    restore_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -309,6 +310,7 @@ def create_schema() -> None:
         "source_checksum": "VARCHAR(256)",
         "destination_checksum": "VARCHAR(256)",
         "checksum_algorithm": "VARCHAR(32)",
+        "restore_requested_at": "TIMESTAMP WITH TIME ZONE",
         "restored_at": "TIMESTAMP WITH TIME ZONE",
         "transferred_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_started_at": "TIMESTAMP WITH TIME ZONE",
@@ -564,6 +566,12 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             ObjectRecord.storage_class.in_(ARCHIVE_STORAGE_CLASSES),
         )
     ).one()
+    restore_requested_total, restore_available_total = session.execute(
+        select(
+            func.count(ObjectRecord.id).filter(ObjectRecord.restore_requested_at.is_not(None)),
+            func.count(ObjectRecord.id).filter(ObjectRecord.restore_requested_at.is_not(None), ObjectRecord.restored_at.is_not(None)),
+        )
+    ).one()
     transferred_bytes, transferred_files, restored_files = int(transferred_bytes or 0), int(transferred_files or 0), int(restored_files or 0)
     transfer_seconds = min(window_seconds, max(1, (utcnow() - first_transfer).total_seconds())) if first_transfer else window_seconds
     restore_seconds = min(window_seconds, max(1, (utcnow() - first_restore).total_seconds())) if first_restore else window_seconds
@@ -613,10 +621,14 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "window_seconds": window_seconds,
             "transfer_bytes": transferred_bytes,
             "transfer_files": transferred_files,
+            "transferred_per_minute": round(transferred_files / (transfer_seconds / 60), 2),
+            "transferred_per_hour": round(transferred_files / (transfer_seconds / 3600), 2),
             "transfer_mbps": round((transferred_bytes * 8) / transfer_seconds / 1_000_000, 2),
             "transfer_live_mbps": round(live_transfer_mbps, 2),
             "transfer_live_window_seconds": live_window_seconds,
             "restored_files": restored_files,
+            "restore_requested_total": int(restore_requested_total or 0),
+            "restore_available_total": int(restore_available_total or 0),
             "restored_per_minute": round(restored_files / (restore_seconds / 60), 2),
             "restored_per_hour": round(restored_files / (restore_seconds / 3600), 2),
             "active_transfers": active_transfers,
