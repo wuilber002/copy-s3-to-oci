@@ -56,6 +56,7 @@ class ObjectState(StrEnum):
     RESTORING = "RESTORING"
     RESTORED = "RESTORED"
     TRANSFERRING = "TRANSFERRING"
+    TRANSFERRED = "TRANSFERRED"
     VERIFIED = "VERIFIED"
     FAILED = "FAILED"
 
@@ -687,7 +688,7 @@ def archive_source(source_id: int, session: Session = Depends(get_session)) -> d
     source = source_or_404(session, source_id)
     if not source_has_executed_wave(session, source_id):
         raise HTTPException(status_code=409, detail="A source without an executed wave must be deleted, not archived")
-    for wave in session.scalars(select(Wave).where(Wave.source_id == source_id, Wave.status.not_in(["VERIFIED", "TRANSFERRED_WITH_ERRORS"]))):
+    for wave in session.scalars(select(Wave).where(Wave.source_id == source_id, Wave.status.not_in(["VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"]))):
         wave.status = "PAUSED"
     source.archived_at, source.status = utcnow(), "ARCHIVED"
     record_event(session, "SOURCE_ARCHIVED", f"Source '{source.name}' archived; historical data retained", source_id=source.id)
@@ -1035,6 +1036,24 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 
 
+@app.post("/api/waves/{wave_id}/verify")
+def verify_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    """Queue integrity verification only when an operator explicitly requests it."""
+    wave = wave_or_404(session, wave_id)
+    if wave.status not in {"TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}:
+        raise HTTPException(status_code=409, detail="Integrity verification can only be requested after transfer completes")
+    queued = session.scalar(select(Task.id).where(
+        Task.wave_id == wave.id, Task.kind == "VERIFY_WAVE", Task.state.in_([TaskState.READY, TaskState.RUNNING])
+    ))
+    if queued:
+        raise HTTPException(status_code=409, detail="Integrity verification is already queued or running for this wave")
+    wave.status = "VERIFICATION_QUEUED"
+    session.add(Task(wave_id=wave.id, kind="VERIFY_WAVE"))
+    record_event(session, "INTEGRITY_VERIFICATION_QUEUED", f"Integrity verification queued by operator for wave '{wave.name}'", source_id=wave.source_id, wave_id=wave.id)
+    session.commit()
+    return {"wave_id": wave.id, "status": wave.status, "message": "Integrity verification queued"}
+
+
 @app.post("/api/waves/{wave_id}/pause")
 def pause_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
@@ -1210,7 +1229,13 @@ def simulate_task(task_id: int, payload: SimulationTaskUpdate, session: Session 
     elif task.kind == "TRANSFER_WAVE":
         for obj in objects:
             if obj.state == ObjectState.RESTORED:
+                obj.state = ObjectState.TRANSFERRED
+        wave.status = "TRANSFERRED"
+    elif task.kind == "VERIFY_WAVE":
+        for obj in objects:
+            if obj.state == ObjectState.TRANSFERRED:
                 obj.state = ObjectState.VERIFIED
+                obj.integrity_verified_at = utcnow()
         wave.status = "VERIFIED"
     else:
         raise HTTPException(status_code=422, detail=f"Task kind '{task.kind}' is not supported by simulation")

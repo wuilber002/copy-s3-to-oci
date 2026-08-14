@@ -11,7 +11,7 @@ O PostgreSQL é a fonte de verdade e a fila durável. As tarefas usam reserva tr
 - Um objeto maior que o alvo não bloqueia o planejamento: ele recebe uma onda exclusiva sinalizada no histórico. A criação automática é limitada a 10.000 ondas por ação como proteção operacional.
 - Uma onda só pode ser excluída antes de uma tarefa ser assumida; a exclusão devolve seus objetos a `DISCOVERED`. Depois de restore, polling, transferência ou verificação iniciados, os dados são preservados para auditoria.
 - A origem é lida uma única vez por objeto e enviada em streaming para OCI Object Storage.
-- SHA-256 é calculado durante o streaming e é a evidência principal de integridade; MD5 é registrado como evidência complementar.
+- SHA-256 é calculado durante o streaming e é a evidência principal de integridade; MD5 é registrado como evidência complementar. A transferência apenas persiste os dois valores SHA-256; a comparação e a transição para `VERIFIED` só ocorrem na tarefa `VERIFY_WAVE`, enfileirada explicitamente pelo operador.
 - Discovery usa somente listagem e campos retornados pelo S3; não faz restore nem leitura de conteúdo.
 - Chamadas AWS são minimizadas. Restore usa S3 Batch Operations por onda; polling usa estado da Batch job e listagem paginada com `RestoreStatus`.
 - A chave do S3 é preservada no OCI. Metadados e tags são preservados no destino quando compatíveis e sempre no manifesto imutável da migração.

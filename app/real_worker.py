@@ -239,18 +239,40 @@ def transfer_wave(session, task: Task, settings) -> None:
         for chunk in iter(lambda: destination_body.read(8 * 1024 * 1024), b""):
             destination_digest.update(chunk)
         destination_checksum = destination_digest.hexdigest()
-        if checksum != destination_checksum:
-            obj.integrity_error = "SHA-256 source/destination mismatch"
-            obj.state = ObjectState.FAILED
-            session.commit()
-            raise RuntimeError(f"SHA-256 mismatch after upload for object {obj.id}")
         obj.metadata_json, obj.tags_json = json.dumps(head.get("Metadata", {})), tags_json
         obj.source_checksum, obj.destination_checksum = checksum, destination_checksum
-        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error, obj.state = "SHA256", utcnow(), None, ObjectState.VERIFIED
+        # Transfer collects immutable checksum evidence, but does not compare it
+        # or declare the object verified. That is an explicit operator action.
+        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error, obj.state = "SHA256", None, None, ObjectState.TRANSFERRED
         session.commit()
-    remaining = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.VERIFIED)) or 0
-    wave.status = "VERIFIED" if not remaining else "TRANSFERRED_WITH_ERRORS"
-    event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed", source_id=source.id, wave_id=wave.id)
+    remaining = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.TRANSFERRED)) or 0
+    wave.status = "TRANSFERRED" if not remaining else "TRANSFERRED_WITH_ERRORS"
+    event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed. Integrity verification awaits operator request.", source_id=source.id, wave_id=wave.id)
+    succeed(session, task)
+
+
+def verify_wave(session, task: Task) -> None:
+    """Compare transfer evidence only after the operator has queued verification."""
+    wave = session.get(Wave, task.wave_id)
+    source = wave.source
+    objects = list(session.scalars(select(ObjectRecord).where(
+        ObjectRecord.wave_id == wave.id, ObjectRecord.state == ObjectState.TRANSFERRED
+    ).order_by(ObjectRecord.id)))
+    failed = 0
+    for obj in objects:
+        if not obj.source_checksum or not obj.destination_checksum:
+            obj.integrity_error, obj.state = "SHA-256 evidence is missing after transfer", ObjectState.FAILED
+            failed += 1
+        elif obj.source_checksum != obj.destination_checksum:
+            obj.integrity_error, obj.state = "SHA-256 source/destination mismatch", ObjectState.FAILED
+            failed += 1
+        else:
+            obj.integrity_error, obj.integrity_verified_at, obj.state = None, utcnow(), ObjectState.VERIFIED
+    remaining = session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.VERIFIED
+    )) or 0
+    wave.status = "VERIFIED" if not remaining else "VERIFICATION_FAILED"
+    event(session, "INTEGRITY_VERIFICATION_COMPLETED", f"Operator-requested integrity verification completed; {remaining} object(s) failed or remain pending", source_id=source.id, wave_id=wave.id)
     succeed(session, task)
 
 
@@ -271,6 +293,7 @@ def run_once() -> None:
             if task.kind == "SUBMIT_BATCH_RESTORE": submit_restore(session, task, settings)
             elif task.kind == "POLL_RESTORE": poll_restore(session, task, settings)
             elif task.kind == "TRANSFER_WAVE": transfer_wave(session, task, settings)
+            elif task.kind == "VERIFY_WAVE": verify_wave(session, task)
             else: raise RuntimeError(f"Unsupported real worker task {task.kind}")
         except Exception as error: retry(session, task, error)
 
