@@ -1396,7 +1396,8 @@ def deep_audit_preview(wave_id: int, session: Session = Depends(get_session)) ->
         raise HTTPException(status_code=409, detail="Integrity verification can only be requested after transfer completes")
     objects, total_bytes = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.wave_id == wave.id)).one()
     throughput_mbps = runtime_settings(session).max_throughput_mbps
-    minimum_seconds = int((int(total_bytes) * 8) / max(1, throughput_mbps * 1_000_000))
+    denominator = max(1, throughput_mbps * 1_000_000)
+    minimum_seconds = max(1, (int(total_bytes) * 8 + denominator - 1) // denominator) if total_bytes else 0
     return {"wave_id": wave.id, "wave_name": wave.name, "source_name": wave.source.name,
             "objects": int(objects), "bytes": int(total_bytes), "throughput_mbps": throughput_mbps,
             "minimum_seconds": minimum_seconds}
