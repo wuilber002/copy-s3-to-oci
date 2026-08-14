@@ -20,7 +20,7 @@
 
 Depois do deploy, abra **Configurações → Inventário de buckets OCI** e use **Atualizar buckets OCI**. A consulta ocorre somente sob demanda via OCI Resource Search no tenancy e o resultado é persistido no PostgreSQL. O cadastro de origem aceita apenas um bucket presente nesse cache; a policy da Dynamic Group continua sendo a autorização efetiva para escrita.
 
-Uma origem sem discovery, inventário ou ondas pode ser excluída definitivamente. Depois que houver dado operacional, a interface disponibiliza somente **Arquivar**: ela pausa ondas não concluídas, remove a origem da lista diária e mantém todo o histórico para auditoria.
+Uma origem com apenas cadastro, discovery, inventário ou ondas ainda não executadas pode ser excluída definitivamente, removendo também esses dados de preview. Depois que um worker assumir qualquer onda, a interface disponibiliza somente **Arquivar**: ela pausa ondas não concluídas, remove a origem da lista diária e mantém todo o histórico para auditoria.
 
 ## Acesso local à interface
 

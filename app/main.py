@@ -583,7 +583,7 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
              "discovery_error": s.discovery_error, "archived_at": s.archived_at,
-             "can_delete": not source_has_operational_data(session, s.id)}
+             "can_delete": not source_has_executed_wave(session, s.id)}
             for s in session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id))]
 
 
@@ -620,9 +620,19 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
     return {"id": source.id, "name": source.name, "status": source.status}
 
 
-def source_has_operational_data(session: Session, source_id: int) -> bool:
-    return bool(session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id)) or
-                session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)))
+def source_has_executed_wave(session: Session, source_id: int) -> bool:
+    """A queued or drafted wave is removable; a claimed wave is audit data."""
+    task_was_claimed = session.scalar(
+        select(func.count(Task.id)).join(Wave).where(Wave.source_id == source_id, Task.attempts > 0)
+    ) or 0
+    progressed_object = session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.source_id == source_id,
+        ObjectRecord.state.not_in([ObjectState.DISCOVERED, ObjectState.WAVE_ASSIGNED]),
+    )) or 0
+    submitted_batch = session.scalar(select(func.count(Wave.id)).where(
+        Wave.source_id == source_id, Wave.batch_job_id.is_not(None)
+    )) or 0
+    return bool(task_was_claimed or progressed_object or submitted_batch)
 
 
 def active_source_or_409(session: Session, source_id: int) -> Source:
@@ -635,9 +645,16 @@ def active_source_or_409(session: Session, source_id: int) -> Source:
 @app.delete("/api/sources/{source_id}")
 def delete_source(source_id: int, session: Session = Depends(get_session)) -> dict:
     source = source_or_404(session, source_id)
-    if source_has_operational_data(session, source_id):
-        raise HTTPException(status_code=409, detail="This source has operational data and must be archived, not deleted")
-    session.query(Event).filter(Event.source_id == source_id).delete(synchronize_session=False)
+    if source_has_executed_wave(session, source_id):
+        raise HTTPException(status_code=409, detail="This source has an executed wave and must be archived, not deleted")
+    wave_ids = list(session.scalars(select(Wave.id).where(Wave.source_id == source_id)))
+    if wave_ids:
+        session.query(Event).filter((Event.source_id == source_id) | (Event.wave_id.in_(wave_ids))).delete(synchronize_session=False)
+        session.query(Task).filter(Task.wave_id.in_(wave_ids)).delete(synchronize_session=False)
+    else:
+        session.query(Event).filter(Event.source_id == source_id).delete(synchronize_session=False)
+    session.query(ObjectRecord).filter(ObjectRecord.source_id == source_id).delete(synchronize_session=False)
+    session.query(Wave).filter(Wave.source_id == source_id).delete(synchronize_session=False)
     session.delete(source)
     session.commit()
     return {"id": source_id, "deleted": True}
@@ -646,8 +663,8 @@ def delete_source(source_id: int, session: Session = Depends(get_session)) -> di
 @app.post("/api/sources/{source_id}/archive")
 def archive_source(source_id: int, session: Session = Depends(get_session)) -> dict:
     source = source_or_404(session, source_id)
-    if not source_has_operational_data(session, source_id):
-        raise HTTPException(status_code=409, detail="A source without operational data must be deleted, not archived")
+    if not source_has_executed_wave(session, source_id):
+        raise HTTPException(status_code=409, detail="A source without an executed wave must be deleted, not archived")
     for wave in session.scalars(select(Wave).where(Wave.source_id == source_id, Wave.status.not_in(["VERIFIED", "TRANSFERRED_WITH_ERRORS"]))):
         wave.status = "PAUSED"
     source.archived_at, source.status = utcnow(), "ARCHIVED"
