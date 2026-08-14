@@ -1161,7 +1161,8 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
                                                Task.state == TaskState.RUNNING)
     ))
     rows = session.execute(
-        select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0))
+        select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
+               func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at))
         .outerjoin(ObjectRecord, ObjectRecord.wave_id == Wave.id)
         .where(Wave.source_id == source_id)
         .group_by(Wave.id)
@@ -1169,10 +1170,11 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
     )
     return [{"id": wave.id, "name": wave.name, "status": wave.status, "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
+             "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and wave.status in {"TRANSFERRED", "VERIFIED"} else None,
              "last_poll_at": wave.last_poll_at,
              "can_delete": wave.id not in executed_wave_ids and wave.id not in progressed_wave_ids,
              "is_transferring": wave.id in transferring_wave_ids}
-            for wave, count, size in rows]
+            for wave, count, size, started, finished in rows]
 
 
 @app.delete("/api/waves/{wave_id}")
