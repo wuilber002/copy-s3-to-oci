@@ -1012,6 +1012,10 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
         select(ObjectRecord.wave_id).where(ObjectRecord.source_id == source_id, ObjectRecord.wave_id.is_not(None),
                                             ObjectRecord.state != ObjectState.WAVE_ASSIGNED)
     ))
+    transferring_wave_ids = set(session.scalars(
+        select(ObjectRecord.wave_id).where(ObjectRecord.source_id == source_id, ObjectRecord.wave_id.is_not(None),
+                                            ObjectRecord.state == ObjectState.TRANSFERRING)
+    ))
     rows = session.execute(
         select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0))
         .outerjoin(ObjectRecord, ObjectRecord.wave_id == Wave.id)
@@ -1022,7 +1026,8 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
     return [{"id": wave.id, "name": wave.name, "status": wave.status, "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
              "last_poll_at": wave.last_poll_at,
-             "can_delete": wave.id not in executed_wave_ids and wave.id not in progressed_wave_ids}
+             "can_delete": wave.id not in executed_wave_ids and wave.id not in progressed_wave_ids,
+             "is_transferring": wave.id in transferring_wave_ids}
             for wave, count, size in rows]
 
 
