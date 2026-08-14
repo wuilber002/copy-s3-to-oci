@@ -8,9 +8,9 @@ O repositório contém a infraestrutura para OCI Resource Manager e uma console 
 
 O procedimento de recursos AWS por AWS CloudShell/CLI está em [docs/aws-cli-setup.md](docs/aws-cli-setup.md). Ele é documentação; não há scripts de provisionamento AWS publicados no repositório.
 
-A console separa o trabalho em **Painel** (status e alertas do dia a dia), **Migrações** (fontes, inventário, ondas, fila e auditoria) e **Configurações** (ícone de engrenagem; parâmetros globais e pré-check OCI).
+A console separa o trabalho em **Status** (alertas, fila, transferências e auditorias em andamento), **Migrações** (fontes, inventário e ondas) e **Configurações** (ícone de engrenagem; parâmetros globais e pré-check OCI).
 
-Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker AWS/OCI real** executa discovery, S3 Batch Operations, polling e cópia; por segurança começa instalado, porém ocioso. A operação externa só começa após configurar a AWS, preencher o bucket de controle e habilitá-lo explicitamente em **Configurações**. A verificação de integridade é uma etapa separada, sempre enfileirada manualmente pelo operador após a transferência.
+Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker AWS/OCI real** executa discovery, S3 Batch Operations, polling e cópia; por segurança começa instalado, porém ocioso. A operação externa só começa após configurar a AWS, preencher o bucket de controle e habilitá-lo explicitamente em **Configurações**. A auditoria profunda é sempre enfileirada manualmente pelo operador após a transferência e exige confirmação reforçada.
 
 ## Garantias de desenho
 
@@ -19,7 +19,8 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker
 - Vault, Key e Secrets OCI sempre criados pelo Terraform, com placeholders instrutivos.
 - Credenciais AWS de bootstrap somente com access key/secret key; a aplicação assume uma role AWS de menor privilégio.
 - Restore em lote via S3 Batch Operations; chamadas AWS por objeto são evitadas sempre que houver alternativa bulk.
-- Evidência de integridade por objeto: durante a cópia, SHA-256 é calculado na leitura da origem e novamente no objeto OCI e fica registrado como evidência pendente. Somente a ação explícita **Verificar integridade** compara os valores, grava a data de verificação e pode mover o objeto para `VERIFIED`. ETag S3 não é tratado como MD5 universal.
+- Integridade padrão por objeto: a cópia calcula SHA-256 na leitura do S3 e o OCI valida SHA-256 antes de aceitar um `PutObject` pequeno ou cada parte de um multipart. A evidência de aceitação nativa fica persistida sem reler o destino. ETag S3 não é tratado como MD5 universal.
+- **Auditoria profunda SHA-256**: operação excepcional que relê todo o objeto OCI e compara o SHA-256 linear. A tela informa volume, tempo mínimo teórico, exige rolar o aviso e marcar confirmação antes de habilitar o início; o Status acompanha o progresso.
 - Metadados S3 são copiados para metadados OCI quando compatíveis; tags são preservadas integralmente no PostgreSQL e em uma representação JSON limitada nos metadados OCI.
 - Ondas de no máximo 10 TB; referência inicial de VM: 8 OCPUs, 32 GB RAM e 500 GB de boot volume.
 

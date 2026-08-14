@@ -211,19 +211,13 @@ def poll_restore(session, task: Task, settings) -> None:
     succeed(session, task, "TRANSFER_WAVE")
 
 
-class HashingStream:
-    def __init__(self, body, rate_bytes_per_second: float, progress=None):
-        self.body, self.digest, self.rate, self.progress = body, hashlib.sha256(), rate_bytes_per_second, progress
-    def read(self, amount=-1):
-        started = time.monotonic(); data = self.body.read(amount)
-        if data:
-            self.digest.update(data)
-            if self.progress:
-                self.progress(len(data))
-            if self.rate > 0:
-                elapsed = time.monotonic() - started; minimum = len(data) / self.rate
-                if minimum > elapsed: time.sleep(minimum - elapsed)
-        return data
+DIRECT_SHA_LIMIT = 16 * 1024 * 1024
+MULTIPART_PART_SIZE = 64 * 1024 * 1024
+COPY_CHUNK_SIZE = 8 * 1024 * 1024
+
+
+def sha256_b64(data: bytes) -> str:
+    return base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
 
 
 def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: str,
@@ -285,19 +279,95 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
             worker_session.commit()
             progress_baseline, progress_baseline_at, last_persist, persisted_once = progress_bytes, now, now, True
 
-        stream = HashingStream(body, rate_bytes_per_second, record_progress)
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
         oci_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
-        oci_client.put_object(namespace, destination_bucket, obj.object_key, stream,
-                              content_length=obj.size_bytes,
-                              content_type=response.get("ContentType"), opc_meta=metadata)
-        checksum = stream.digest.hexdigest()
+        full_digest = hashlib.sha256()
+
+        def read_part(limit: int) -> bytes:
+            chunks, remaining = [], limit
+            while remaining:
+                chunk = body.read(min(COPY_CHUNK_SIZE, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                full_digest.update(chunk)
+                remaining -= len(chunk)
+            return b"".join(chunks)
+
+        def throttle_uploaded(size: int, started: float) -> None:
+            if rate_bytes_per_second <= 0:
+                return
+            remaining = (size / rate_bytes_per_second) - (time.monotonic() - started)
+            if remaining > 0:
+                time.sleep(remaining)
+
+        if obj.size_bytes <= DIRECT_SHA_LIMIT:
+            payload = read_part(obj.size_bytes)
+            if len(payload) != obj.size_bytes:
+                raise RuntimeError(f"S3 object ended early: expected {obj.size_bytes} bytes, received {len(payload)}")
+            checksum_b64 = sha256_b64(payload)
+            upload_started = time.monotonic()
+            oci_client.put_object(
+                namespace, destination_bucket, obj.object_key, payload,
+                content_length=obj.size_bytes, content_type=response.get("ContentType"), opc_meta=metadata,
+                opc_checksum_algorithm="SHA256", opc_content_sha256=checksum_b64,
+            )
+            throttle_uploaded(len(payload), upload_started)
+            record_progress(len(payload))
+            delivery_algorithm, delivery_checksum = "SHA256", checksum_b64
+        else:
+            create = oci_client.create_multipart_upload(
+                namespace, destination_bucket,
+                oci.object_storage.models.CreateMultipartUploadDetails(
+                    object=obj.object_key, content_type=response.get("ContentType"), metadata=metadata,
+                ),
+                opc_checksum_algorithm="SHA256",
+            )
+            upload_id, parts, part_digests = create.data.upload_id, [], []
+            try:
+                part_number = 1
+                while True:
+                    payload = read_part(MULTIPART_PART_SIZE)
+                    if not payload:
+                        break
+                    digest_b64 = sha256_b64(payload)
+                    upload_started = time.monotonic()
+                    uploaded = oci_client.upload_part(
+                        namespace, destination_bucket, obj.object_key, upload_id, part_number, payload,
+                        content_length=len(payload), opc_checksum_algorithm="SHA256", opc_content_sha256=digest_b64,
+                    )
+                    throttle_uploaded(len(payload), upload_started)
+                    record_progress(len(payload))
+                    parts.append(oci.object_storage.models.CommitMultipartUploadPartDetails(
+                        part_num=part_number, etag=uploaded.headers["etag"],
+                    ))
+                    part_digests.append(base64.b64decode(digest_b64))
+                    part_number += 1
+                if not parts:
+                    raise RuntimeError("Multipart upload did not receive any part")
+                oci_client.commit_multipart_upload(
+                    namespace, destination_bucket, obj.object_key, upload_id,
+                    oci.object_storage.models.CommitMultipartUploadDetails(parts_to_commit=parts),
+                    opc_checksum_algorithm="SHA256",
+                )
+            except Exception:
+                try:
+                    oci_client.abort_multipart_upload(namespace, destination_bucket, obj.object_key, upload_id)
+                except Exception:
+                    pass
+                raise
+            delivery_algorithm = "SHA256_MULTIPART"
+            delivery_checksum = base64.b64encode(hashlib.sha256(b"".join(part_digests)).digest()).decode("ascii")
+        checksum = full_digest.hexdigest()
         obj.metadata_json, obj.tags_json = json.dumps(response.get("Metadata", {})), tags_json
         obj.source_checksum, obj.destination_checksum = checksum, None
-        # The destination is intentionally not reread here. SHA-256 comparison
-        # is a separate explicit verification task, avoiding an OCI GetObject
-        # request and a second full read for every transferred object.
+        # OCI independently verifies the submitted SHA-256 before accepting a
+        # direct object or every multipart part. This is the normal integrity
+        # control; a full destination reread remains an explicit deep audit.
         obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error = "SHA256", None, None
+        obj.delivery_integrity_algorithm = delivery_algorithm
+        obj.delivery_integrity_checksum = delivery_checksum
+        obj.delivery_integrity_status, obj.delivery_integrity_verified_at = "OCI_ACCEPTED", utcnow()
         obj.transfer_elapsed_seconds += max(0, time.monotonic() - elapsed_baseline)
         obj.state, obj.transferred_at = ObjectState.TRANSFERRED, utcnow()
         obj.transfer_progress_bytes, obj.transfer_progress_at, obj.transfer_rate_mbps = obj.size_bytes, utcnow(), 0
@@ -372,16 +442,33 @@ def verify_wave(session, task: Task) -> None:
     for obj in objects:
         if not obj.source_checksum:
             obj.integrity_error, obj.state = "SHA-256 source evidence is missing after transfer", ObjectState.FAILED
+            obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
+            session.commit()
             failed += 1
             continue
         try:
             destination_body = oci_client.get_object(namespace, source.destination_bucket, obj.object_key).data.raw
             destination_digest = hashlib.sha256()
-            for chunk in iter(lambda: destination_body.read(8 * 1024 * 1024), b""):
+            obj.audit_started_at, obj.audit_progress_bytes = utcnow(), 0
+            obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
+            session.commit()
+            progress, baseline, baseline_at, last_persist, persisted_once = 0, 0, time.monotonic(), time.monotonic(), False
+            for chunk in iter(lambda: destination_body.read(COPY_CHUNK_SIZE), b""):
                 destination_digest.update(chunk)
+                progress += len(chunk)
+                now = time.monotonic()
+                if not persisted_once or now - last_persist >= 2:
+                    obj.audit_progress_bytes, obj.audit_progress_at = progress, utcnow()
+                    if persisted_once:
+                        elapsed = max(now - baseline_at, 0.001)
+                        obj.audit_rate_mbps = round(((progress - baseline) * 8) / elapsed / 1_000_000, 2)
+                    session.commit()
+                    baseline, baseline_at, last_persist, persisted_once = progress, now, now, True
             obj.destination_checksum = destination_digest.hexdigest()
         except Exception as error:
             obj.integrity_error, obj.state = f"Unable to read OCI destination: {type(error).__name__}: {error}", ObjectState.FAILED
+            obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
+            session.commit()
             failed += 1
             continue
         if obj.source_checksum != obj.destination_checksum:
@@ -389,6 +476,8 @@ def verify_wave(session, task: Task) -> None:
             failed += 1
         else:
             obj.integrity_error, obj.integrity_verified_at, obj.state = None, utcnow(), ObjectState.VERIFIED
+        obj.audit_progress_bytes, obj.audit_progress_at, obj.audit_rate_mbps = obj.size_bytes, utcnow(), 0
+        session.commit()
     remaining = session.scalar(select(func.count(ObjectRecord.id)).where(
         ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.VERIFIED
     )) or 0

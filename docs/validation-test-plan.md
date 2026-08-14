@@ -30,7 +30,8 @@ Validar o ciclo completo sem gerar custo de recuperação durante discovery e an
 5. Criar uma única S3 Batch Operations Restore job em modo Bulk.
 6. Acompanhar a job com backoff; depois acompanhar disponibilidade com listagens paginadas que incluam `RestoreStatus`.
 7. Durante o restore, reiniciar a VM uma vez e confirmar que a job e o estado local são retomados sem criar uma nova job de restore.
-8. Transferir os objetos restaurados em streaming para OCI, capturar metadados/tags e calcular SHA-256 durante a leitura; baixar o objeto OCI uma vez para calcular e comparar o SHA-256 de destino.
+8. Transferir os objetos restaurados, capturar metadados/tags e calcular SHA-256 durante a leitura. Validar SHA-256 no OCI durante o `PutObject` ou em cada parte do multipart, sem releitura do destino.
+9. Executar auditoria profunda em uma onda pequena: confirmar o aviso reforçado, acompanhar o progresso no Status e comparar o SHA-256 linear por leitura completa do OCI.
 9. Durante a transferência, reiniciar a VM uma vez; confirmar retomada idempotente, sem marcar objetos incompletos como concluídos.
 10. Executar reconciliação final.
 

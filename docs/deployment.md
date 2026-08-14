@@ -52,7 +52,7 @@ Os parâmetros operacionais são persistidos no PostgreSQL. O **worker AWS/OCI r
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 
-O cartão **Credenciais e integrações** no Painel e o botão **Executar pré-check OCI** em Configurações usam a identidade dinâmica da VM para ler a versão atual de cada Secret e listar no máximo um objeto em cada bucket OCI já cadastrado. Quando todas as credenciais AWS estão preenchidas, o pré-check também executa `GetCallerIdentity` e `AssumeRole` na role de migração; ele não lista, restaura, baixa nem cobra operações de S3. Valores de Secret nunca entram na resposta, nos logs ou na tela.
+O cartão **Credenciais e integrações** no Status e o botão **Executar pré-check OCI** em Configurações usam a identidade dinâmica da VM para ler a versão atual de cada Secret e listar no máximo um objeto em cada bucket OCI já cadastrado. Quando todas as credenciais AWS estão preenchidas, o pré-check também executa `GetCallerIdentity` e `AssumeRole` na role de migração; ele não lista, restaura, baixa nem cobra operações de S3. Valores de Secret nunca entram na resposta, nos logs ou na tela.
 
 - **Vermelho** (`PLACEHOLDER`): o valor ainda é o texto instrutivo criado pelo Terraform, ou há uma configuração ausente.
 - **Amarelo** (`CONFIGURED`): o valor foi preenchido, porém não existe uma validação segura sem executar uma operação real. A role de Batch Operations só será validada ao criar o primeiro job Batch.

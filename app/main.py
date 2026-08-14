@@ -121,6 +121,14 @@ class ObjectRecord(Base):
     transfer_progress_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     transfer_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_rate_mbps: Mapped[float] = mapped_column(Float, default=0)
+    delivery_integrity_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    delivery_integrity_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    delivery_integrity_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    delivery_integrity_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    audit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    audit_progress_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    audit_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    audit_rate_mbps: Mapped[float] = mapped_column(Float, default=0)
     integrity_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     integrity_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     state: Mapped[str] = mapped_column(String(32), default=ObjectState.DISCOVERED)
@@ -286,6 +294,10 @@ class ActivityRefreshSettingsUpdate(BaseModel):
     seconds: int = Field(ge=5, le=300)
 
 
+class DeepAuditStart(BaseModel):
+    confirmed: bool = False
+
+
 class SimulationTaskUpdate(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
 
@@ -319,6 +331,14 @@ def create_schema() -> None:
         "transfer_progress_bytes": "BIGINT NOT NULL DEFAULT 0",
         "transfer_progress_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_rate_mbps": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "delivery_integrity_algorithm": "VARCHAR(32)",
+        "delivery_integrity_checksum": "VARCHAR(256)",
+        "delivery_integrity_status": "VARCHAR(32)",
+        "delivery_integrity_verified_at": "TIMESTAMP WITH TIME ZONE",
+        "audit_started_at": "TIMESTAMP WITH TIME ZONE",
+        "audit_progress_bytes": "BIGINT NOT NULL DEFAULT 0",
+        "audit_progress_at": "TIMESTAMP WITH TIME ZONE",
+        "audit_rate_mbps": "DOUBLE PRECISION NOT NULL DEFAULT 0",
         "integrity_verified_at": "TIMESTAMP WITH TIME ZONE",
         "integrity_error": "TEXT",
     }
@@ -702,6 +722,32 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
     return {"waves": waves, "generated_at": now}
 
 
+@app.get("/api/deep-audits")
+def deep_audits(session: Session = Depends(get_session)) -> dict:
+    """Progress of explicitly approved full OCI rereads."""
+    tasks = list(session.scalars(
+        select(Task).where(Task.kind == "VERIFY_WAVE", Task.state.in_([TaskState.READY, TaskState.RUNNING]))
+        .order_by(Task.created_at, Task.id)
+    ))
+    audits = []
+    for task in tasks:
+        wave = task.wave
+        objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
+        total_bytes = sum(obj.size_bytes for obj in objects)
+        checked = [obj for obj in objects if obj.integrity_verified_at or obj.integrity_error]
+        checked_bytes = sum(min(obj.size_bytes, int(obj.audit_progress_bytes or 0)) for obj in objects)
+        live_rate = sum(float(obj.audit_rate_mbps or 0) for obj in objects if obj.audit_started_at and not obj.integrity_verified_at and not obj.integrity_error)
+        audits.append({
+            "task_id": task.id, "task_state": task.state, "wave_id": wave.id,
+            "wave_name": wave.name, "source_name": wave.source.name,
+            "objects_checked": len(checked), "objects_total": len(objects),
+            "bytes_checked": checked_bytes, "bytes_total": total_bytes,
+            "failed": sum(1 for obj in objects if obj.integrity_error),
+            "rate_mbps": round(live_rate, 2), "started_at": min((obj.audit_started_at for obj in objects if obj.audit_started_at), default=None),
+        })
+    return {"audits": audits, "generated_at": utcnow()}
+
+
 @app.get("/api/settings")
 def get_settings(session: Session = Depends(get_session)) -> dict:
     return settings_dict(runtime_settings(session))
@@ -798,15 +844,16 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     total_rows = session.execute(
         select(ObjectRecord.source_id, func.count(ObjectRecord.id),
                func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.VERIFIED, 1), else_=0)), 0),
-               func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0))
+               func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0),
+               func.coalesce(func.sum(case((ObjectRecord.delivery_integrity_status == "OCI_ACCEPTED", 1), else_=0)), 0))
         .where(ObjectRecord.source_id.in_([s.id for s in sources])).group_by(ObjectRecord.source_id)
     ).all() if sources else []
-    totals = {source_id: (int(total), int(verified), int(transferred)) for source_id, total, verified, transferred in total_rows}
+    totals = {source_id: (int(total), int(verified), int(transferred), int(delivery_verified)) for source_id, total, verified, transferred, delivery_verified in total_rows}
     def migration_status(source: Source) -> str:
-        total, verified, transferred = totals.get(source.id, (0, 0, 0))
+        total, verified, transferred, delivery_verified = totals.get(source.id, (0, 0, 0, 0))
         if source.destination_validation_status == "DIFFERENT":
             return "DESTINATION_DIVERGENT"
-        if source.status == "DISCOVERED" and total and verified == total:
+        if source.status == "DISCOVERED" and total and (verified == total or (transferred == total and delivery_verified == total)):
             return "COMPLETED"
         if source.status == "DISCOVERED" and total and transferred == total:
             return "AWAITING_INTEGRITY_VERIFICATION"
@@ -952,7 +999,9 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
         .group_by(ObjectRecord.state)
     ).all())
     source = source_or_404(session, source_id)
-    migration_status = "DESTINATION_DIVERGENT" if source.destination_validation_status == "DIFFERENT" else "COMPLETED" if source.status == "DISCOVERED" and count and states.get(ObjectState.VERIFIED, 0) == count else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count else "IN_PROGRESS" if count else "NOT_STARTED"
+    delivery_verified = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id, ObjectRecord.delivery_integrity_status == "OCI_ACCEPTED")) or 0
+    all_transferred = (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count
+    migration_status = "DESTINATION_DIVERGENT" if source.destination_validation_status == "DIFFERENT" else "COMPLETED" if source.status == "DISCOVERED" and count and (states.get(ObjectState.VERIFIED, 0) == count or (all_transferred and delivery_verified == count)) else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and all_transferred else "IN_PROGRESS" if count else "NOT_STARTED"
     return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states, "migration_status": migration_status,
             "destination_validation": {"status": source.destination_validation_status, "at": source.destination_validation_at,
                                        "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count},
@@ -1005,6 +1054,8 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
         )))
         for obj in objects:
             obj.integrity_verified_at, obj.destination_checksum, obj.transferred_at = None, None, None
+            obj.delivery_integrity_algorithm, obj.delivery_integrity_checksum = None, None
+            obj.delivery_integrity_status, obj.delivery_integrity_verified_at = None, None
             obj.integrity_error = "OCI destination validation found object missing or with a different size"
             if obj.wave_id:
                 obj.state = ObjectState.WAVE_ASSIGNED
@@ -1050,7 +1101,11 @@ def object_detail(object_id: int, session: Session = Depends(get_session)) -> di
             "metadata": json.loads(obj.metadata_json), "tags": json.loads(obj.tags_json),
             "integrity": {"source_checksum": obj.source_checksum, "destination_checksum": obj.destination_checksum,
                           "algorithm": obj.checksum_algorithm, "verified_at": obj.integrity_verified_at,
-                          "error": obj.integrity_error}, "restored_at": obj.restored_at,
+                          "error": obj.integrity_error,
+                          "delivery_algorithm": obj.delivery_integrity_algorithm,
+                          "delivery_checksum": obj.delivery_integrity_checksum,
+                          "delivery_status": obj.delivery_integrity_status,
+                          "delivery_verified_at": obj.delivery_integrity_verified_at}, "restored_at": obj.restored_at,
             "transferred_at": obj.transferred_at}
 
 
@@ -1334,9 +1389,24 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 
 
+@app.get("/api/waves/{wave_id}/deep-audit-preview")
+def deep_audit_preview(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    wave = wave_or_404(session, wave_id)
+    if wave.status not in {"TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}:
+        raise HTTPException(status_code=409, detail="Integrity verification can only be requested after transfer completes")
+    objects, total_bytes = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.wave_id == wave.id)).one()
+    throughput_mbps = runtime_settings(session).max_throughput_mbps
+    minimum_seconds = int((int(total_bytes) * 8) / max(1, throughput_mbps * 1_000_000))
+    return {"wave_id": wave.id, "wave_name": wave.name, "source_name": wave.source.name,
+            "objects": int(objects), "bytes": int(total_bytes), "throughput_mbps": throughput_mbps,
+            "minimum_seconds": minimum_seconds}
+
+
 @app.post("/api/waves/{wave_id}/verify")
-def verify_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
-    """Queue integrity verification only when an operator explicitly requests it."""
+def verify_wave(wave_id: int, payload: DeepAuditStart, session: Session = Depends(get_session)) -> dict:
+    """Queue a costly full OCI reread only after an explicit acknowledgement."""
+    if not payload.confirmed:
+        raise HTTPException(status_code=422, detail="Explicit deep-audit confirmation is required")
     wave = wave_or_404(session, wave_id)
     if wave.status not in {"TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}:
         raise HTTPException(status_code=409, detail="Integrity verification can only be requested after transfer completes")
@@ -1347,9 +1417,9 @@ def verify_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
         raise HTTPException(status_code=409, detail="Integrity verification is already queued or running for this wave")
     wave.status = "VERIFICATION_QUEUED"
     session.add(Task(wave_id=wave.id, kind="VERIFY_WAVE"))
-    record_event(session, "INTEGRITY_VERIFICATION_QUEUED", f"Integrity verification queued by operator for wave '{wave.name}'", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "DEEP_AUDIT_QUEUED", f"Full OCI SHA-256 reread explicitly approved for wave '{wave.name}'", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
-    return {"wave_id": wave.id, "status": wave.status, "message": "Integrity verification queued"}
+    return {"wave_id": wave.id, "status": wave.status, "message": "Deep audit queued"}
 
 
 @app.post("/api/waves/{wave_id}/pause")

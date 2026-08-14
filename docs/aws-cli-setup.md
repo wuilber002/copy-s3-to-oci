@@ -241,7 +241,7 @@ aws iam get-role --role-name "$BATCH_ROLE" --query 'Role.AssumeRolePolicyDocumen
 aws s3api head-bucket --bucket "$CONTROL_BUCKET" --region "$AWS_REGION"
 ```
 
-Depois de preencher as duas Secrets AWS no OCI Vault e os dois ARNs em **Configurações**, acesse a interface web por túnel SSH e use **Painel → Credenciais e integrações → Validar agora**. O pré-check faz somente `GetCallerIdentity` e `AssumeRole` para a role de migração. Ele não faz discovery, restore, download ou upload.
+Depois de preencher as duas Secrets AWS no OCI Vault e os dois ARNs em **Configurações**, acesse a interface web por túnel SSH e use **Status → Credenciais e integrações → Validar agora**. O pré-check faz somente `GetCallerIdentity` e `AssumeRole` para a role de migração. Ele não faz discovery, restore, download ou upload.
 
 ## Cleanup ao terminar o procedimento
 
