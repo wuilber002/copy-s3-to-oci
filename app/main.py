@@ -946,7 +946,7 @@ def archive_source(source_id: int, session: Session = Depends(get_session)) -> d
     source = source_or_404(session, source_id)
     if not source_has_executed_wave(session, source_id):
         raise HTTPException(status_code=409, detail="A source without an executed wave must be deleted, not archived")
-    for wave in session.scalars(select(Wave).where(Wave.source_id == source_id, Wave.status.not_in(["VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"]))):
+    for wave in session.scalars(select(Wave).where(Wave.source_id == source_id, Wave.status.not_in(["COMPLETED", "VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"]))):
         wave.status = "PAUSED"
     source.archived_at, source.status = utcnow(), "ARCHIVED"
     record_event(session, "SOURCE_ARCHIVED", f"Source '{source.name}' archived; historical data retained", source_id=source.id)
@@ -1306,7 +1306,7 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
              "status": displayed_status(wave),
              "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
-             "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and displayed_status(wave) in {"TRANSFERRED", "VERIFIED"} else None,
+             "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and displayed_status(wave) in {"COMPLETED", "TRANSFERRED", "VERIFIED"} else None,
              "last_poll_at": wave.last_poll_at,
              "can_delete": wave.id not in executed_wave_ids and wave.id not in progressed_wave_ids,
              "is_transferring": wave.id in transferring_wave_ids}
@@ -1392,7 +1392,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
 @app.get("/api/waves/{wave_id}/deep-audit-preview")
 def deep_audit_preview(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
-    if wave.status not in {"TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}:
+    if wave.status not in {"COMPLETED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}:
         raise HTTPException(status_code=409, detail="Integrity verification can only be requested after transfer completes")
     objects, total_bytes = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.wave_id == wave.id)).one()
     throughput_mbps = runtime_settings(session).max_throughput_mbps
@@ -1409,7 +1409,7 @@ def verify_wave(wave_id: int, payload: DeepAuditStart, session: Session = Depend
     if not payload.confirmed:
         raise HTTPException(status_code=422, detail="Explicit deep-audit confirmation is required")
     wave = wave_or_404(session, wave_id)
-    if wave.status not in {"TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}:
+    if wave.status not in {"COMPLETED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}:
         raise HTTPException(status_code=409, detail="Integrity verification can only be requested after transfer completes")
     queued = session.scalar(select(Task.id).where(
         Task.wave_id == wave.id, Task.kind == "VERIFY_WAVE", Task.state.in_([TaskState.READY, TaskState.RUNNING])

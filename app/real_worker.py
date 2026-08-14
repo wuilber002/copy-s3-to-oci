@@ -20,7 +20,7 @@ from urllib.parse import quote
 
 import boto3
 import oci
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
 from app.main import (
     Event, ObjectRecord, ObjectState, SessionLocal, Source, Task, TaskState,
@@ -421,8 +421,12 @@ def transfer_wave(session, task: Task, settings) -> None:
         ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.TRANSFERRED
     )) or 0
     wave = session.get(Wave, task.wave_id)
-    wave.status = "TRANSFERRED" if not remaining else "TRANSFERRED_WITH_ERRORS"
-    event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed. Integrity verification awaits operator request.", source_id=source.id, wave_id=wave.id)
+    delivery_pending = session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.wave_id == wave.id,
+        or_(ObjectRecord.delivery_integrity_status.is_(None), ObjectRecord.delivery_integrity_status != "OCI_ACCEPTED"),
+    )) or 0
+    wave.status = "COMPLETED" if not remaining and not delivery_pending else "TRANSFERRED_WITH_ERRORS"
+    event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed and {delivery_pending} object(s) without OCI cryptographic delivery evidence.", source_id=source.id, wave_id=wave.id)
     succeed(session, task)
 
 
