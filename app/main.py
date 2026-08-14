@@ -116,6 +116,7 @@ class OciBucketCache(Base):
     bucket_ocid: Mapped[str] = mapped_column(String(255), unique=True)
     name: Mapped[str] = mapped_column(String(255), index=True)
     compartment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    compartment_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     lifecycle_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
     refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
@@ -295,6 +296,7 @@ def create_schema() -> None:
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
+    existing_bucket_columns = {column["name"] for column in inspect(engine).get_columns("oci_bucket_cache")}
     with engine.begin() as connection:
         for column, sql_type in expected_columns.items():
             if column not in existing_columns:
@@ -308,6 +310,8 @@ def create_schema() -> None:
         for column, sql_type in wave_columns.items():
             if column not in existing_wave_columns:
                 connection.execute(text(f"ALTER TABLE waves ADD COLUMN {column} {sql_type}"))
+        if "compartment_name" not in existing_bucket_columns:
+            connection.execute(text("ALTER TABLE oci_bucket_cache ADD COLUMN compartment_name VARCHAR(255)"))
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -536,7 +540,8 @@ def list_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
     buckets = list(session.scalars(select(OciBucketCache).order_by(OciBucketCache.name, OciBucketCache.compartment_id)))
     refreshed_at = max((bucket.refreshed_at for bucket in buckets), default=None)
     return {"buckets": [{"name": bucket.name, "ocid": bucket.bucket_ocid,
-                          "compartment_id": bucket.compartment_id, "lifecycle_state": bucket.lifecycle_state,
+                          "compartment_id": bucket.compartment_id, "compartment_name": bucket.compartment_name,
+                          "lifecycle_state": bucket.lifecycle_state,
                           "refreshed_at": bucket.refreshed_at} for bucket in buckets],
             "refreshed_at": refreshed_at}
 
@@ -570,6 +575,7 @@ def refresh_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
             session.add(cached)
         cached.name = name
         cached.compartment_id = getattr(item, "compartment_id", None)
+        cached.compartment_name = getattr(item, "compartment_name", None)
         cached.lifecycle_state = getattr(item, "lifecycle_state", None)
         cached.refreshed_at = now
     if found:
