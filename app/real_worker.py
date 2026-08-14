@@ -70,7 +70,17 @@ def aws_clients(settings, region: str):
 def claim_task(session, lease_seconds: int) -> Task | None:
     now = utcnow()
     available = (Task.state == TaskState.READY) | ((Task.state == TaskState.RUNNING) & (Task.lease_expires_at < now))
-    task = session.scalar(select(Task).join(Wave).where(available, Task.available_at <= now, Wave.status != "PAUSED").order_by(Task.available_at, Task.id).with_for_update(skip_locked=True).limit(1))
+    # A wave owns one durable transfer task, but a process restart can leave a
+    # still-valid lease behind. Never claim another transfer task while one is
+    # live, even if other task kinds remain eligible in the queue.
+    live_transfer = session.scalar(select(Task.id).where(
+        Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING,
+        Task.lease_expires_at >= now,
+    ).limit(1))
+    query = select(Task).join(Wave).where(available, Task.available_at <= now, Wave.status != "PAUSED")
+    if live_transfer:
+        query = query.where(Task.kind != "TRANSFER_WAVE")
+    task = session.scalar(query.order_by(Task.available_at, Task.id).with_for_update(skip_locked=True).limit(1))
     if not task:
         return None
     task.state, task.worker_id = TaskState.RUNNING, WORKER_ID
