@@ -21,9 +21,9 @@ from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, case, create_engine, func, inspect, select, text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, case, create_engine, func, inspect, or_, select, text
 from sqlalchemy.engine import URL
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
 
 
 def utcnow() -> datetime:
@@ -959,23 +959,54 @@ def export_tasks(session: Session = Depends(get_session)) -> StreamingResponse:
 @app.get("/api/events")
 def list_events(limit: int = 100, source_id: int | None = None, wave_id: int | None = None, session: Session = Depends(get_session)) -> list[dict]:
     limit = min(max(limit, 1), 500)
-    query = select(Event)
+    # An event can be associated directly with a source, only with a wave, or
+    # with both. Join both paths so the operational history remains readable
+    # when wave names are reused by different sources.
+    wave_source = aliased(Source)
+    query = (
+        select(
+            Event,
+            func.coalesce(Source.id, wave_source.id).label("resolved_source_id"),
+            func.coalesce(Source.name, wave_source.name).label("source_name"),
+            Wave.name.label("wave_name"),
+        )
+        .outerjoin(Source, Event.source_id == Source.id)
+        .outerjoin(Wave, Event.wave_id == Wave.id)
+        .outerjoin(wave_source, Wave.source_id == wave_source.id)
+    )
     if source_id is not None:
-        query = query.where(Event.source_id == source_id)
+        query = query.where(or_(Event.source_id == source_id, Wave.source_id == source_id))
     if wave_id is not None:
         query = query.where(Event.wave_id == wave_id)
-    events = session.scalars(query.order_by(Event.created_at.desc(), Event.id.desc()).limit(limit))
-    return [{"id": event.id, "kind": event.kind, "message": event.message, "source_id": event.source_id,
-             "wave_id": event.wave_id, "created_at": event.created_at} for event in events]
+    rows = session.execute(query.order_by(Event.created_at.desc(), Event.id.desc()).limit(limit))
+    return [{"id": event.id, "kind": event.kind, "message": event.message,
+             "source_id": resolved_source_id, "source_name": source_name,
+             "wave_id": event.wave_id, "wave_name": wave_name,
+             "created_at": event.created_at}
+            for event, resolved_source_id, source_name, wave_name in rows]
 
 
 @app.get("/api/events.csv")
 def export_events(session: Session = Depends(get_session)) -> StreamingResponse:
     content = io.StringIO()
     writer = csv.writer(content, lineterminator="\n")
-    writer.writerow(["id", "created_at", "kind", "source_id", "wave_id", "message"])
-    for event in session.scalars(select(Event).order_by(Event.created_at.desc(), Event.id.desc())):
-        writer.writerow([event.id, event.created_at.isoformat(), event.kind, event.source_id or "", event.wave_id or "", event.message])
+    writer.writerow(["id", "created_at", "kind", "source_name", "source_id", "wave_name", "wave_id", "message"])
+    wave_source = aliased(Source)
+    rows = session.execute(
+        select(
+            Event,
+            func.coalesce(Source.id, wave_source.id).label("resolved_source_id"),
+            func.coalesce(Source.name, wave_source.name).label("source_name"),
+            Wave.name.label("wave_name"),
+        )
+        .outerjoin(Source, Event.source_id == Source.id)
+        .outerjoin(Wave, Event.wave_id == Wave.id)
+        .outerjoin(wave_source, Wave.source_id == wave_source.id)
+        .order_by(Event.created_at.desc(), Event.id.desc())
+    )
+    for event, resolved_source_id, source_name, wave_name in rows:
+        writer.writerow([event.id, event.created_at.isoformat(), event.kind, source_name or "", resolved_source_id or "",
+                         wave_name or "", event.wave_id or "", event.message])
     return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": 'attachment; filename="events.csv"'})
 
 
