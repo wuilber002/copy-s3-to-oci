@@ -135,7 +135,7 @@ variables:
     type: boolean
     default: true
     required: true
-    description: Warning: OCI limits the number of policy statements by compartment. This stack uses one Object Storage statement per distinct destination-bucket compartment, plus two common statements.
+    description: Warning: OCI limits the number of policy statements by compartment. This stack uses one Object Storage statement per distinct destination-bucket compartment, plus three common statements (Vault, namespace and tenancy-wide bucket metadata for Resource Search).
   policy_compartment_ocid:
     title: Policy compartment
     type: oci:identity:compartment:id

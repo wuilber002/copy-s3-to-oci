@@ -79,6 +79,7 @@ class Source(Base):
     discovery_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="source")
     waves: Mapped[list[Wave]] = relationship(back_populates="source")
@@ -106,6 +107,17 @@ class ObjectRecord(Base):
     wave_id: Mapped[int | None] = mapped_column(ForeignKey("waves.id"), nullable=True, index=True)
     source: Mapped[Source] = relationship(back_populates="objects")
     wave: Mapped[Wave | None] = relationship(back_populates="objects")
+
+
+class OciBucketCache(Base):
+    __tablename__ = "oci_bucket_cache"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    bucket_ocid: Mapped[str] = mapped_column(String(255), unique=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    compartment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    lifecycle_state: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class Wave(Base):
@@ -278,6 +290,7 @@ def create_schema() -> None:
         "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT"}
+    source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     wave_columns = {"batch_job_id": "VARCHAR(128)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
@@ -514,19 +527,72 @@ def update_settings(payload: RuntimeSettingsUpdate, session: Session = Depends(g
     return settings_dict(settings)
 
 
+@app.get("/api/oci/buckets")
+def list_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
+    buckets = list(session.scalars(select(OciBucketCache).order_by(OciBucketCache.name, OciBucketCache.compartment_id)))
+    refreshed_at = max((bucket.refreshed_at for bucket in buckets), default=None)
+    return {"buckets": [{"name": bucket.name, "ocid": bucket.bucket_ocid,
+                          "compartment_id": bucket.compartment_id, "lifecycle_state": bucket.lifecycle_state,
+                          "refreshed_at": bucket.refreshed_at} for bucket in buckets],
+            "refreshed_at": refreshed_at}
+
+
+@app.post("/api/oci/buckets/refresh")
+def refresh_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
+    """Manually refresh tenancy-wide bucket metadata through OCI Resource Search."""
+    try:
+        import oci
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        client = oci.resource_search.ResourceSearchClient({}, signer=signer)
+        query = "query bucket resources"
+        response = client.search_resources(oci.resource_search.models.StructuredSearchDetails(query=query))
+        items = list(response.data.items)
+        while response.next_page:
+            response = client.search_resources(oci.resource_search.models.StructuredSearchDetails(query=query), page=response.next_page)
+            items.extend(response.data.items)
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"OCI Resource Search failed: {type(error).__name__}") from error
+
+    now, found = utcnow(), set()
+    for item in items:
+        bucket_ocid = getattr(item, "identifier", None)
+        name = getattr(item, "display_name", None)
+        if not bucket_ocid or not name:
+            continue
+        found.add(bucket_ocid)
+        cached = session.scalar(select(OciBucketCache).where(OciBucketCache.bucket_ocid == bucket_ocid))
+        if not cached:
+            cached = OciBucketCache(bucket_ocid=bucket_ocid, name=name)
+            session.add(cached)
+        cached.name = name
+        cached.compartment_id = getattr(item, "compartment_id", None)
+        cached.lifecycle_state = getattr(item, "lifecycle_state", None)
+        cached.refreshed_at = now
+    if found:
+        session.query(OciBucketCache).filter(OciBucketCache.bucket_ocid.not_in(found)).delete(synchronize_session=False)
+    else:
+        session.query(OciBucketCache).delete(synchronize_session=False)
+    record_event(session, "OCI_BUCKET_CACHE_REFRESHED", f"OCI Resource Search cached {len(found)} bucket(s)")
+    session.commit()
+    return {"buckets": len(found), "refreshed_at": now}
+
+
 @app.get("/api/sources")
 def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
-             "discovery_error": s.discovery_error}
-            for s in session.scalars(select(Source).order_by(Source.id))]
+             "discovery_error": s.discovery_error, "archived_at": s.archived_at,
+             "can_delete": not source_has_operational_data(session, s.id)}
+            for s in session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id))]
 
 
 @app.post("/api/sources", status_code=201)
 def create_source(payload: SourceCreate, session: Session = Depends(get_session)) -> dict:
     if session.scalar(select(Source).where(Source.name == payload.name)):
         raise HTTPException(status_code=409, detail="Source name already exists")
+    if not session.scalar(select(OciBucketCache.id).where(OciBucketCache.name == payload.destination_bucket)):
+        raise HTTPException(status_code=422, detail="Choose a destination bucket from the OCI cache; refresh it in Settings first")
     source = Source(**payload.model_dump())
     session.add(source)
     session.flush()
@@ -537,7 +603,7 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
 
 @app.put("/api/sources/{source_id}")
 def update_source(source_id: int, payload: SourceUpdate, session: Session = Depends(get_session)) -> dict:
-    source = source_or_404(session, source_id)
+    source = active_source_or_409(session, source_id)
     objects = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id)) or 0
     waves = session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)) or 0
     if objects or waves:
@@ -545,6 +611,8 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
     duplicate = session.scalar(select(Source.id).where(Source.name == payload.name, Source.id != source_id))
     if duplicate:
         raise HTTPException(status_code=409, detail="Source name already exists")
+    if not session.scalar(select(OciBucketCache.id).where(OciBucketCache.name == payload.destination_bucket)):
+        raise HTTPException(status_code=422, detail="Choose a destination bucket from the OCI cache; refresh it in Settings first")
     for field, value in payload.model_dump().items():
         setattr(source, field, value)
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
@@ -552,9 +620,44 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
     return {"id": source.id, "name": source.name, "status": source.status}
 
 
+def source_has_operational_data(session: Session, source_id: int) -> bool:
+    return bool(session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id)) or
+                session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)))
+
+
+def active_source_or_409(session: Session, source_id: int) -> Source:
+    source = source_or_404(session, source_id)
+    if source.archived_at:
+        raise HTTPException(status_code=409, detail="Archived sources are read-only")
+    return source
+
+
+@app.delete("/api/sources/{source_id}", status_code=204)
+def delete_source(source_id: int, session: Session = Depends(get_session)) -> None:
+    source = source_or_404(session, source_id)
+    if source_has_operational_data(session, source_id):
+        raise HTTPException(status_code=409, detail="This source has operational data and must be archived, not deleted")
+    session.query(Event).filter(Event.source_id == source_id).delete(synchronize_session=False)
+    session.delete(source)
+    session.commit()
+
+
+@app.post("/api/sources/{source_id}/archive")
+def archive_source(source_id: int, session: Session = Depends(get_session)) -> dict:
+    source = source_or_404(session, source_id)
+    if not source_has_operational_data(session, source_id):
+        raise HTTPException(status_code=409, detail="A source without operational data must be deleted, not archived")
+    for wave in session.scalars(select(Wave).where(Wave.source_id == source_id, Wave.status.not_in(["VERIFIED", "TRANSFERRED_WITH_ERRORS"]))):
+        wave.status = "PAUSED"
+    source.archived_at, source.status = utcnow(), "ARCHIVED"
+    record_event(session, "SOURCE_ARCHIVED", f"Source '{source.name}' archived; historical data retained", source_id=source.id)
+    session.commit()
+    return {"id": source.id, "status": source.status, "archived_at": source.archived_at}
+
+
 @app.post("/api/sources/{source_id}/inventory/import", status_code=201)
 def import_inventory(source_id: int, payload: InventoryImport, session: Session = Depends(get_session)) -> dict:
-    source_or_404(session, source_id)
+    active_source_or_409(session, source_id)
     inserted = 0
     for item in payload.items:
         duplicate = session.scalar(select(ObjectRecord.id).where(
@@ -573,7 +676,7 @@ def import_inventory(source_id: int, payload: InventoryImport, session: Session 
 
 @app.post("/api/sources/{source_id}/discovery")
 def request_discovery(source_id: int, session: Session = Depends(get_session)) -> dict:
-    source = source_or_404(session, source_id)
+    source = active_source_or_409(session, source_id)
     if source.status == "DISCOVERING":
         raise HTTPException(status_code=409, detail="Discovery already running for this source")
     if session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)):
@@ -665,7 +768,7 @@ def export_inventory(source_id: int, session: Session = Depends(get_session)) ->
 
 @app.post("/api/sources/{source_id}/waves", status_code=201)
 def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(get_session)) -> dict:
-    source_or_404(session, source_id)
+    active_source_or_409(session, source_id)
     if session.scalar(select(Wave).where(Wave.source_id == source_id, Wave.name == payload.name)):
         raise HTTPException(status_code=409, detail="Wave name already exists for this source")
     wave = Wave(source_id=source_id, **payload.model_dump())

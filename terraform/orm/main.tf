@@ -24,7 +24,10 @@ locals {
 
   common_policy_statements = [
     "Allow dynamic-group ${local.dynamic_group_name} to read secret-bundles in compartment id ${var.secrets_compartment_ocid}",
-    "Allow dynamic-group ${local.dynamic_group_name} to read objectstorage-namespaces in tenancy"
+    "Allow dynamic-group ${local.dynamic_group_name} to read objectstorage-namespaces in tenancy",
+    # Resource Search needs bucket metadata visibility; object access remains
+    # limited by the per-compartment destination-bucket statements above.
+    "Allow dynamic-group ${local.dynamic_group_name} to inspect buckets in tenancy"
   ]
 
   policy_statements = concat(local.common_policy_statements, local.object_storage_policy_statements)

@@ -33,7 +33,7 @@ output "dynamic_group_name" {
 
 output "policy_statement_count" {
   value       = var.create_oci_policy ? length(local.policy_statements) : 0
-  description = "Policy statements created: two common statements plus one per destination-bucket compartment."
+  description = "Policy statements created: three common statements plus one per destination-bucket compartment."
 }
 
 output "boot_volume_backup_policy_id" {
