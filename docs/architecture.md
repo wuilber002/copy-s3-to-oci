@@ -16,6 +16,7 @@ O PostgreSQL é a fonte de verdade e a fila durável. As tarefas usam reserva tr
 - Enquanto uma onda estiver transferindo, o Painel também lista fonte e onda com arquivos e bytes transferidos em relação ao total. Objetos em `TRANSFERRED` e `VERIFIED` contam como transferidos; a onda deixa essa lista ao concluir a cópia ou ao ser interrompida.
 - Uma onda só é considerada ativamente transferindo quando sua tarefa `TRANSFER_WAVE` está em `RUNNING`. Um objeto que permaneça em `TRANSFERRING` após falha, pausa ou retry não mantém indevidamente a onda no quadro de atividade.
 - O bloco **Atividade de migração** é independente da saúde da VM. Sua atualização automática pode ser desativada ou configurada entre 5 segundos e 5 minutos; essa preferência fica persistida no PostgreSQL da plataforma.
+- O mesmo bloco mostra CPU e memória da VM. A CPU é uma média host-wide entre as execuções do timer de estado (normalmente um minuto); a memória usa `MemAvailable` do Linux para calcular a parcela efetivamente ocupada.
 - Uma origem recebe a marca **Concluído** somente se o discovery estiver concluído, houver ao menos um objeto no inventário e todos os objetos estiverem em `VERIFIED`. Assim, uma origem totalmente copiada, mas ainda sem a verificação manual de integridade, não é encerrada indevidamente.
 - Discovery usa somente listagem e campos retornados pelo S3; não faz restore nem leitura de conteúdo.
 - Chamadas AWS são minimizadas. Restore usa S3 Batch Operations por onda; polling usa estado da Batch job e listagem paginada com `RestoreStatus`.
