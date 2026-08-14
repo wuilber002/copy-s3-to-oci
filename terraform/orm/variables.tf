@@ -35,7 +35,7 @@ variable "instance_shape" {
 }
 
 variable "ocpus" {
-  description = "OCPUs for the migration VM. PoC minimum: 2; production recommendation: 8."
+  description = "OCPUs for the migration VM. Validation minimum: 2; production recommendation: 8."
   type        = number
   default     = 8
 
@@ -46,7 +46,7 @@ variable "ocpus" {
 }
 
 variable "memory_in_gbs" {
-  description = "Memory for the migration VM. PoC minimum: 8 GB; production recommendation: 32 GB."
+  description = "Memory for the migration VM. Validation minimum: 8 GB; production recommendation: 32 GB."
   type        = number
   default     = 32
 

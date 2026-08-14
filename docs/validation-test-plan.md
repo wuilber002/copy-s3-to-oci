@@ -1,4 +1,4 @@
-# Plano de teste da PoC — Linux 2.6.12-rc2
+# Plano de validação — Linux 2.6.12-rc2
 
 ## Dataset
 
@@ -15,7 +15,7 @@ Validar o ciclo completo sem gerar custo de recuperação durante discovery e an
 
 | Item | Valor |
 | --- | --- |
-| Tamanho máximo da onda | 10 TB; a PoC usa todo o dataset de 220 MB |
+| Tamanho máximo da onda | 10 TB; a validação usa todo o dataset de 220 MB |
 | Tier de restore | Bulk |
 | Retenção | 3 dias |
 | Workers de transferência | 4 |

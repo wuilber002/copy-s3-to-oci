@@ -11,7 +11,7 @@
 
 1. Crie um Stack a partir de `terraform/orm` neste repositório.
 2. Preencha o formulário. Use 8 OCPUs, 32 GB e boot volume de 500 GB como ponto de partida.
-   Para uma PoC em subnet pública, habilite `Assign public IP to VM` somente se a security list/NSG restringir a porta 22 à rede administrativa. Em subnet privada, mantenha desligado e use o bastion/VPN do cliente.
+   Em subnet pública, habilite `Assign public IP to VM` somente se a security list/NSG restringir a porta 22 à rede administrativa. Em subnet privada, mantenha desligado e use o bastion/VPN do cliente.
 3. Mantenha a criação de Vault, Key e Secrets: esses recursos são obrigatórios e sempre criados.
 4. Se criar policy, informe os buckets OCI de destino em `destination_buckets_json`. Agrupe buckets no mesmo compartment sempre que possível.
 5. Aplique o stack. Por padrão, ele cria e associa uma policy de backup incremental diário do boot volume, com retenção de 14 dias. É possível informar uma policy existente em vez disso.
@@ -47,7 +47,7 @@ A console é o plano de controle local e persiste suas operações no PostgreSQL
 
 Os formulários e indicadores principais possuem ícones `i` de ajuda contextual. Eles descrevem limites, impacto operacional e, quando aplicável, impactos de custo e prazo de restore. A ajuda está disponível por mouse e teclado.
 
-Os parâmetros operacionais são persistidos no PostgreSQL. O **worker AWS/OCI real** é um container separado da API e fica inerte por padrão; somente depois da habilitação explícita ele assume discovery e tarefas duráveis de restore, polling e transferência. O worker simulado é uma ferramenta de PoC e nunca chama AWS ou OCI.
+Os parâmetros operacionais são persistidos no PostgreSQL. O **worker AWS/OCI real** é um container separado da API e fica inerte por padrão; somente depois da habilitação explícita ele assume discovery e tarefas duráveis de restore, polling e transferência. O worker de simulação é uma ferramenta de teste e nunca chama AWS ou OCI.
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 

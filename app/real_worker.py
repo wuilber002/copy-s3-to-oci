@@ -213,7 +213,9 @@ def transfer_wave(session, task: Task, settings) -> None:
     s3, _, _ = aws_clients(settings, source.aws_region)
     signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
     oci_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
-    namespace = oci_client.get_namespace().data
+    namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
+    if not namespace:
+        raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
     rate = settings.max_throughput_mbps * 125000 / max(1, settings.transfer_workers)
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORED, ObjectState.TRANSFERRING])).order_by(ObjectRecord.id)))
     for obj in objects:

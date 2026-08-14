@@ -12,21 +12,19 @@ ALL {instance.id = '<VM_OCID>'}
 
 ## Policy mínima
 
-Para `N` compartments distintos que guardam buckets de destino, a policy possui `N + 3` statements:
+Para `N` compartments distintos que guardam buckets de destino, a policy possui `1 + 2N` statements:
 
 1. um para ler os Secret Bundles;
-2. um para consultar o namespace do Object Storage;
-3. um para consultar metadados de recursos pelo OCI Resource Search no tenancy;
-4. um por compartment distinto de bucket, consolidando todos os buckets daquele compartment.
+2. um `inspect buckets` por compartment de destino, para que o OCI Resource Search retorne apenas metadados desses compartments;
+3. um `manage objects` por compartment distinto de bucket, consolidando todos os buckets autorizados naquele compartment.
 
 Exemplo com três buckets em dois compartments:
 
 ```text
 Allow dynamic-group s3-oci-migration-vm to read secret-bundles in compartment id <SECRETS_COMPARTMENT_OCID>
-Allow dynamic-group s3-oci-migration-vm to read objectstorage-namespaces in tenancy
-Allow dynamic-group s3-oci-migration-vm to inspect buckets in tenancy
-
+Allow dynamic-group s3-oci-migration-vm to inspect buckets in compartment id <COMPARTMENT_A_OCID>
 Allow dynamic-group s3-oci-migration-vm to manage objects in compartment id <COMPARTMENT_A_OCID> where any {target.bucket.name='destination-finance', target.bucket.name='destination-legal'}
+Allow dynamic-group s3-oci-migration-vm to inspect buckets in compartment id <COMPARTMENT_B_OCID>
 Allow dynamic-group s3-oci-migration-vm to manage objects in compartment id <COMPARTMENT_B_OCID> where target.bucket.name='destination-technology'
 ```
 
@@ -34,7 +32,7 @@ Allow dynamic-group s3-oci-migration-vm to manage objects in compartment id <COM
 
 OCI impõe limites para statements de policy por ramificação de compartments. Escolha o compartment de criação da policy de modo que ele governe todos os compartments informados e agrupe destinos no menor número possível de compartments. Cada novo bucket no mesmo compartment não aumenta a quantidade de statements; cada novo compartment aumenta um.
 
-O `inspect buckets in tenancy` permite que o OCI Resource Search monte o combobox com metadados de buckets do tenancy; não permite ler ou gravar objetos. O acesso efetivo continua limitado às regras `manage objects` dos buckets explicitamente aprovados. O stack mostra `policy_statement_count` como saída após o apply.
+O OCI Resource Search é executado sobre o tenancy, mas retorna somente metadados de buckets nos compartments onde a identidade dinâmica recebeu `inspect buckets`. Não há statement `in tenancy`: o namespace é fornecido pelo Terraform no arquivo de runtime da VM. O acesso efetivo continua limitado às regras `manage objects` dos buckets explicitamente aprovados. O stack mostra `policy_statement_count` como saída após o apply.
 
 ## Permissões para Resource Manager
 

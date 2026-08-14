@@ -20,8 +20,8 @@ Para o caso inicial de 600 TB, ondas de 10 TB e rota de 1,2 Gbps:
 | Recurso | Recomendação |
 | --- | --- |
 | Shape | VM.Standard.E5.Flex, ou flex x86 equivalente disponível |
-| CPU | 8 OCPUs em produção; 2 OCPUs na PoC de 220 MB |
-| Memória | 32 GB em produção; 8 GB na PoC de 220 MB |
+| CPU | 8 OCPUs em produção; 2 OCPUs na validação inicial de 220 MB |
+| Memória | 32 GB em produção; 8 GB na validação inicial de 220 MB |
 | Boot volume | 500 GB |
 | Workers de transferência iniciais | 4 |
 

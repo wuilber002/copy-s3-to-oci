@@ -2,7 +2,7 @@
 
 Terraform não cria nenhum recurso na AWS. Antes de cadastrar uma origem na interface web, o cliente deve criar os itens abaixo.
 
-Para o procedimento completo, reproduzível e com comandos para AWS CloudShell/AWS CLI, incluindo cleanup dos arquivos temporários e remoção opcional da PoC, consulte [AWS por CLI](aws-cli-setup.md).
+Para o procedimento completo, reproduzível e com comandos para AWS CloudShell/AWS CLI, incluindo cleanup dos arquivos temporários e remoção opcional do ambiente de validação, consulte [AWS por CLI](aws-cli-setup.md).
 
 ## 1. Credencial de bootstrap
 

@@ -272,7 +272,7 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 @app.on_event("startup")
 def create_schema() -> None:
     Base.metadata.create_all(engine)
-    # Lightweight additive migrations keep the single-VM PoC upgradeable. No
+    # Lightweight additive migrations keep the single-VM deployment upgradeable. No
     # destructive schema operation is performed automatically.
     expected_columns = {
         "source_checksum": "VARCHAR(256)",
@@ -398,8 +398,11 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
     try:
         runtime_config = read_oci_runtime_config()
         secret_ocids = runtime_config.get("secret_ocids", {})
+        object_storage_namespace = runtime_config.get("object_storage_namespace", "").strip()
     except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
         return {"ready": False, "checks": [{"name": "Configuração OCI", "status": "NOT_CONFIGURED", "detail": type(error).__name__}]}
+    if not object_storage_namespace:
+        checks.append({"name": "Namespace OCI Object Storage", "status": "NOT_CONFIGURED", "detail": "namespace ausente do runtime gerado pelo Terraform"})
     try:
         import oci
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
@@ -475,11 +478,12 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
         checks.append({"name": "Credenciais AWS e role de migração", "status": "NOT_CONFIGURED", "detail": "preencha as duas Secrets AWS e o ARN da role de migração"})
 
     try:
-        namespace = object_storage_client.get_namespace().data
-        checks.append({"name": "Namespace OCI Object Storage", "status": "READY", "detail": namespace})
+        if not object_storage_namespace:
+            raise RuntimeError("Object Storage namespace is not configured")
+        checks.append({"name": "Namespace OCI Object Storage", "status": "READY", "detail": object_storage_namespace})
         for bucket_name in sorted({source.destination_bucket for source in session.scalars(select(Source))}):
             try:
-                object_storage_client.list_objects(namespace, bucket_name, limit=1)
+                object_storage_client.list_objects(object_storage_namespace, bucket_name, limit=1)
                 checks.append({"name": f"Bucket OCI {bucket_name}", "status": "READY", "detail": "leitura autorizada"})
             except Exception as error:
                 checks.append({"name": f"Bucket OCI {bucket_name}", "status": "FAILED", "detail": type(error).__name__})
@@ -1004,7 +1008,7 @@ def heartbeat_task(task_id: int, payload: ClaimRequest, session: Session = Depen
 
 @app.post("/api/tasks/{task_id}/simulate")
 def simulate_task(task_id: int, payload: SimulationTaskUpdate, session: Session = Depends(get_session)) -> dict:
-    """Advance a task without any AWS/OCI call; restricted to explicit PoC mode."""
+    """Advance a task without any AWS/OCI call; restricted to explicit simulation mode."""
     settings = runtime_settings(session)
     if not settings.simulation_enabled:
         raise HTTPException(status_code=409, detail="Simulation mode is disabled")

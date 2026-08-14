@@ -254,7 +254,7 @@ unset BOOTSTRAP_USER_ARN MIGRATION_ROLE_ARN BATCH_ROLE_ARN
 unset SOURCE_BUCKET_ARN SOURCE_OBJECT_ARN CONTROL_BUCKET_ARN CONTROL_OBJECT_ARN
 ```
 
-### Remoção completa de uma PoC (opcional e destrutiva)
+### Remoção completa de um ambiente de validação (opcional e destrutiva)
 
 Execute **somente depois de encerrar a migração** e remover/substituir as versões das Secrets OCI. Os comandos abaixo removem a access key, usuário, roles e o bucket de controle identificados pelas variáveis desta página. Eles não tocam no bucket de origem.
 

@@ -11,8 +11,9 @@ locals {
     ])
   }
 
-  # One object-storage statement per distinct bucket compartment, plus the two
-  # common statements below. This deliberately minimizes OCI policy statements.
+  # Object access and bucket metadata inspection stay scoped to exactly the
+  # compartments supplied in the destination-bucket form. This deliberately
+  # minimizes OCI policy statements without using tenancy-wide permissions.
   object_storage_policy_statements = [
     for compartment_id, bucket_names in local.buckets_by_compartment : format(
       "Allow dynamic-group %s to manage objects in compartment id %s where any {%s}",
@@ -22,15 +23,19 @@ locals {
     )
   ]
 
-  common_policy_statements = [
-    "Allow dynamic-group ${local.dynamic_group_name} to read secret-bundles in compartment id ${var.secrets_compartment_ocid}",
-    "Allow dynamic-group ${local.dynamic_group_name} to read objectstorage-namespaces in tenancy",
-    # Resource Search needs bucket metadata visibility; object access remains
-    # limited by the per-compartment destination-bucket statements above.
-    "Allow dynamic-group ${local.dynamic_group_name} to inspect buckets in tenancy"
+  bucket_inspection_policy_statements = [
+    for compartment_id in local.bucket_compartments : format(
+      "Allow dynamic-group %s to inspect buckets in compartment id %s",
+      local.dynamic_group_name,
+      compartment_id,
+    )
   ]
 
-  policy_statements = concat(local.common_policy_statements, local.object_storage_policy_statements)
+  common_policy_statements = [
+    "Allow dynamic-group ${local.dynamic_group_name} to read secret-bundles in compartment id ${var.secrets_compartment_ocid}",
+  ]
+
+  policy_statements = concat(local.common_policy_statements, local.bucket_inspection_policy_statements, local.object_storage_policy_statements)
 
   effective_backup_policy_id = var.create_boot_volume_backup_policy ? oci_core_volume_backup_policy.migration[0].id : trimspace(var.backup_policy_id)
 
@@ -48,6 +53,10 @@ locals {
       See docs/aws-setup.md before replacing this value.
     EOT
   }
+}
+
+data "oci_objectstorage_namespace" "migration" {
+  compartment_id = var.compartment_ocid
 }
 
 resource "random_password" "postgres" {
@@ -148,6 +157,7 @@ resource "oci_core_instance" "migration" {
       bootstrap_repository = var.bootstrap_repository
       bootstrap_ref        = var.bootstrap_ref
       oci_runtime_config = jsonencode({
+        object_storage_namespace = data.oci_objectstorage_namespace.migration.namespace
         secret_ocids = merge(
           { for name, secret in oci_vault_secret.aws : name => secret.id },
           { postgres_password = oci_vault_secret.postgres_password.id },

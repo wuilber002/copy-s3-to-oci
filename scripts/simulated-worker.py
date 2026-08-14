@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PoC-only worker that exercises durable task leases without cloud calls."""
+"""Simulation-only worker that exercises durable task leases without cloud calls."""
 
 import json
 import time
@@ -8,7 +8,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 BASE_URL = "http://127.0.0.1:8080"
-WORKER_ID = "poc-simulated-worker"
+WORKER_ID = "simulated-worker"
 
 
 def post(path: str, payload: dict) -> Optional[dict]:
