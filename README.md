@@ -1,6 +1,6 @@
-# S3 Glacier to OCI Object Storage Migration
+# RAIJIN — S3 Glacier to OCI Object Storage Migration
 
-Plataforma de migração controlada de objetos AWS S3, incluindo Glacier Deep Archive, para OCI Object Storage. Ela opera em uma única VM OCI e mantém inventário, ondas, estado de restore, transferências e evidências de integridade em PostgreSQL.
+**RAIJIN** (雷神, o deus japonês do trovão) é uma plataforma de migração controlada de objetos AWS S3, incluindo Glacier Deep Archive, para OCI Object Storage. Ela opera em uma única VM OCI e mantém inventário, ondas, estado de restore, transferências e evidências de integridade em PostgreSQL.
 
 ## Estado atual
 
