@@ -83,8 +83,10 @@
     <div id="inventory"></div>
   </section>
 
-  <section class="card"><h2>Criar uma onda</h2>
-    <form id="wave-form" class="grid">
+  <section class="card"><h2>Criar ondas</h2>
+    <label class="field" style="max-width:420px"><span class="with-help">Método de criação <span class="help" tabindex="0" data-help="Escolha criar apenas a próxima onda, criar automaticamente todas as ondas pendentes ou limitar a criação automática a um prefixo S3 específico.">i</span></span><select id="wave-creation-method" onchange="showWaveCreationMethod()"><option value="manual">Criar uma onda manualmente</option><option value="automatic">Criar todas automaticamente</option><option value="prefix">Criar automaticamente por prefixo</option></select></label>
+    <div id="wave-method-manual" class="wave-method">
+    <h3>Onda manual</h3><form id="wave-form" class="grid">
       <label class="field"><span class="with-help">Nome da onda <span class="help" tabindex="0" data-help="Identificador único desta onda dentro da origem. Use um nome que permita reconhecer o lote em relatórios e no processo de aprovação.">i</span></span><input id="wave-name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,127}" placeholder="Ex.: onda-001"></label>
       <label class="field"><span class="with-help">Quantidade de dados <span class="help" tabindex="0" data-help="Quantidade máxima somada dos objetos selecionados para esta onda. Informe o valor e escolha a unidade ao lado; o limite técnico total é 10 TB.">i</span></span><input id="wave-size" type="number" min="0.001" step="0.001" value="10" required></label>
       <label class="field"><span class="with-help">Unidade de medida <span class="help" tabindex="0" data-help="Define a unidade da quantidade informada: MB para megabytes, GB para gigabytes ou TB para terabytes. A plataforma converte o valor para bytes antes de criar a onda.">i</span></span><select id="wave-size-unit"><option value="MB">MB</option><option value="GB">GB</option><option value="TB" selected>TB</option></select></label>
@@ -93,10 +95,10 @@
       <button>Criar onda manual</button>
     </form>
     <p class="hint">Seleciona a próxima sequência de objetos descobertos da origem até o limite. Ela gera uma tarefa persistente; o restore só será submetido pelo worker AWS após sua configuração.</p>
-  </section>
+    </div>
 
-  <section class="card"><h2>Criar ondas automaticamente</h2>
-    <form id="automatic-wave-form" class="grid">
+    <div id="wave-method-automatic" class="wave-method hidden">
+    <h3>Ondas automáticas</h3><form id="automatic-wave-form" class="grid">
       <label class="field"><span class="with-help">Tamanho alvo por onda <span class="help" tabindex="0" data-help="Cada onda é preenchida em ordem de chave S3 até este tamanho. A última pode ser menor. Um objeto maior que o alvo é colocado em uma onda exclusiva para não bloquear a migração.">i</span></span><input id="automatic-wave-size" type="number" min="0.001" step="0.001" value="10" onchange="previewAutomaticWaves()" required></label>
       <label class="field"><span>Unidade</span><select id="automatic-wave-unit" onchange="previewAutomaticWaves()"><option value="MB">MB</option><option value="GB">GB</option><option value="TB" selected>TB</option></select></label>
       <label class="field"><span>Retenção do restore (dias)</span><input id="automatic-restore-days" type="number" min="1" max="30" value="7" required></label>
@@ -104,10 +106,10 @@
       <button>Criar todas as ondas</button>
     </form>
     <div id="automatic-wave-preview" class="hint">Selecione uma origem e informe o tamanho alvo para calcular a estimativa.</div>
-  </section>
+    </div>
 
-  <section class="card"><h2>Criar ondas por prefixo S3</h2>
-    <form id="prefix-wave-form" class="grid">
+    <div id="wave-method-prefix" class="wave-method hidden">
+    <h3>Ondas por prefixo S3</h3><form id="prefix-wave-form" class="grid">
       <label class="field"><span class="with-help">Prefixo de objetos <span class="help" tabindex="0" data-help="Cria ondas somente para chaves descobertas que começam com este prefixo. Use, por exemplo, workload-prioritario/ ou dados/sistema-a/. Os objetos fora do prefixo permanecem disponíveis para outras ondas.">i</span></span><input id="prefix-wave-prefix" maxlength="1024" placeholder="Ex.: workload-prioritario/" onchange="previewPrefixWaves()" required></label>
       <label class="field"><span>Tamanho alvo por onda</span><input id="prefix-wave-size" type="number" min="0.001" step="0.001" value="10" onchange="previewPrefixWaves()" required></label>
       <label class="field"><span>Unidade</span><select id="prefix-wave-unit" onchange="previewPrefixWaves()"><option value="MB">MB</option><option value="GB">GB</option><option value="TB" selected>TB</option></select></label>
@@ -116,6 +118,7 @@
       <button>Criar ondas do prefixo</button>
     </form>
     <div id="prefix-wave-preview" class="hint">Informe um prefixo para calcular a estimativa das ondas desse workload.</div>
+    </div>
   </section>
 
   <section class="card"><h2>Ondas</h2><div id="waves">Selecione uma origem.</div></section>
@@ -134,6 +137,7 @@ function say(text, bad=false){const e=$('#message');e.textContent=text;e.classNa
 async function api(path, options={}){const r=await fetch(path,options);if(!r.ok){let d=await r.text();try{d=JSON.parse(d).detail||d}catch{}throw new Error(d)}return r.status===204?null:r.json()}
 function escape(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function showView(view){document.querySelectorAll('.view').forEach(e=>e.classList.remove('active'));document.querySelectorAll('[data-view]').forEach(e=>e.classList.remove('active'));$(`#view-${view}`).classList.add('active');document.querySelector(`[data-view="${view}"]`)?.classList.add('active');window.scrollTo({top:0,behavior:'smooth'});if(view==='migrations')refreshMigration();if(view==='settings'){loadSettings();loadOciBuckets()}}
+function showWaveCreationMethod(){const method=$('#wave-creation-method').value;document.querySelectorAll('.wave-method').forEach(section=>section.classList.add('hidden'));$(`#wave-method-${method}`).classList.remove('hidden');if(method==='automatic')previewAutomaticWaves();if(method==='prefix')previewPrefixWaves()}
 
 function serviceLabel(name){return {migration_systemd:'Serviço da plataforma',postgres_container:'PostgreSQL',app_container:'Aplicação web',real_worker:'Worker AWS/OCI real',postgres_backup_timer:'Timer de backup PostgreSQL',platform_status_timer:'Timer de estado',simulated_worker:'Worker de simulação'}[name]||name}
 function serviceHelp(name){return {migration_systemd:'Serviço systemd que inicia e mantém os containers da plataforma após boot. Se ficar inativo, PostgreSQL e aplicação podem não voltar automaticamente após uma reinicialização.',postgres_container:'Banco PostgreSQL persistente: guarda inventário, ondas, fila, configurações, auditoria e evidências de integridade. Se parar, a console e os workers não conseguem operar.',app_container:'API e interface web local da plataforma. Se parar, o túnel SSH continuará existindo, mas a interface e os workers não terão API disponível.',real_worker:'Executa o discovery AWS, Batch Operations, polling de restore, cópia para OCI e validação SHA-256. O container pode ficar running e ocioso; ele só chama provedores após a chave Worker AWS/OCI real ser habilitada.',postgres_backup_timer:'Agenda o backup lógico diário do PostgreSQL. Se parar, a plataforma continua funcionando, mas perde a camada complementar de recuperação de dados.',platform_status_timer:'Atualiza o estado dos serviços exibido no Painel. Se parar, a migração pode continuar, porém os cartões e alertas podem ficar desatualizados.',simulated_worker:'Worker de teste. Ele só age quando a simulação é habilitada e nunca chama AWS ou OCI. Mantenha desabilitado em operação normal.'}[name]||'Estado do componente local da plataforma.'}
@@ -177,6 +181,7 @@ $('#automatic-wave-form').addEventListener('submit',async e=>{e.preventDefault()
 $('#prefix-wave-form').addEventListener('submit',async e=>{e.preventDefault();await submitAutomaticWaveForm(true)});
 async function refreshMigration(){await loadSources();if(selectedSource){$('#source-select').value=selectedSource;await selectSource()}await Promise.all([loadTasks(),loadEvents()])}
 async function refreshAll(){await Promise.all([loadHealth(),loadSettings(),loadOciBuckets(),loadSources(),loadDaily()]);if(selectedSource){$('#source-select').value=selectedSource;await selectSource()}await Promise.all([loadTasks(),loadEvents()])}
+showWaveCreationMethod();
 refreshAll();
 </script>
 </body></html>
