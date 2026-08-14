@@ -977,15 +977,14 @@ def assign_wave(session: Session, source_id: int, name: str, max_bytes: int, res
                 restore_tier: str, objects: list[ObjectRecord], oversized: bool = False) -> Wave:
     assigned_bytes = sum(obj.size_bytes for obj in objects)
     wave = Wave(source_id=source_id, name=name, max_bytes=max_bytes, restore_days=restore_days,
-                restore_tier=restore_tier, status="READY_FOR_RESTORE")
+                restore_tier=restore_tier, status="PLANNED")
     session.add(wave)
     session.flush()
     for obj in objects:
         obj.wave_id = wave.id
         obj.state = ObjectState.WAVE_ASSIGNED
-    session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
     suffix = " (contains an object larger than the configured target)" if oversized else ""
-    record_event(session, "WAVE_CREATED", f"Wave '{wave.name}' created with {len(objects)} object(s) and {assigned_bytes} byte(s){suffix}", source_id=source_id, wave_id=wave.id)
+    record_event(session, "WAVE_CREATED", f"Wave '{wave.name}' planned with {len(objects)} object(s) and {assigned_bytes} byte(s){suffix}; no task was queued", source_id=source_id, wave_id=wave.id)
     return wave
 
 
@@ -1236,6 +1235,30 @@ def resume_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     record_event(session, "WAVE_RESUMED", f"Wave '{wave.name}' resumed by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
+
+
+@app.post("/api/waves/{wave_id}/queue")
+def queue_planned_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    wave = wave_or_404(session, wave_id)
+    if wave.status != "PLANNED":
+        raise HTTPException(status_code=409, detail="Only a planned wave can be added to the queue")
+    wave.status = "READY_FOR_RESTORE"
+    session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
+    record_event(session, "WAVE_QUEUED", f"Wave '{wave.name}' added to the restore queue by operator", source_id=wave.source_id, wave_id=wave.id)
+    session.commit()
+    return {"wave_id": wave.id, "status": wave.status}
+
+
+@app.post("/api/sources/{source_id}/waves/queue-all")
+def queue_all_planned_waves(source_id: int, session: Session = Depends(get_session)) -> dict:
+    source = active_source_or_409(session, source_id)
+    waves = list(session.scalars(select(Wave).where(Wave.source_id == source.id, Wave.status == "PLANNED").order_by(Wave.id)))
+    for wave in waves:
+        wave.status = "READY_FOR_RESTORE"
+        session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
+        record_event(session, "WAVE_QUEUED", f"Wave '{wave.name}' added to the restore queue by operator", source_id=source.id, wave_id=wave.id)
+    session.commit()
+    return {"queued": len(waves)}
 
 
 @app.post("/api/waves/{wave_id}/reprocess")
