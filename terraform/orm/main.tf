@@ -59,6 +59,14 @@ data "oci_objectstorage_namespace" "migration" {
   compartment_id = var.compartment_ocid
 }
 
+# Resolve names while the Resource Manager stack runs. The VM receives only a
+# local OCID-to-name map, so the dynamic group needs no Identity permission
+# just to render the destination-bucket selector.
+data "oci_identity_compartment" "destination" {
+  for_each = toset(local.bucket_compartments)
+  id       = each.value
+}
+
 resource "random_password" "postgres" {
   length  = 48
   special = false
@@ -158,6 +166,9 @@ resource "oci_core_instance" "migration" {
       bootstrap_ref        = var.bootstrap_ref
       oci_runtime_config = jsonencode({
         object_storage_namespace = data.oci_objectstorage_namespace.migration.namespace
+        destination_compartment_names = {
+          for compartment_id, compartment in data.oci_identity_compartment.destination : compartment_id => compartment.name
+        }
         secret_ocids = merge(
           { for name, secret in oci_vault_secret.aws : name => secret.id },
           { postgres_password = oci_vault_secret.postgres_password.id },

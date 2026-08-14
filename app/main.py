@@ -562,6 +562,11 @@ def refresh_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"OCI Resource Search failed: {type(error).__name__}") from error
 
+    try:
+        configured_compartment_names = read_oci_runtime_config().get("destination_compartment_names", {})
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        configured_compartment_names = {}
+
     now, found = utcnow(), set()
     for item in items:
         bucket_ocid = getattr(item, "identifier", None)
@@ -575,7 +580,10 @@ def refresh_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
             session.add(cached)
         cached.name = name
         cached.compartment_id = getattr(item, "compartment_id", None)
-        cached.compartment_name = getattr(item, "compartment_name", None)
+        cached.compartment_name = (
+            getattr(item, "compartment_name", None)
+            or configured_compartment_names.get(cached.compartment_id)
+        )
         cached.lifecycle_state = getattr(item, "lifecycle_state", None)
         cached.refreshed_at = now
     if found:

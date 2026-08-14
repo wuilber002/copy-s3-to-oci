@@ -32,7 +32,7 @@ Allow dynamic-group s3-oci-migration-vm to manage objects in compartment id <COM
 
 OCI impõe limites para statements de policy por ramificação de compartments. Escolha o compartment de criação da policy de modo que ele governe todos os compartments informados e agrupe destinos no menor número possível de compartments. Cada novo bucket no mesmo compartment não aumenta a quantidade de statements; cada novo compartment aumenta um.
 
-O OCI Resource Search é executado sobre o tenancy, mas retorna somente metadados de buckets nos compartments onde a identidade dinâmica recebeu `inspect buckets`. Não há statement `in tenancy`: o namespace é fornecido pelo Terraform no arquivo de runtime da VM. O acesso efetivo continua limitado às regras `manage objects` dos buckets explicitamente aprovados. O stack mostra `policy_statement_count` como saída após o apply.
+O OCI Resource Search é executado sobre o tenancy, mas retorna somente metadados de buckets nos compartments onde a identidade dinâmica recebeu `inspect buckets`. Não há statement `in tenancy`: o namespace e o mapeamento de OCID para nome dos compartments de destino são fornecidos pelo Terraform no arquivo local de runtime da VM. O acesso efetivo continua limitado às regras `manage objects` dos buckets explicitamente aprovados. O stack mostra `policy_statement_count` como saída após o apply.
 
 ## Permissões para Resource Manager
 
