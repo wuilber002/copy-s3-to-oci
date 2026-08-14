@@ -262,10 +262,6 @@ class SimulationTaskUpdate(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
 
 
-class WaveAction(BaseModel):
-    reason: str = Field(min_length=3, max_length=1000)
-
-
 class IntegrityEvidence(BaseModel):
     source_checksum: str | None = Field(default=None, max_length=256)
     destination_checksum: str | None = Field(default=None, max_length=256)
@@ -1040,18 +1036,18 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
 
 
 @app.post("/api/waves/{wave_id}/pause")
-def pause_wave(wave_id: int, payload: WaveAction, session: Session = Depends(get_session)) -> dict:
+def pause_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
     if wave.status == "PAUSED":
         return {"wave_id": wave.id, "status": wave.status}
     wave.status = "PAUSED"
-    record_event(session, "WAVE_PAUSED", f"Wave '{wave.name}' paused: {payload.reason}", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "WAVE_PAUSED", f"Wave '{wave.name}' paused by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
 
 @app.post("/api/waves/{wave_id}/resume")
-def resume_wave(wave_id: int, payload: WaveAction, session: Session = Depends(get_session)) -> dict:
+def resume_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
     if wave.status != "PAUSED":
         raise HTTPException(status_code=409, detail="Only a paused wave can be resumed")
@@ -1059,13 +1055,13 @@ def resume_wave(wave_id: int, payload: WaveAction, session: Session = Depends(ge
     queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
     if not queued:
         session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
-    record_event(session, "WAVE_RESUMED", f"Wave '{wave.name}' resumed: {payload.reason}", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "WAVE_RESUMED", f"Wave '{wave.name}' resumed by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
 
 @app.post("/api/waves/{wave_id}/reprocess")
-def reprocess_wave(wave_id: int, payload: WaveAction, session: Session = Depends(get_session)) -> dict:
+def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     """Queue a new controlled restore submission; no external call is made here."""
     wave = wave_or_404(session, wave_id)
     if wave.status == "PAUSED":
@@ -1075,7 +1071,7 @@ def reprocess_wave(wave_id: int, payload: WaveAction, session: Session = Depends
         raise HTTPException(status_code=409, detail="This wave already has a queued or running task")
     wave.status = "READY_FOR_RESTORE"
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
-    record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}': {payload.reason}", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}' by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status, "message": "Restore task queued"}
 
