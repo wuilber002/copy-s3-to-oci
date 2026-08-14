@@ -14,6 +14,7 @@ import io
 import json
 import socket
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -208,24 +209,26 @@ class HashingStream:
         return data
 
 
-def transfer_wave(session, task: Task, settings) -> None:
-    wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
-    s3, _, _ = aws_clients(settings, source.aws_region)
-    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-    oci_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
-    namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
-    if not namespace:
-        raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
-    rate = settings.max_throughput_mbps * 125000 / max(1, settings.transfer_workers)
-    objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORED, ObjectState.TRANSFERRING])).order_by(ObjectRecord.id)))
-    wave.status = "TRANSFERRING"
-    session.commit()
-    for obj in objects:
-        task.lease_expires_at = utcnow() + timedelta(seconds=settings.task_lease_seconds); session.commit()
-        obj.state = ObjectState.TRANSFERRING; session.commit()
-        args = {"Bucket": source.s3_bucket, "Key": obj.object_key}
-        if obj.version_id: args["VersionId"] = obj.version_id
-        head, tags = s3.head_object(**args), s3.get_object_tagging(**args).get("TagSet", [])
+def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: str,
+                    object_id: int, rate_bytes_per_second: float) -> None:
+    """Copy one object using an independent database session.
+
+    A SQLAlchemy session is never shared between file workers. AWS credentials
+    are assumed once per wave, while the OCI client is short lived per object
+    worker to keep its HTTP state isolated too.
+    """
+    with SessionLocal() as worker_session:
+        obj = worker_session.get(ObjectRecord, object_id)
+        if not obj or obj.state not in {ObjectState.RESTORED, ObjectState.TRANSFERRING}:
+            return
+        obj.state = ObjectState.TRANSFERRING
+        worker_session.commit()
+
+        args = {"Bucket": source_bucket, "Key": obj.object_key}
+        if obj.version_id:
+            args["VersionId"] = obj.version_id
+        head = s3.head_object(**args)
+        tags = s3.get_object_tagging(**args).get("TagSet", [])
         body = s3.get_object(**args)["Body"]
         # OCI metadata is preserved where supported. S3 object tags have no
         # equivalent OCI tag API, so their complete evidence remains in the
@@ -233,10 +236,14 @@ def transfer_wave(session, task: Task, settings) -> None:
         metadata = {str(k).lower(): str(v) for k, v in head.get("Metadata", {}).items()}
         tags_json = json.dumps({tag["Key"]: tag["Value"] for tag in tags}, separators=(",", ":"), ensure_ascii=False)
         metadata["s3-oci-tags-json"] = tags_json[:1800]
-        stream = HashingStream(body, rate)
-        oci_client.put_object(namespace, source.destination_bucket, obj.object_key, stream, content_length=obj.size_bytes, content_type=head.get("ContentType"), opc_meta=metadata)
+        stream = HashingStream(body, rate_bytes_per_second)
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        oci_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
+        oci_client.put_object(namespace, destination_bucket, obj.object_key, stream,
+                              content_length=obj.size_bytes,
+                              content_type=head.get("ContentType"), opc_meta=metadata)
         checksum = stream.digest.hexdigest()
-        destination_body = oci_client.get_object(namespace, source.destination_bucket, obj.object_key).data.raw
+        destination_body = oci_client.get_object(namespace, destination_bucket, obj.object_key).data.raw
         destination_digest = hashlib.sha256()
         for chunk in iter(lambda: destination_body.read(8 * 1024 * 1024), b""):
             destination_digest.update(chunk)
@@ -245,9 +252,54 @@ def transfer_wave(session, task: Task, settings) -> None:
         obj.source_checksum, obj.destination_checksum = checksum, destination_checksum
         # Transfer collects immutable checksum evidence, but does not compare it
         # or declare the object verified. That is an explicit operator action.
-        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error, obj.state, obj.transferred_at = "SHA256", None, None, ObjectState.TRANSFERRED, utcnow()
+        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error = "SHA256", None, None
+        obj.state, obj.transferred_at = ObjectState.TRANSFERRED, utcnow()
+        worker_session.commit()
+
+
+def transfer_wave(session, task: Task, settings) -> None:
+    wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
+    s3, _, _ = aws_clients(settings, source.aws_region)
+    namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
+    if not namespace:
+        raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
+    wave.status = "TRANSFERRING"
+    session.commit()
+
+    # The wave task remains exclusive: file workers only parallelize objects
+    # inside it. Settings are reloaded before each batch, so changing workers
+    # or the aggregate throughput in the UI takes effect without a restart.
+    while True:
+        session.expire_all()
+        live_settings = runtime_settings(session)
+        worker_count = max(1, live_settings.transfer_workers)
+        object_ids = list(session.scalars(select(ObjectRecord.id).where(
+            ObjectRecord.wave_id == wave.id,
+            ObjectRecord.state.in_([ObjectState.RESTORED, ObjectState.TRANSFERRING]),
+        ).order_by(ObjectRecord.id).limit(worker_count)))
+        if not object_ids:
+            break
+        task.lease_expires_at = utcnow() + timedelta(seconds=live_settings.task_lease_seconds)
         session.commit()
-    remaining = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.TRANSFERRED)) or 0
+        rate = live_settings.max_throughput_mbps * 125000 / worker_count
+        errors: list[str] = []
+        with ThreadPoolExecutor(max_workers=len(object_ids), thread_name_prefix="s3-oci-transfer") as executor:
+            futures = [executor.submit(transfer_object, s3, namespace, source.s3_bucket,
+                                       source.destination_bucket, object_id, rate)
+                       for object_id in object_ids]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as error:
+                    errors.append(f"{type(error).__name__}: {error}")
+        if errors:
+            raise RuntimeError(f"{len(errors)} object transfer(s) failed in parallel batch: {errors[0]}")
+
+    session.expire_all()
+    remaining = session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.TRANSFERRED
+    )) or 0
+    wave = session.get(Wave, task.wave_id)
     wave.status = "TRANSFERRED" if not remaining else "TRANSFERRED_WITH_ERRORS"
     event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed. Integrity verification awaits operator request.", source_id=source.id, wave_id=wave.id)
     succeed(session, task)
