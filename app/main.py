@@ -544,7 +544,7 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0),
             func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), ObjectRecord.size_bytes), else_=0)), 0),
         ).join(Source, Source.id == Wave.source_id).join(ObjectRecord, ObjectRecord.wave_id == Wave.id)
-        .where(Wave.id.in_(select(ObjectRecord.wave_id).where(ObjectRecord.state == ObjectState.TRANSFERRING)))
+        .where(Wave.id.in_(select(Task.wave_id).where(Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING)))
         .group_by(Wave.id, Source.name).order_by(Wave.id)
     ).all()
     active_transfers = [
@@ -1029,8 +1029,8 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
                                             ObjectRecord.state != ObjectState.WAVE_ASSIGNED)
     ))
     transferring_wave_ids = set(session.scalars(
-        select(ObjectRecord.wave_id).where(ObjectRecord.source_id == source_id, ObjectRecord.wave_id.is_not(None),
-                                            ObjectRecord.state == ObjectState.TRANSFERRING)
+        select(Task.wave_id).join(Wave).where(Wave.source_id == source_id, Task.kind == "TRANSFER_WAVE",
+                                               Task.state == TaskState.RUNNING)
     ))
     rows = session.execute(
         select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0))
