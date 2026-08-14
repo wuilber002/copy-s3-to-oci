@@ -103,6 +103,8 @@ class ObjectRecord(Base):
     source_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
     destination_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
     checksum_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     integrity_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     integrity_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     state: Mapped[str] = mapped_column(String(32), default=ObjectState.DISCOVERED)
@@ -284,6 +286,8 @@ def create_schema() -> None:
         "source_checksum": "VARCHAR(256)",
         "destination_checksum": "VARCHAR(256)",
         "checksum_algorithm": "VARCHAR(32)",
+        "restored_at": "TIMESTAMP WITH TIME ZONE",
+        "transferred_at": "TIMESTAMP WITH TIME ZONE",
         "integrity_verified_at": "TIMESTAMP WITH TIME ZONE",
         "integrity_error": "TEXT",
     }
@@ -513,6 +517,14 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     task_counts = dict(session.execute(
         select(Task.state, func.count(Task.id)).group_by(Task.state)
     ).all())
+    window_seconds = 300
+    since = utcnow() - timedelta(seconds=window_seconds)
+    transferred_bytes, transferred_files = session.execute(
+        select(func.coalesce(func.sum(ObjectRecord.size_bytes), 0), func.count(ObjectRecord.id)).where(
+            ObjectRecord.transferred_at >= since
+        )
+    ).one()
+    transferred_bytes, transferred_files, restored_files = int(transferred_bytes or 0), int(transferred_files or 0), int(session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.restored_at >= since)) or 0)
     volume = shutil.disk_usage("/")
     return {
         "status": "ok",
@@ -521,6 +533,15 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
         "objects": object_count,
         "bytes": bytes_total,
         "tasks": task_counts,
+        "activity": {
+            "window_seconds": window_seconds,
+            "transfer_bytes": transferred_bytes,
+            "transfer_files": transferred_files,
+            "transfer_mbps": round((transferred_bytes * 8) / window_seconds / 1_000_000, 2),
+            "restored_files": restored_files,
+            "restored_per_minute": round(restored_files / (window_seconds / 60), 2),
+            "restored_per_hour": round(restored_files / (window_seconds / 3600), 2),
+        },
         "disk": {"total": volume.total, "used": volume.used, "free": volume.free},
     }
 
@@ -775,7 +796,8 @@ def object_detail(object_id: int, session: Session = Depends(get_session)) -> di
             "metadata": json.loads(obj.metadata_json), "tags": json.loads(obj.tags_json),
             "integrity": {"source_checksum": obj.source_checksum, "destination_checksum": obj.destination_checksum,
                           "algorithm": obj.checksum_algorithm, "verified_at": obj.integrity_verified_at,
-                          "error": obj.integrity_error}}
+                          "error": obj.integrity_error}, "restored_at": obj.restored_at,
+            "transferred_at": obj.transferred_at}
 
 
 @app.put("/api/objects/{object_id}/integrity")
@@ -1224,12 +1246,14 @@ def simulate_task(task_id: int, payload: SimulationTaskUpdate, session: Session 
         for obj in objects:
             if obj.state in [ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING]:
                 obj.state = ObjectState.RESTORED
+                obj.restored_at = utcnow()
         wave.status = "RESTORED"
         next_kind = "TRANSFER_WAVE"
     elif task.kind == "TRANSFER_WAVE":
         for obj in objects:
             if obj.state == ObjectState.RESTORED:
                 obj.state = ObjectState.TRANSFERRED
+                obj.transferred_at = utcnow()
         wave.status = "TRANSFERRED"
     elif task.kind == "VERIFY_WAVE":
         for obj in objects:

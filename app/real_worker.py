@@ -127,7 +127,7 @@ def submit_restore(session, task: Task, settings) -> None:
     archives = archive_objects(session, wave.id)
     if not archives:
         for obj in session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state == ObjectState.WAVE_ASSIGNED)):
-            obj.state = ObjectState.RESTORED
+            obj.state, obj.restored_at = ObjectState.RESTORED, utcnow()
         wave.status = "RESTORED"
         succeed(session, task, "TRANSFER_WAVE")
         return
@@ -181,7 +181,7 @@ def poll_restore(session, task: Task, settings) -> None:
     for obj in objects:
         if obj.storage_class not in ARCHIVE_CLASSES or obj.object_key in ready_keys:
             if obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING, ObjectState.WAVE_ASSIGNED}:
-                obj.state = ObjectState.RESTORED
+                obj.state, obj.restored_at = ObjectState.RESTORED, obj.restored_at or utcnow()
         elif obj.state == ObjectState.RESTORE_REQUESTED:
             obj.state = ObjectState.RESTORING
     pending = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING]))) or 0
@@ -243,7 +243,7 @@ def transfer_wave(session, task: Task, settings) -> None:
         obj.source_checksum, obj.destination_checksum = checksum, destination_checksum
         # Transfer collects immutable checksum evidence, but does not compare it
         # or declare the object verified. That is an explicit operator action.
-        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error, obj.state = "SHA256", None, None, ObjectState.TRANSFERRED
+        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error, obj.state, obj.transferred_at = "SHA256", None, None, ObjectState.TRANSFERRED, utcnow()
         session.commit()
     remaining = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.TRANSFERRED)) or 0
     wave.status = "TRANSFERRED" if not remaining else "TRANSFERRED_WITH_ERRORS"
