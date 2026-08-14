@@ -198,11 +198,14 @@ def poll_restore(session, task: Task, settings) -> None:
 
 
 class HashingStream:
-    def __init__(self, body, rate_bytes_per_second: float): self.body, self.digest, self.rate = body, hashlib.sha256(), rate_bytes_per_second
+    def __init__(self, body, rate_bytes_per_second: float, progress=None):
+        self.body, self.digest, self.rate, self.progress = body, hashlib.sha256(), rate_bytes_per_second, progress
     def read(self, amount=-1):
         started = time.monotonic(); data = self.body.read(amount)
         if data:
             self.digest.update(data)
+            if self.progress:
+                self.progress(len(data))
             if self.rate > 0:
                 elapsed = time.monotonic() - started; minimum = len(data) / self.rate
                 if minimum > elapsed: time.sleep(minimum - elapsed)
@@ -210,7 +213,7 @@ class HashingStream:
 
 
 def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: str,
-                    object_id: int, rate_bytes_per_second: float) -> None:
+                    object_id: int, rate_bytes_per_second: float, preserve_s3_tags: bool) -> None:
     """Copy one object using an independent database session.
 
     A SQLAlchemy session is never shared between file workers. AWS credentials
@@ -221,39 +224,58 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
         obj = worker_session.get(ObjectRecord, object_id)
         if not obj or obj.state not in {ObjectState.RESTORED, ObjectState.TRANSFERRING}:
             return
-        obj.state = ObjectState.TRANSFERRING
+        obj.state, obj.transfer_started_at = ObjectState.TRANSFERRING, utcnow()
+        obj.transfer_progress_bytes, obj.transfer_progress_at, obj.transfer_rate_mbps = 0, utcnow(), 0
         worker_session.commit()
 
         args = {"Bucket": source_bucket, "Key": obj.object_key}
         if obj.version_id:
             args["VersionId"] = obj.version_id
-        head = s3.head_object(**args)
-        tags = s3.get_object_tagging(**args).get("TagSet", [])
-        body = s3.get_object(**args)["Body"]
+        # GetObject already returns the metadata and content headers that were
+        # formerly fetched with a separate HeadObject request.
+        response = s3.get_object(**args)
+        tags = s3.get_object_tagging(**args).get("TagSet", []) if preserve_s3_tags else []
+        body = response["Body"]
         # OCI metadata is preserved where supported. S3 object tags have no
         # equivalent OCI tag API, so their complete evidence remains in the
         # control database and a bounded JSON copy is stored as metadata.
-        metadata = {str(k).lower(): str(v) for k, v in head.get("Metadata", {}).items()}
+        metadata = {str(k).lower(): str(v) for k, v in response.get("Metadata", {}).items()}
         tags_json = json.dumps({tag["Key"]: tag["Value"] for tag in tags}, separators=(",", ":"), ensure_ascii=False)
-        metadata["s3-oci-tags-json"] = tags_json[:1800]
-        stream = HashingStream(body, rate_bytes_per_second)
+        if preserve_s3_tags:
+            metadata["s3-oci-tags-json"] = tags_json[:1800]
+        progress_bytes, progress_baseline, progress_baseline_at, last_persist = 0, 0, time.monotonic(), time.monotonic()
+
+        def record_progress(size: int) -> None:
+            nonlocal progress_bytes, progress_baseline, progress_baseline_at, last_persist
+            progress_bytes += size
+            now = time.monotonic()
+            # Persist at most once every two seconds per active object. This
+            # keeps a restart-safe live rate without turning each read chunk
+            # into a PostgreSQL write.
+            if now - last_persist < 2:
+                return
+            elapsed = max(now - progress_baseline_at, 0.001)
+            obj.transfer_progress_bytes = progress_bytes
+            obj.transfer_progress_at = utcnow()
+            obj.transfer_rate_mbps = round(((progress_bytes - progress_baseline) * 8) / elapsed / 1_000_000, 2)
+            worker_session.commit()
+            progress_baseline, progress_baseline_at, last_persist = progress_bytes, now, now
+
+        stream = HashingStream(body, rate_bytes_per_second, record_progress)
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
         oci_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
         oci_client.put_object(namespace, destination_bucket, obj.object_key, stream,
                               content_length=obj.size_bytes,
-                              content_type=head.get("ContentType"), opc_meta=metadata)
+                              content_type=response.get("ContentType"), opc_meta=metadata)
         checksum = stream.digest.hexdigest()
-        destination_body = oci_client.get_object(namespace, destination_bucket, obj.object_key).data.raw
-        destination_digest = hashlib.sha256()
-        for chunk in iter(lambda: destination_body.read(8 * 1024 * 1024), b""):
-            destination_digest.update(chunk)
-        destination_checksum = destination_digest.hexdigest()
-        obj.metadata_json, obj.tags_json = json.dumps(head.get("Metadata", {})), tags_json
-        obj.source_checksum, obj.destination_checksum = checksum, destination_checksum
-        # Transfer collects immutable checksum evidence, but does not compare it
-        # or declare the object verified. That is an explicit operator action.
+        obj.metadata_json, obj.tags_json = json.dumps(response.get("Metadata", {})), tags_json
+        obj.source_checksum, obj.destination_checksum = checksum, None
+        # The destination is intentionally not reread here. SHA-256 comparison
+        # is a separate explicit verification task, avoiding an OCI GetObject
+        # request and a second full read for every transferred object.
         obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error = "SHA256", None, None
         obj.state, obj.transferred_at = ObjectState.TRANSFERRED, utcnow()
+        obj.transfer_progress_bytes, obj.transfer_progress_at, obj.transfer_rate_mbps = obj.size_bytes, utcnow(), 0
         worker_session.commit()
 
 
@@ -285,7 +307,7 @@ def transfer_wave(session, task: Task, settings) -> None:
         errors: list[str] = []
         with ThreadPoolExecutor(max_workers=len(object_ids), thread_name_prefix="s3-oci-transfer") as executor:
             futures = [executor.submit(transfer_object, s3, namespace, source.s3_bucket,
-                                       source.destination_bucket, object_id, rate)
+                                       source.destination_bucket, object_id, rate, live_settings.preserve_s3_tags)
                        for object_id in object_ids]
             for future in as_completed(futures):
                 try:
@@ -306,18 +328,34 @@ def transfer_wave(session, task: Task, settings) -> None:
 
 
 def verify_wave(session, task: Task) -> None:
-    """Compare transfer evidence only after the operator has queued verification."""
+    """Read OCI objects and compare them to the SHA-256 evidence from S3."""
     wave = session.get(Wave, task.wave_id)
     source = wave.source
+    namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
+    if not namespace:
+        raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
+    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+    oci_client = oci.object_storage.ObjectStorageClient({}, signer=signer)
     objects = list(session.scalars(select(ObjectRecord).where(
         ObjectRecord.wave_id == wave.id, ObjectRecord.state == ObjectState.TRANSFERRED
     ).order_by(ObjectRecord.id)))
     failed = 0
     for obj in objects:
-        if not obj.source_checksum or not obj.destination_checksum:
-            obj.integrity_error, obj.state = "SHA-256 evidence is missing after transfer", ObjectState.FAILED
+        if not obj.source_checksum:
+            obj.integrity_error, obj.state = "SHA-256 source evidence is missing after transfer", ObjectState.FAILED
             failed += 1
-        elif obj.source_checksum != obj.destination_checksum:
+            continue
+        try:
+            destination_body = oci_client.get_object(namespace, source.destination_bucket, obj.object_key).data.raw
+            destination_digest = hashlib.sha256()
+            for chunk in iter(lambda: destination_body.read(8 * 1024 * 1024), b""):
+                destination_digest.update(chunk)
+            obj.destination_checksum = destination_digest.hexdigest()
+        except Exception as error:
+            obj.integrity_error, obj.state = f"Unable to read OCI destination: {type(error).__name__}: {error}", ObjectState.FAILED
+            failed += 1
+            continue
+        if obj.source_checksum != obj.destination_checksum:
             obj.integrity_error, obj.state = "SHA-256 source/destination mismatch", ObjectState.FAILED
             failed += 1
         else:

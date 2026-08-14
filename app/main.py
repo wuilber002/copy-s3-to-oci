@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
 
@@ -109,6 +109,10 @@ class ObjectRecord(Base):
     checksum_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
     restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    transfer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    transfer_progress_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    transfer_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    transfer_rate_mbps: Mapped[float] = mapped_column(Float, default=0)
     integrity_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     integrity_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     state: Mapped[str] = mapped_column(String(32), default=ObjectState.DISCOVERED)
@@ -192,6 +196,7 @@ class RuntimeSettings(Base):
     aws_batch_role_arn: Mapped[str] = mapped_column(String(2048), default="")
     aws_control_bucket: Mapped[str] = mapped_column(String(255), default="")
     aws_control_prefix: Mapped[str] = mapped_column(String(1024), default="s3-oci-control/")
+    preserve_s3_tags: Mapped[bool] = mapped_column(default=True)
     real_worker_enabled: Mapped[bool] = mapped_column(default=False)
     activity_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
     activity_refresh_seconds: Mapped[int] = mapped_column(Integer, default=15)
@@ -264,6 +269,7 @@ class RuntimeSettingsUpdate(BaseModel):
     aws_batch_role_arn: str = Field(default="", max_length=2048, pattern=r"^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/.+")
     aws_control_bucket: str = Field(default="", max_length=255, pattern=r"^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
     aws_control_prefix: str = Field(default="s3-oci-control/", max_length=1024)
+    preserve_s3_tags: bool = True
     real_worker_enabled: bool = False
 
 
@@ -299,6 +305,10 @@ def create_schema() -> None:
         "checksum_algorithm": "VARCHAR(32)",
         "restored_at": "TIMESTAMP WITH TIME ZONE",
         "transferred_at": "TIMESTAMP WITH TIME ZONE",
+        "transfer_started_at": "TIMESTAMP WITH TIME ZONE",
+        "transfer_progress_bytes": "BIGINT NOT NULL DEFAULT 0",
+        "transfer_progress_at": "TIMESTAMP WITH TIME ZONE",
+        "transfer_rate_mbps": "DOUBLE PRECISION NOT NULL DEFAULT 0",
         "integrity_verified_at": "TIMESTAMP WITH TIME ZONE",
         "integrity_error": "TEXT",
     }
@@ -308,6 +318,7 @@ def create_schema() -> None:
         "aws_batch_role_arn": "VARCHAR(2048) NOT NULL DEFAULT ''",
         "aws_control_bucket": "VARCHAR(255) NOT NULL DEFAULT ''",
         "aws_control_prefix": "VARCHAR(1024) NOT NULL DEFAULT 's3-oci-control/'",
+        "preserve_s3_tags": "BOOLEAN NOT NULL DEFAULT TRUE",
         "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
@@ -383,6 +394,7 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "simulation_enabled": settings.simulation_enabled, "aws_migration_role_arn": settings.aws_migration_role_arn,
             "aws_batch_role_arn": settings.aws_batch_role_arn, "aws_control_bucket": settings.aws_control_bucket,
             "aws_control_prefix": settings.aws_control_prefix, "real_worker_enabled": settings.real_worker_enabled,
+            "preserve_s3_tags": settings.preserve_s3_tags,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
             "activity_refresh_seconds": settings.activity_refresh_seconds, "updated_at": settings.updated_at}
 
@@ -541,6 +553,10 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
         )
     ).one()
     transferred_bytes, transferred_files, restored_files = int(transferred_bytes or 0), int(transferred_files or 0), int(session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.restored_at >= since)) or 0)
+    live_transfer_mbps = float(session.scalar(select(func.coalesce(func.sum(ObjectRecord.transfer_rate_mbps), 0)).where(
+        ObjectRecord.state == ObjectState.TRANSFERRING,
+        ObjectRecord.wave_id.in_(select(Task.wave_id).where(Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING)),
+    )) or 0)
     active_transfer_rows = session.execute(
         select(
             Wave.id, Wave.name, Source.name,
@@ -548,6 +564,9 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
             func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0),
             func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), ObjectRecord.size_bytes), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.TRANSFERRING, 1), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.TRANSFERRING, ObjectRecord.transfer_progress_bytes), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.TRANSFERRING, ObjectRecord.transfer_rate_mbps), else_=0)), 0),
         ).join(Source, Source.id == Wave.source_id).join(ObjectRecord, ObjectRecord.wave_id == Wave.id)
         .where(Wave.id.in_(select(Task.wave_id).where(Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING)))
         .group_by(Wave.id, Source.name).order_by(Wave.id)
@@ -555,8 +574,9 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     active_transfers = [
         {"wave_id": wave_id, "wave_name": wave_name, "source_name": source_name,
          "total_files": int(total_files), "total_bytes": int(total_bytes),
-         "transferred_files": int(done_files), "transferred_bytes": int(done_bytes)}
-        for wave_id, wave_name, source_name, total_files, total_bytes, done_files, done_bytes in active_transfer_rows
+         "transferred_files": int(done_files), "transferred_bytes": int(done_bytes),
+         "in_flight_files": int(in_flight_files), "in_flight_bytes": int(in_flight_bytes), "live_mbps": round(float(live_mbps), 2)}
+        for wave_id, wave_name, source_name, total_files, total_bytes, done_files, done_bytes, in_flight_files, in_flight_bytes, live_mbps in active_transfer_rows
     ]
     volume = shutil.disk_usage("/")
     return {
@@ -571,6 +591,7 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "transfer_bytes": transferred_bytes,
             "transfer_files": transferred_files,
             "transfer_mbps": round((transferred_bytes * 8) / window_seconds / 1_000_000, 2),
+            "transfer_live_mbps": round(live_transfer_mbps, 2),
             "restored_files": restored_files,
             "restored_per_minute": round(restored_files / (window_seconds / 60), 2),
             "restored_per_hour": round(restored_files / (window_seconds / 3600), 2),
