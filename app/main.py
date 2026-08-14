@@ -571,6 +571,15 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
         ObjectRecord.state == ObjectState.TRANSFERRING,
         ObjectRecord.wave_id.in_(select(Task.wave_id).where(Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING)),
     )) or 0)
+    # Tiny objects can finish before a two-second in-flight sample exists. Add
+    # their completion throughput from a short fixed window so current activity
+    # remains meaningful for workloads with many small files.
+    live_window_seconds = 15
+    live_since = utcnow() - timedelta(seconds=live_window_seconds)
+    recently_completed_bytes = int(session.scalar(select(func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(
+        ObjectRecord.transferred_at >= live_since,
+    )) or 0)
+    live_transfer_mbps += (recently_completed_bytes * 8) / live_window_seconds / 1_000_000
     active_transfer_rows = session.execute(
         select(
             Wave.id, Wave.name, Source.name,
@@ -606,6 +615,7 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "transfer_files": transferred_files,
             "transfer_mbps": round((transferred_bytes * 8) / transfer_seconds / 1_000_000, 2),
             "transfer_live_mbps": round(live_transfer_mbps, 2),
+            "transfer_live_window_seconds": live_window_seconds,
             "restored_files": restored_files,
             "restored_per_minute": round(restored_files / (restore_seconds / 60), 2),
             "restored_per_hour": round(restored_files / (restore_seconds / 3600), 2),

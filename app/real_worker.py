@@ -253,23 +253,26 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
         tags_json = json.dumps({tag["Key"]: tag["Value"] for tag in tags}, separators=(",", ":"), ensure_ascii=False)
         if preserve_s3_tags:
             metadata["s3-oci-tags-json"] = tags_json[:1800]
-        progress_bytes, progress_baseline, progress_baseline_at, last_persist = 0, 0, time.monotonic(), time.monotonic()
+        progress_bytes, progress_baseline, progress_baseline_at, last_persist, persisted_once = 0, 0, time.monotonic(), time.monotonic(), False
 
         def record_progress(size: int) -> None:
-            nonlocal progress_bytes, progress_baseline, progress_baseline_at, last_persist
+            nonlocal progress_bytes, progress_baseline, progress_baseline_at, last_persist, persisted_once
             progress_bytes += size
             now = time.monotonic()
             # Persist at most once every two seconds per active object. This
             # keeps a restart-safe live rate without turning each read chunk
             # into a PostgreSQL write.
-            if now - last_persist < 2:
+            if persisted_once and now - last_persist < 2:
                 return
-            elapsed = max(now - progress_baseline_at, 0.001)
             obj.transfer_progress_bytes = progress_bytes
             obj.transfer_progress_at = utcnow()
-            obj.transfer_rate_mbps = round(((progress_bytes - progress_baseline) * 8) / elapsed / 1_000_000, 2)
+            if persisted_once:
+                elapsed = max(now - progress_baseline_at, 0.001)
+                obj.transfer_rate_mbps = round(((progress_bytes - progress_baseline) * 8) / elapsed / 1_000_000, 2)
+            else:
+                obj.transfer_rate_mbps = 0
             worker_session.commit()
-            progress_baseline, progress_baseline_at, last_persist = progress_bytes, now, now
+            progress_baseline, progress_baseline_at, last_persist, persisted_once = progress_bytes, now, now, True
 
         stream = HashingStream(body, rate_bytes_per_second, record_progress)
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
