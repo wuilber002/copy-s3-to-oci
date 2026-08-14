@@ -7,6 +7,9 @@ O PostgreSQL é a fonte de verdade e a fila durável. As tarefas usam reserva tr
 ## Princípios
 
 - Uma onda tem no máximo 10 TB.
+- Ondas podem ser criadas uma a uma, automaticamente para toda a origem ou automaticamente para um prefixo S3. A seleção é determinística por chave S3; a prévia informa objetos, bytes, estimativa de ondas e objetos acima do tamanho alvo.
+- Um objeto maior que o alvo não bloqueia o planejamento: ele recebe uma onda exclusiva sinalizada no histórico. A criação automática é limitada a 10.000 ondas por ação como proteção operacional.
+- Uma onda só pode ser excluída antes de uma tarefa ser assumida; a exclusão devolve seus objetos a `DISCOVERED`. Depois de restore, polling, transferência ou verificação iniciados, os dados são preservados para auditoria.
 - A origem é lida uma única vez por objeto e enviada em streaming para OCI Object Storage.
 - SHA-256 é calculado durante o streaming e é a evidência principal de integridade; MD5 é registrado como evidência complementar.
 - Discovery usa somente listagem e campos retornados pelo S3; não faz restore nem leitura de conteúdo.

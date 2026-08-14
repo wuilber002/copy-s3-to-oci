@@ -38,10 +38,11 @@ A console é o plano de controle local e persiste suas operações no PostgreSQL
 
 - cadastro e seleção de uma origem S3 e de seu bucket OCI de destino;
 - totais e amostra paginada do inventário que foi descoberto;
-- criação de ondas de no máximo 10 TB, com tier e duração de restore;
+- criação manual de uma onda, criação automática por tamanho e criação automática restrita a um prefixo S3, todas de no máximo 10 TB, com tier e duração de restore;
+- prévia local antes da criação automática, com objetos, bytes, estimativa de ondas e alerta para objetos acima do tamanho alvo;
 - download do manifesto CSV da onda, já com as chaves codificadas para S3 Batch Operations;
 - relatório de objetos, bytes, estados, tarefas, tentativas e erros por onda;
-- pausa, retomada e reprocessamento controlado de ondas; e
+- pausa, retomada, reprocessamento e exclusão controlada de ondas ainda não executadas; e
 - saúde do banco/fila e espaço livre do volume, além de recuperação de tarefas cujo lease expirou após interrupção; e
 - histórico operacional persistente para ações administrativas e de fila.
 

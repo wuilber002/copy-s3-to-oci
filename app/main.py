@@ -15,13 +15,14 @@ import csv
 import io
 import json
 import base64
+import re
 import shutil
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, case, create_engine, func, inspect, or_, select, text
+from sqlalchemy import BigInteger, DateTime, ForeignKey, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
 
@@ -222,6 +223,13 @@ class WaveCreate(BaseModel):
     max_bytes: int = Field(gt=0, le=10 * 1024**4)
     restore_days: int = Field(ge=1, le=30)
     restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
+
+
+class AutomaticWaveCreate(BaseModel):
+    max_bytes: int = Field(gt=0, le=10 * 1024**4)
+    restore_days: int = Field(ge=1, le=30)
+    restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
+    prefix: str = Field(default="", max_length=1024)
 
 
 class ClaimRequest(BaseModel):
@@ -807,41 +815,140 @@ def export_inventory(source_id: int, session: Session = Depends(get_session)) ->
     return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="source-{source_id}-inventory.csv"'})
 
 
-@app.post("/api/sources/{source_id}/waves", status_code=201)
-def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(get_session)) -> dict:
-    active_source_or_409(session, source_id)
-    if session.scalar(select(Wave).where(Wave.source_id == source_id, Wave.name == payload.name)):
-        raise HTTPException(status_code=409, detail="Wave name already exists for this source")
-    wave = Wave(source_id=source_id, **payload.model_dump())
+def discovered_object_filters(source_id: int, prefix: str = "") -> list:
+    filters = [ObjectRecord.source_id == source_id, ObjectRecord.state == ObjectState.DISCOVERED]
+    if prefix.strip():
+        filters.append(ObjectRecord.object_key.startswith(prefix.strip()))
+    return filters
+
+
+def assign_wave(session: Session, source_id: int, name: str, max_bytes: int, restore_days: int,
+                restore_tier: str, objects: list[ObjectRecord], oversized: bool = False) -> Wave:
+    assigned_bytes = sum(obj.size_bytes for obj in objects)
+    wave = Wave(source_id=source_id, name=name, max_bytes=max_bytes, restore_days=restore_days,
+                restore_tier=restore_tier, status="READY_FOR_RESTORE")
     session.add(wave)
     session.flush()
-    remaining = payload.max_bytes
-    objects = session.scalars(select(ObjectRecord).where(ObjectRecord.source_id == source_id, ObjectRecord.state == ObjectState.DISCOVERED).order_by(ObjectRecord.object_key).with_for_update(skip_locked=True))
-    assigned = 0
-    assigned_bytes = 0
     for obj in objects:
-        if obj.size_bytes > remaining and assigned:
-            break
-        if obj.size_bytes > payload.max_bytes:
-            continue
         obj.wave_id = wave.id
         obj.state = ObjectState.WAVE_ASSIGNED
-        remaining -= obj.size_bytes
-        assigned += 1
-        assigned_bytes += obj.size_bytes
-    if not assigned:
-        session.rollback()
-        raise HTTPException(status_code=409, detail="No discovered objects fit in this wave")
-    wave.status = "READY_FOR_RESTORE"
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
-    record_event(session, "WAVE_CREATED", f"Wave '{wave.name}' created with {assigned} object(s) and {assigned_bytes} byte(s)", source_id=source_id, wave_id=wave.id)
+    suffix = " (contains an object larger than the configured target)" if oversized else ""
+    record_event(session, "WAVE_CREATED", f"Wave '{wave.name}' created with {len(objects)} object(s) and {assigned_bytes} byte(s){suffix}", source_id=source_id, wave_id=wave.id)
+    return wave
+
+
+def next_wave_objects(session: Session, source_id: int, max_bytes: int, prefix: str = "") -> tuple[list[ObjectRecord], bool]:
+    """Select the next deterministic group without loading the full inventory."""
+    selected: list[ObjectRecord] = []
+    remaining = max_bytes
+    last_key: str | None = None
+    last_id: int | None = None
+    filters = discovered_object_filters(source_id, prefix)
+    while True:
+        keyset = []
+        if last_key is not None and last_id is not None:
+            keyset.append(or_(ObjectRecord.object_key > last_key, and_(ObjectRecord.object_key == last_key, ObjectRecord.id > last_id)))
+        rows = list(session.scalars(
+            select(ObjectRecord).where(*filters, *keyset).order_by(ObjectRecord.object_key, ObjectRecord.id).limit(1000).with_for_update(skip_locked=True)
+        ))
+        if not rows:
+            return selected, False
+        for obj in rows:
+            last_key, last_id = obj.object_key, obj.id
+            if obj.size_bytes > max_bytes:
+                if selected:
+                    return selected, False
+                return [obj], True
+            if selected and obj.size_bytes > remaining:
+                return selected, False
+            selected.append(obj)
+            remaining -= obj.size_bytes
+            if remaining == 0:
+                return selected, False
+
+
+def automatic_wave_name(session: Session, source: Source, prefix: str, sequence: int) -> str:
+    prefix_part = re.sub(r"[^A-Za-z0-9_-]+", "-", prefix.strip("/")) if prefix.strip("/") else ""
+    stem = f"{source.name}-{prefix_part + '-' if prefix_part else ''}wave"
+    stem = stem[:120].rstrip("-_") or "wave"
+    candidate = f"{stem}-{sequence:03d}"
+    while session.scalar(select(Wave.id).where(Wave.source_id == source.id, Wave.name == candidate)):
+        sequence += 1
+        candidate = f"{stem}-{sequence:03d}"
+    return candidate
+
+
+@app.get("/api/sources/{source_id}/waves/preview")
+def preview_automatic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1024**4),
+                            prefix: str = Query(default="", max_length=1024),
+                            session: Session = Depends(get_session)) -> dict:
+    active_source_or_409(session, source_id)
+    filters = discovered_object_filters(source_id, prefix)
+    objects, total_bytes = session.execute(
+        select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(*filters)
+    ).one()
+    oversized = session.scalar(select(func.count(ObjectRecord.id)).where(*filters, ObjectRecord.size_bytes > max_bytes)) or 0
+    estimate = (total_bytes + max_bytes - 1) // max_bytes if total_bytes else 0
+    # This limit keeps a mistaken MB-sized target from turning a single action
+    # into millions of durable tasks on the VM.
+    return {"objects": objects, "bytes": total_bytes, "estimated_waves": estimate,
+            "oversized_objects": oversized, "prefix": prefix.strip(), "max_automatic_waves": 10000}
+
+
+@app.post("/api/sources/{source_id}/waves", status_code=201)
+def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(get_session)) -> dict:
+    source = active_source_or_409(session, source_id)
+    if session.scalar(select(Wave).where(Wave.source_id == source_id, Wave.name == payload.name)):
+        raise HTTPException(status_code=409, detail="Wave name already exists for this source")
+    objects, oversized = next_wave_objects(session, source_id, payload.max_bytes)
+    if not objects:
+        raise HTTPException(status_code=409, detail="No discovered objects are available for this wave")
+    wave = assign_wave(session, source.id, payload.name, payload.max_bytes, payload.restore_days,
+                       payload.restore_tier, objects, oversized)
     session.commit()
-    return {"id": wave.id, "name": wave.name, "objects": assigned, "bytes": assigned_bytes, "status": wave.status}
+    return {"id": wave.id, "name": wave.name, "objects": len(objects), "bytes": sum(obj.size_bytes for obj in objects),
+            "status": wave.status, "oversized": oversized}
+
+
+@app.post("/api/sources/{source_id}/waves/automatic", status_code=201)
+def create_automatic_waves(source_id: int, payload: AutomaticWaveCreate, session: Session = Depends(get_session)) -> dict:
+    source = active_source_or_409(session, source_id)
+    preview = preview_automatic_waves(source_id, payload.max_bytes, payload.prefix, session)
+    if not preview["objects"]:
+        raise HTTPException(status_code=409, detail="No discovered objects match this automatic-wave selection")
+    if preview["estimated_waves"] > preview["max_automatic_waves"]:
+        raise HTTPException(status_code=422, detail=f"Estimated {preview['estimated_waves']} waves exceeds the safety limit of {preview['max_automatic_waves']}. Increase the target size.")
+    created: list[Wave] = []
+    sequence = 1
+    total_objects = total_bytes = oversized_waves = 0
+    while True:
+        objects, oversized = next_wave_objects(session, source_id, payload.max_bytes, payload.prefix)
+        if not objects:
+            break
+        name = automatic_wave_name(session, source, payload.prefix, sequence)
+        wave = assign_wave(session, source.id, name, payload.max_bytes, payload.restore_days,
+                           payload.restore_tier, objects, oversized)
+        created.append(wave)
+        total_objects += len(objects)
+        total_bytes += sum(obj.size_bytes for obj in objects)
+        oversized_waves += int(oversized)
+        sequence += 1
+    session.commit()
+    return {"waves": len(created), "objects": total_objects, "bytes": total_bytes, "oversized_waves": oversized_waves,
+            "names": [wave.name for wave in created]}
 
 
 @app.get("/api/sources/{source_id}/waves")
 def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[dict]:
     source_or_404(session, source_id)
+    executed_wave_ids = set(session.scalars(
+        select(Task.wave_id).join(Wave).where(Wave.source_id == source_id, Task.attempts > 0)
+    ))
+    progressed_wave_ids = set(session.scalars(
+        select(ObjectRecord.wave_id).where(ObjectRecord.source_id == source_id, ObjectRecord.wave_id.is_not(None),
+                                            ObjectRecord.state != ObjectState.WAVE_ASSIGNED)
+    ))
     rows = session.execute(
         select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0))
         .outerjoin(ObjectRecord, ObjectRecord.wave_id == Wave.id)
@@ -851,7 +958,30 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
     )
     return [{"id": wave.id, "name": wave.name, "status": wave.status, "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
-             "last_poll_at": wave.last_poll_at} for wave, count, size in rows]
+             "last_poll_at": wave.last_poll_at,
+             "can_delete": wave.id not in executed_wave_ids and wave.id not in progressed_wave_ids}
+            for wave, count, size in rows]
+
+
+@app.delete("/api/waves/{wave_id}", status_code=204)
+def delete_wave(wave_id: int, session: Session = Depends(get_session)) -> None:
+    wave = wave_or_404(session, wave_id)
+    executed = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.attempts > 0))
+    progressed = session.scalar(select(ObjectRecord.id).where(
+        ObjectRecord.wave_id == wave.id, ObjectRecord.state != ObjectState.WAVE_ASSIGNED
+    ))
+    if executed or progressed:
+        raise HTTPException(status_code=409, detail="A wave with started restore, polling, transfer, or verification cannot be deleted")
+    objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id).with_for_update()))
+    for obj in objects:
+        obj.wave_id = None
+        obj.state = ObjectState.DISCOVERED
+    session.query(Event).filter(Event.wave_id == wave.id).delete(synchronize_session=False)
+    session.query(Task).filter(Task.wave_id == wave.id).delete(synchronize_session=False)
+    source_id, name = wave.source_id, wave.name
+    session.delete(wave)
+    record_event(session, "WAVE_DELETED", f"Unexecuted wave '{name}' deleted; {len(objects)} object(s) returned to discovery", source_id=source_id)
+    session.commit()
 
 
 @app.get("/api/waves/{wave_id}/objects")
