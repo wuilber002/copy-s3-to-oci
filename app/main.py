@@ -189,6 +189,8 @@ class RuntimeSettings(Base):
     aws_control_bucket: Mapped[str] = mapped_column(String(255), default="")
     aws_control_prefix: Mapped[str] = mapped_column(String(1024), default="s3-oci-control/")
     real_worker_enabled: Mapped[bool] = mapped_column(default=False)
+    activity_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
+    activity_refresh_seconds: Mapped[int] = mapped_column(Integer, default=15)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -261,6 +263,11 @@ class RuntimeSettingsUpdate(BaseModel):
     real_worker_enabled: bool = False
 
 
+class ActivityRefreshSettingsUpdate(BaseModel):
+    enabled: bool
+    seconds: int = Field(ge=5, le=300)
+
+
 class SimulationTaskUpdate(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
 
@@ -298,6 +305,8 @@ def create_schema() -> None:
         "aws_control_bucket": "VARCHAR(255) NOT NULL DEFAULT ''",
         "aws_control_prefix": "VARCHAR(1024) NOT NULL DEFAULT 's3-oci-control/'",
         "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+        "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
@@ -368,7 +377,9 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
             "simulation_enabled": settings.simulation_enabled, "aws_migration_role_arn": settings.aws_migration_role_arn,
             "aws_batch_role_arn": settings.aws_batch_role_arn, "aws_control_bucket": settings.aws_control_bucket,
-            "aws_control_prefix": settings.aws_control_prefix, "real_worker_enabled": settings.real_worker_enabled, "updated_at": settings.updated_at}
+            "aws_control_prefix": settings.aws_control_prefix, "real_worker_enabled": settings.real_worker_enabled,
+            "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
+            "activity_refresh_seconds": settings.activity_refresh_seconds, "updated_at": settings.updated_at}
 
 
 def read_oci_runtime_config() -> dict:
@@ -567,6 +578,21 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
 @app.get("/api/settings")
 def get_settings(session: Session = Depends(get_session)) -> dict:
     return settings_dict(runtime_settings(session))
+
+
+@app.get("/api/activity-refresh-settings")
+def get_activity_refresh_settings(session: Session = Depends(get_session)) -> dict:
+    settings = runtime_settings(session)
+    return {"enabled": settings.activity_auto_refresh_enabled, "seconds": settings.activity_refresh_seconds}
+
+
+@app.put("/api/activity-refresh-settings")
+def update_activity_refresh_settings(payload: ActivityRefreshSettingsUpdate, session: Session = Depends(get_session)) -> dict:
+    settings = runtime_settings(session)
+    settings.activity_auto_refresh_enabled, settings.activity_refresh_seconds = payload.enabled, payload.seconds
+    record_event(session, "ACTIVITY_REFRESH_SETTINGS_UPDATED", f"Activity auto-refresh {'enabled' if payload.enabled else 'disabled'}; interval {payload.seconds}s")
+    session.commit()
+    return {"enabled": settings.activity_auto_refresh_enabled, "seconds": settings.activity_refresh_seconds}
 
 
 @app.put("/api/settings")
