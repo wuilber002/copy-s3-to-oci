@@ -135,7 +135,7 @@ let selectedSource = '', selectedWave = '', inventoryOffset = 0, sources = [], o
 const $ = s => document.querySelector(s);
 const fmt = n => new Intl.NumberFormat('pt-BR').format(n || 0);
 const bytes = n => { n=Number(n||0); const u=['B','KB','MB','GB','TB','PB']; let i=0; while(n>=1024&&i<u.length-1){n/=1024;i++} return `${n.toLocaleString('pt-BR',{maximumFractionDigits:2})} ${u[i]}`};
-const duration = seconds => {seconds=Number(seconds);if(!Number.isFinite(seconds)||seconds<0)return '—';const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=Math.floor(seconds%60);return h?`${h}h ${m}min ${s}s`:m?`${m}min ${s}s`:`${s}s`};
+const duration = seconds => {if(seconds===null||seconds===undefined||seconds==='')return '—';seconds=Number(seconds);if(!Number.isFinite(seconds)||seconds<0)return '—';const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=Math.floor(seconds%60);return h?`${h}h ${m}min ${s}s`:m?`${m}min ${s}s`:`${s}s`};
 function say(text, bad=false){const e=$('#message');e.textContent=text;e.className=`status ${bad?'error':'ok'}`;setTimeout(()=>{if(e.textContent===text)e.textContent=''},7000)}
 async function api(path, options={}){const r=await fetch(path,options);if(!r.ok){let d=await r.text();try{d=JSON.parse(d).detail||d}catch{}throw new Error(d)}return r.status===204?null:r.json()}
 function escape(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}

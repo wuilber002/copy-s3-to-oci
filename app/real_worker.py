@@ -298,12 +298,16 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
 
 def transfer_wave(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
+    # Reflect the claimed transfer immediately.  Establishing AWS clients can
+    # take a few seconds (or retry credentials), and leaving the wave as
+    # READY_FOR_RESTORE during that interval is misleading for Standard data,
+    # which never needs a restore request.
+    wave.status = "TRANSFERRING"
+    session.commit()
     s3, _, _ = aws_clients(settings, source.aws_region)
     namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
     if not namespace:
         raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
-    wave.status = "TRANSFERRING"
-    session.commit()
 
     # The wave task remains exclusive: file workers only parallelize objects
     # inside it. Settings are reloaded before each batch, so changing workers

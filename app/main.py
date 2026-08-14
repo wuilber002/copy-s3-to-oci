@@ -1172,11 +1172,21 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
         .group_by(Wave.id)
         .order_by(Wave.id)
     )
+    def displayed_status(wave: Wave) -> str:
+        # A task lease is the source of truth while a worker owns the wave.
+        # This also heals UI state left behind by a controlled worker restart:
+        # a re-queued transfer must be RESTORED, never READY_FOR_RESTORE.
+        if wave.id in transferring_wave_ids:
+            return "TRANSFERRING"
+        if wave.id in ready_transfer_wave_ids and wave.status in {"READY_FOR_RESTORE", "RESTORED", "TRANSFERRING"}:
+            return "RESTORED"
+        return wave.status
+
     return [{"id": wave.id, "name": wave.name,
-             "status": "RESTORED" if wave.status == "TRANSFERRING" and wave.id in ready_transfer_wave_ids else wave.status,
+             "status": displayed_status(wave),
              "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
-             "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and wave.status in {"TRANSFERRED", "VERIFIED"} else None,
+             "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and displayed_status(wave) in {"TRANSFERRED", "VERIFIED"} else None,
              "last_poll_at": wave.last_poll_at,
              "can_delete": wave.id not in executed_wave_ids and wave.id not in progressed_wave_ids,
              "is_transferring": wave.id in transferring_wave_ids}
