@@ -17,7 +17,7 @@ import json
 import base64
 import shutil
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -742,16 +742,21 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
 
 
 @app.get("/api/sources/{source_id}/inventory")
-def list_inventory(source_id: int, limit: int = 100, offset: int = 0, session: Session = Depends(get_session)) -> dict:
+def list_inventory(source_id: int, limit: int = 10, offset: int = 0,
+                   search: str = Query(default="", max_length=512),
+                   session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
     limit = min(max(limit, 1), 1000)
-    query = select(ObjectRecord).where(ObjectRecord.source_id == source_id).order_by(ObjectRecord.object_key).offset(offset).limit(limit)
+    filters = [ObjectRecord.source_id == source_id]
+    if search.strip():
+        filters.append(ObjectRecord.object_key.ilike(f"%{search.strip()}%"))
+    query = select(ObjectRecord).where(*filters).order_by(ObjectRecord.object_key).offset(offset).limit(limit)
     rows = session.scalars(query)
-    total = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id)) or 0
+    total = session.scalar(select(func.count(ObjectRecord.id)).where(*filters)) or 0
     return {"items": [{"id": obj.id, "key": obj.object_key, "version_id": obj.version_id,
                        "size_bytes": obj.size_bytes, "storage_class": obj.storage_class, "state": obj.state,
                        "last_modified": obj.last_modified, "etag": obj.etag, "wave_id": obj.wave_id} for obj in rows],
-            "limit": limit, "offset": offset, "total": total}
+            "limit": limit, "offset": offset, "total": total, "search": search.strip()}
 
 
 @app.get("/api/objects/{object_id}")
