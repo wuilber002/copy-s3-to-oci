@@ -117,6 +117,7 @@ class ObjectRecord(Base):
     restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    transfer_elapsed_seconds: Mapped[float] = mapped_column(Float, default=0)
     transfer_progress_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     transfer_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_rate_mbps: Mapped[float] = mapped_column(Float, default=0)
@@ -314,6 +315,7 @@ def create_schema() -> None:
         "restored_at": "TIMESTAMP WITH TIME ZONE",
         "transferred_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_started_at": "TIMESTAMP WITH TIME ZONE",
+        "transfer_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0",
         "transfer_progress_bytes": "BIGINT NOT NULL DEFAULT 0",
         "transfer_progress_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_rate_mbps": "DOUBLE PRECISION NOT NULL DEFAULT 0",
@@ -635,6 +637,69 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
         },
         "disk": {"total": volume.total, "used": volume.used, "free": volume.free},
     }
+
+
+@app.get("/api/transfer-queue")
+def transfer_queue(session: Session = Depends(get_session)) -> dict:
+    """Queue view for the dashboard; it only reads the local control database."""
+    now = utcnow()
+    transfer_kinds = ("SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "TRANSFER_WAVE")
+    tasks = list(session.scalars(
+        select(Task).join(Wave).where(
+            Task.kind.in_(transfer_kinds), Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+            Wave.status != "PAUSED",
+        ).order_by(Task.available_at, Task.id)
+    ))
+    # At most one current task represents each wave.  Prefer a running task
+    # when a stale/retried READY row exists for the same wave.
+    by_wave: dict[int, Task] = {}
+    for task in tasks:
+        previous = by_wave.get(task.wave_id)
+        if not previous or (task.state == TaskState.RUNNING and previous.state != TaskState.RUNNING):
+            by_wave[task.wave_id] = task
+
+    def elapsed_seconds(objects: list[ObjectRecord]) -> int:
+        elapsed = 0.0
+        for obj in objects:
+            value = float(obj.transfer_elapsed_seconds or 0)
+            # Waves created before the accumulated-duration field retain an
+            # accurate useful fallback from their recorded start/end stamps.
+            if value <= 0 and obj.transfer_started_at and obj.transferred_at:
+                value = max(0, (obj.transferred_at - obj.transfer_started_at).total_seconds())
+            elapsed += value
+        return int(elapsed)
+
+    waves = []
+    for task in by_wave.values():
+        wave = task.wave
+        objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id).order_by(ObjectRecord.id)))
+        completed = [obj for obj in objects if obj.state in {ObjectState.TRANSFERRED, ObjectState.VERIFIED}]
+        in_flight = [obj for obj in objects if obj.state == ObjectState.TRANSFERRING]
+        active = task.kind == "TRANSFER_WAVE" and task.state == TaskState.RUNNING
+        workers = []
+        capacity = runtime_settings(session).transfer_workers
+        for slot in range(capacity):
+            obj = in_flight[slot] if slot < len(in_flight) else None
+            workers.append({
+                "slot": slot + 1,
+                "state": "TRANSFERRING" if obj else "IDLE",
+                "object_key": obj.object_key if obj else None,
+                "progress_bytes": int(obj.transfer_progress_bytes or 0) if obj else 0,
+                "total_bytes": int(obj.size_bytes) if obj else 0,
+                "rate_mbps": round(float(obj.transfer_rate_mbps or 0), 2) if obj else 0,
+                "elapsed_seconds": int(float(obj.transfer_elapsed_seconds or 0)) if obj else 0,
+            })
+        waves.append({
+            "wave_id": wave.id, "wave_name": wave.name, "source_name": wave.source.name,
+            "status": wave.status, "task_kind": task.kind, "task_state": task.state,
+            "available_at": task.available_at, "active": active,
+            "transferred_files": len(completed), "total_files": len(objects),
+            "transferred_bytes": sum(obj.size_bytes for obj in completed),
+            "total_bytes": sum(obj.size_bytes for obj in objects),
+            "elapsed_seconds": elapsed_seconds(objects), "workers": workers if active else [],
+        })
+    waves.sort(key=lambda item: (not item["active"], item["available_at"], item["wave_id"]))
+    return {"waves": waves, "generated_at": now}
 
 
 @app.get("/api/settings")

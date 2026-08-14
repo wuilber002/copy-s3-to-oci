@@ -238,6 +238,10 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
         obj = worker_session.get(ObjectRecord, object_id)
         if not obj or obj.state not in {ObjectState.RESTORED, ObjectState.TRANSFERRING}:
             return
+        # Keep an accumulated active-copy duration.  A stopped worker may
+        # resume this object later; downtime is intentionally not counted.
+        if obj.state != ObjectState.TRANSFERRING:
+            obj.transfer_elapsed_seconds = 0
         obj.state, obj.transfer_started_at = ObjectState.TRANSFERRING, utcnow()
         obj.transfer_progress_bytes, obj.transfer_progress_at, obj.transfer_rate_mbps = 0, utcnow(), 0
         worker_session.commit()
@@ -258,9 +262,10 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
         if preserve_s3_tags:
             metadata["s3-oci-tags-json"] = tags_json[:1800]
         progress_bytes, progress_baseline, progress_baseline_at, last_persist, persisted_once = 0, 0, time.monotonic(), time.monotonic(), False
+        elapsed_baseline = time.monotonic()
 
         def record_progress(size: int) -> None:
-            nonlocal progress_bytes, progress_baseline, progress_baseline_at, last_persist, persisted_once
+            nonlocal progress_bytes, progress_baseline, progress_baseline_at, last_persist, persisted_once, elapsed_baseline
             progress_bytes += size
             now = time.monotonic()
             # Persist at most once every two seconds per active object. This
@@ -270,6 +275,8 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
                 return
             obj.transfer_progress_bytes = progress_bytes
             obj.transfer_progress_at = utcnow()
+            obj.transfer_elapsed_seconds += max(0, now - elapsed_baseline)
+            elapsed_baseline = now
             if persisted_once:
                 elapsed = max(now - progress_baseline_at, 0.001)
                 obj.transfer_rate_mbps = round(((progress_bytes - progress_baseline) * 8) / elapsed / 1_000_000, 2)
@@ -291,6 +298,7 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
         # is a separate explicit verification task, avoiding an OCI GetObject
         # request and a second full read for every transferred object.
         obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error = "SHA256", None, None
+        obj.transfer_elapsed_seconds += max(0, time.monotonic() - elapsed_baseline)
         obj.state, obj.transferred_at = ObjectState.TRANSFERRED, utcnow()
         obj.transfer_progress_bytes, obj.transfer_progress_at, obj.transfer_rate_mbps = obj.size_bytes, utcnow(), 0
         worker_session.commit()
