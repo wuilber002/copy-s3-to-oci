@@ -682,6 +682,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     totals = {source_id: (int(total), int(verified), int(transferred)) for source_id, total, verified, transferred in total_rows}
     def migration_status(source: Source) -> str:
         total, verified, transferred = totals.get(source.id, (0, 0, 0))
+        if source.destination_validation_status == "DIFFERENT":
+            return "DESTINATION_DIVERGENT"
         if source.status == "DISCOVERED" and total and verified == total:
             return "COMPLETED"
         if source.status == "DISCOVERED" and total and transferred == total:
@@ -828,7 +830,7 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
         .group_by(ObjectRecord.state)
     ).all())
     source = source_or_404(session, source_id)
-    migration_status = "COMPLETED" if source.status == "DISCOVERED" and count and states.get(ObjectState.VERIFIED, 0) == count else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count else "IN_PROGRESS" if count else "NOT_STARTED"
+    migration_status = "DESTINATION_DIVERGENT" if source.destination_validation_status == "DIFFERENT" else "COMPLETED" if source.status == "DISCOVERED" and count and states.get(ObjectState.VERIFIED, 0) == count else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count else "IN_PROGRESS" if count else "NOT_STARTED"
     return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states, "migration_status": migration_status,
             "destination_validation": {"status": source.destination_validation_status, "at": source.destination_validation_at,
                                        "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count},
@@ -873,6 +875,25 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
     source.destination_validation_at = utcnow()
     source.destination_missing_count, source.destination_size_mismatch_count = len(missing), len(mismatched)
     source.destination_validation_status = "VALID" if not missing and not mismatched else "DIFFERENT"
+    affected_wave_counts: dict[int, int] = {}
+    divergent_keys = missing + mismatched
+    for offset in range(0, len(divergent_keys), 1000):
+        objects = list(session.scalars(select(ObjectRecord).where(
+            ObjectRecord.source_id == source.id, ObjectRecord.object_key.in_(divergent_keys[offset:offset + 1000])
+        )))
+        for obj in objects:
+            obj.integrity_verified_at, obj.destination_checksum, obj.transferred_at = None, None, None
+            obj.integrity_error = "OCI destination validation found object missing or with a different size"
+            if obj.wave_id:
+                obj.state = ObjectState.WAVE_ASSIGNED
+                affected_wave_counts[obj.wave_id] = affected_wave_counts.get(obj.wave_id, 0) + 1
+            else:
+                obj.state = ObjectState.DISCOVERED
+    for wave_id, affected_objects in affected_wave_counts.items():
+        wave = session.get(Wave, wave_id)
+        wave.status, wave.batch_job_id, wave.manifest_key, wave.manifest_etag = "READY_FOR_RESTORE", None, None, None
+        wave.last_poll_at, wave.poll_count = None, 0
+        record_event(session, "DESTINATION_DIVERGENCE_REOPENED_WAVE", f"Wave reopened after OCI destination validation; {affected_objects} object(s) require reprocessing", source_id=source.id, wave_id=wave.id)
     record_event(session, "DESTINATION_VALIDATED", f"OCI destination validation: {len(missing)} missing and {len(mismatched)} size mismatch(es)", source_id=source.id)
     session.commit()
     return {"source_id": source.id, "status": source.destination_validation_status, "expected": len(expected), "found": len(found), "missing": len(missing), "size_mismatches": len(mismatched), "missing_examples": missing[:50], "size_mismatch_examples": mismatched[:50], "validated_at": source.destination_validation_at}

@@ -18,6 +18,7 @@ O PostgreSQL é a fonte de verdade e a fila durável. As tarefas usam reserva tr
 - O bloco **Atividade de migração** é independente da saúde da VM. Sua atualização automática pode ser desativada ou configurada entre 5 segundos e 5 minutos; essa preferência fica persistida no PostgreSQL da plataforma.
 - O mesmo bloco mostra CPU e memória da VM. A CPU é uma média host-wide entre as execuções do timer de estado (normalmente um minuto); a memória usa `MemAvailable` do Linux para calcular a parcela efetivamente ocupada.
 - Uma origem recebe a marca **Concluído** somente se o discovery estiver concluído, houver ao menos um objeto no inventário e todos os objetos estiverem em `VERIFIED`. Assim, uma origem totalmente copiada, mas ainda sem a verificação manual de integridade, não é encerrada indevidamente.
+- Se a validação explícita do destino OCI detectar objeto ausente ou tamanho divergente, os objetos afetados voltam para `WAVE_ASSIGNED`, suas ondas para `READY_FOR_RESTORE` e a origem deixa de ser concluída. Nenhum restore ou retransferência é iniciado automaticamente; o operador usa **Reprocessar** quando decidir corrigir a divergência.
 - Discovery usa somente listagem e campos retornados pelo S3; não faz restore nem leitura de conteúdo.
 - Chamadas AWS são minimizadas. Restore usa S3 Batch Operations por onda; polling usa estado da Batch job e listagem paginada com `RestoreStatus`.
 - A chave do S3 é preservada no OCI. Metadados e tags são preservados no destino quando compatíveis e sempre no manifesto imutável da migração.
