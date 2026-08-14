@@ -632,14 +632,15 @@ def active_source_or_409(session: Session, source_id: int) -> Source:
     return source
 
 
-@app.delete("/api/sources/{source_id}", status_code=204)
-def delete_source(source_id: int, session: Session = Depends(get_session)) -> None:
+@app.delete("/api/sources/{source_id}")
+def delete_source(source_id: int, session: Session = Depends(get_session)) -> dict:
     source = source_or_404(session, source_id)
     if source_has_operational_data(session, source_id):
         raise HTTPException(status_code=409, detail="This source has operational data and must be archived, not deleted")
     session.query(Event).filter(Event.source_id == source_id).delete(synchronize_session=False)
     session.delete(source)
     session.commit()
+    return {"id": source_id, "deleted": True}
 
 
 @app.post("/api/sources/{source_id}/archive")
