@@ -82,6 +82,10 @@ class Source(Base):
     discovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    destination_validation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    destination_validation_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    destination_missing_count: Mapped[int] = mapped_column(Integer, default=0)
+    destination_size_mismatch_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="source")
     waves: Mapped[list[Wave]] = relationship(back_populates="source")
@@ -310,6 +314,7 @@ def create_schema() -> None:
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
+    source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
@@ -686,6 +691,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
              "discovery_error": s.discovery_error, "archived_at": s.archived_at,
+             "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
+                                        "missing": s.destination_missing_count, "size_mismatches": s.destination_size_mismatch_count},
              "migration_status": migration_status(s), "can_delete": not source_has_executed_wave(session, s.id)}
             for s in sources]
 
@@ -823,8 +830,49 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
     source = source_or_404(session, source_id)
     migration_status = "COMPLETED" if source.status == "DISCOVERED" and count and states.get(ObjectState.VERIFIED, 0) == count else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count else "IN_PROGRESS" if count else "NOT_STARTED"
     return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states, "migration_status": migration_status,
+            "destination_validation": {"status": source.destination_validation_status, "at": source.destination_validation_at,
+                                       "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count},
             "discovery": {"status": source.status, "requested_at": source.discovery_requested_at,
                           "completed_at": source.discovery_completed_at, "error": source.discovery_error}}
+
+
+@app.post("/api/sources/{source_id}/validate-destination")
+def validate_destination(source_id: int, session: Session = Depends(get_session)) -> dict:
+    """Explicitly reconcile the persisted S3 discovery inventory with OCI listing."""
+    source = active_source_or_409(session, source_id)
+    expected = {key: int(size) for key, size in session.execute(
+        select(ObjectRecord.object_key, ObjectRecord.size_bytes).where(ObjectRecord.source_id == source.id)
+    )}
+    if not expected:
+        raise HTTPException(status_code=409, detail="Run discovery before validating the destination")
+    try:
+        import oci
+        namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
+        if not namespace:
+            raise RuntimeError("OCI namespace is not configured")
+        client = oci.object_storage.ObjectStorageClient({}, signer=oci.auth.signers.InstancePrincipalsSecurityTokenSigner())
+        found: dict[str, int] = {}
+        start_after = None
+        while True:
+            response = client.list_objects(namespace, source.destination_bucket, prefix=source.s3_prefix, start_after=start_after, limit=1000).data
+            for item in response.objects:
+                found[item.name] = int(item.size)
+            start_after = response.next_start_with
+            if not start_after:
+                break
+    except Exception as error:
+        source.destination_validation_at, source.destination_validation_status = utcnow(), "FAILED"
+        record_event(session, "DESTINATION_VALIDATION_FAILED", f"OCI destination validation failed: {type(error).__name__}", source_id=source.id)
+        session.commit()
+        raise HTTPException(status_code=502, detail=f"OCI destination validation failed: {type(error).__name__}") from error
+    missing = sorted(key for key in expected if key not in found)
+    mismatched = sorted(key for key, size in expected.items() if key in found and found[key] != size)
+    source.destination_validation_at = utcnow()
+    source.destination_missing_count, source.destination_size_mismatch_count = len(missing), len(mismatched)
+    source.destination_validation_status = "VALID" if not missing and not mismatched else "DIFFERENT"
+    record_event(session, "DESTINATION_VALIDATED", f"OCI destination validation: {len(missing)} missing and {len(mismatched)} size mismatch(es)", source_id=source.id)
+    session.commit()
+    return {"source_id": source.id, "status": source.destination_validation_status, "expected": len(expected), "found": len(found), "missing": len(missing), "size_mismatches": len(mismatched), "missing_examples": missing[:50], "size_mismatch_examples": mismatched[:50], "validated_at": source.destination_validation_at}
 
 
 @app.get("/api/sources/{source_id}/inventory")
