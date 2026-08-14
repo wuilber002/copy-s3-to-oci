@@ -15,7 +15,7 @@
   <div id="alerts" class="alerts"></div>
 
   <main id="view-dashboard" class="view active">
-  <section class="card"><h2>Saúde da plataforma</h2><div id="health" class="grid">Carregando…</div><div id="services" class="hint">Carregando estado dos serviços…</div><p class="hint">O estado é gerado no host a cada minuto e exposto ao container somente para leitura. Inclui o espaço do volume local, onde estão PostgreSQL e seus backups. O backup de volume é acompanhado no Console OCI.</p></section>
+  <section class="card"><h2>Saúde da plataforma</h2><div id="health" class="grid">Carregando…</div><div id="active-transfers" class="hint">Carregando transferências ativas…</div><div id="services" class="hint">Carregando estado dos serviços…</div><p class="hint">O estado é gerado no host a cada minuto e exposto ao container somente para leitura. Inclui o espaço do volume local, onde estão PostgreSQL e seus backups. O backup de volume é acompanhado no Console OCI.</p></section>
   <section class="card"><h2>Credenciais e integrações</h2><p class="hint">Valida as Secrets OCI e os ARNs configurados localmente. Quando preenchidos, testa a credencial AWS e a role de migração sem listar ou restaurar objetos.</p><button class="secondary" onclick="runReadiness()">Validar agora</button><div id="readiness-dashboard" class="hint">Ainda não validado nesta sessão.</div></section>
   <section class="card"><h2>Fila e atividades recentes</h2><div id="daily-queue" class="hint">Carregando…</div><div id="daily-events" class="hint">Carregando…</div><p><button onclick="showView('migrations')">Abrir Migrações</button></p></section>
   </main>
@@ -193,6 +193,7 @@ $('#automatic-wave-form').addEventListener('submit',async e=>{e.preventDefault()
 $('#prefix-wave-form').addEventListener('submit',async e=>{e.preventDefault();await submitAutomaticWaveForm(true)});
 async function refreshMigration(){await loadSources();if(selectedSource){$('#source-select').value=selectedSource;await selectSource()}await Promise.all([loadTasks(),loadEvents()])}
 async function refreshAll(){await Promise.all([loadHealth(),loadSettings(),loadOciBuckets(),loadSources(),loadDaily()]);if(selectedSource){$('#source-select').value=selectedSource;await selectSource()}await Promise.all([loadTasks(),loadEvents()])}
+const loadHealthBase=loadHealth;loadHealth=async function(){await loadHealthBase();try{const active=(await api('/api/operations')).activity.active_transfers||[];$('#active-transfers').innerHTML=active.length?`<h3>Transferências ativas <span class="help" tabindex="0" data-help="Ondas com pelo menos um objeto em cópia. Transferido inclui objetos copiados e objetos já verificados; os totais incluem todos os objetos da onda.">i</span></h3><table><thead><tr><th>Fonte / onda</th><th>Arquivos</th><th>Dados</th></tr></thead><tbody>${active.map(x=>`<tr><td>${escape(x.source_name)}<br><b>${escape(x.wave_name)}</b> <small>#${x.wave_id}</small></td><td>${fmt(x.transferred_files)} / ${fmt(x.total_files)}</td><td>${bytes(x.transferred_bytes)} / ${bytes(x.total_bytes)}</td></tr>`).join('')}</tbody></table>`:'<p class="hint">Nenhuma onda com transferência ativa.</p>'}catch(e){$('#active-transfers').innerHTML='<p class="warning">Não foi possível carregar transferências ativas.</p>'}};
 showWaveCreationMethod();
 refreshAll();
 </script>

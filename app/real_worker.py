@@ -218,6 +218,8 @@ def transfer_wave(session, task: Task, settings) -> None:
         raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
     rate = settings.max_throughput_mbps * 125000 / max(1, settings.transfer_workers)
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORED, ObjectState.TRANSFERRING])).order_by(ObjectRecord.id)))
+    wave.status = "TRANSFERRING"
+    session.commit()
     for obj in objects:
         task.lease_expires_at = utcnow() + timedelta(seconds=settings.task_lease_seconds); session.commit()
         obj.state = ObjectState.TRANSFERRING; session.commit()

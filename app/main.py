@@ -525,6 +525,23 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
         )
     ).one()
     transferred_bytes, transferred_files, restored_files = int(transferred_bytes or 0), int(transferred_files or 0), int(session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.restored_at >= since)) or 0)
+    active_transfer_rows = session.execute(
+        select(
+            Wave.id, Wave.name, Source.name,
+            func.count(ObjectRecord.id),
+            func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), ObjectRecord.size_bytes), else_=0)), 0),
+        ).join(Source, Source.id == Wave.source_id).join(ObjectRecord, ObjectRecord.wave_id == Wave.id)
+        .where(Wave.id.in_(select(ObjectRecord.wave_id).where(ObjectRecord.state == ObjectState.TRANSFERRING)))
+        .group_by(Wave.id, Source.name).order_by(Wave.id)
+    ).all()
+    active_transfers = [
+        {"wave_id": wave_id, "wave_name": wave_name, "source_name": source_name,
+         "total_files": int(total_files), "total_bytes": int(total_bytes),
+         "transferred_files": int(done_files), "transferred_bytes": int(done_bytes)}
+        for wave_id, wave_name, source_name, total_files, total_bytes, done_files, done_bytes in active_transfer_rows
+    ]
     volume = shutil.disk_usage("/")
     return {
         "status": "ok",
@@ -541,6 +558,7 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "restored_files": restored_files,
             "restored_per_minute": round(restored_files / (window_seconds / 60), 2),
             "restored_per_hour": round(restored_files / (window_seconds / 3600), 2),
+            "active_transfers": active_transfers,
         },
         "disk": {"total": volume.total, "used": volume.used, "free": volume.free},
     }

@@ -13,6 +13,7 @@ O PostgreSQL é a fonte de verdade e a fila durável. As tarefas usam reserva tr
 - A origem é lida uma única vez por objeto e enviada em streaming para OCI Object Storage.
 - SHA-256 é calculado durante o streaming e é a evidência principal de integridade; MD5 é registrado como evidência complementar. A transferência apenas persiste os dois valores SHA-256; a comparação e a transição para `VERIFIED` só ocorrem na tarefa `VERIFY_WAVE`, enfileirada explicitamente pelo operador.
 - O Painel mede atividade em uma janela móvel de cinco minutos: bytes de objetos cuja cópia foi concluída, convertidos em Mbps, e objetos cuja disponibilidade após restore foi observada, convertidos em arquivos/minuto e arquivos/hora. Métricas passam a existir apenas para operações concluídas após a atualização que as habilita.
+- Enquanto uma onda estiver transferindo, o Painel também lista fonte e onda com arquivos e bytes transferidos em relação ao total. Objetos em `TRANSFERRED` e `VERIFIED` contam como transferidos; a onda deixa essa lista ao concluir a cópia ou ao ser interrompida.
 - Discovery usa somente listagem e campos retornados pelo S3; não faz restore nem leitura de conteúdo.
 - Chamadas AWS são minimizadas. Restore usa S3 Batch Operations por onda; polling usa estado da Batch job e listagem paginada com `RestoreStatus`.
 - A chave do S3 é preservada no OCI. Metadados e tags são preservados no destino quando compatíveis e sempre no manifesto imutável da migração.
