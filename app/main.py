@@ -963,8 +963,8 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
             for wave, count, size in rows]
 
 
-@app.delete("/api/waves/{wave_id}", status_code=204)
-def delete_wave(wave_id: int, session: Session = Depends(get_session)) -> None:
+@app.delete("/api/waves/{wave_id}")
+def delete_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
     executed = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.attempts > 0))
     progressed = session.scalar(select(ObjectRecord.id).where(
@@ -982,6 +982,7 @@ def delete_wave(wave_id: int, session: Session = Depends(get_session)) -> None:
     session.delete(wave)
     record_event(session, "WAVE_DELETED", f"Unexecuted wave '{name}' deleted; {len(objects)} object(s) returned to discovery", source_id=source_id)
     session.commit()
+    return {"wave_id": wave_id, "objects_returned": len(objects)}
 
 
 @app.get("/api/waves/{wave_id}/objects")
