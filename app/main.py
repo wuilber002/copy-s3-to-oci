@@ -852,13 +852,16 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
             raise RuntimeError("OCI namespace is not configured")
         client = oci.object_storage.ObjectStorageClient({}, signer=oci.auth.signers.InstancePrincipalsSecurityTokenSigner())
         found: dict[str, int] = {}
-        start_after = None
+        start = None
         while True:
-            response = client.list_objects(namespace, source.destination_bucket, prefix=source.s3_prefix, start_after=start_after, limit=1000).data
+            arguments = {"prefix": source.s3_prefix, "limit": 1000, "fields": "name,size"}
+            if start:
+                arguments["start"] = start
+            response = client.list_objects(namespace, source.destination_bucket, **arguments).data
             for item in response.objects:
                 found[item.name] = int(item.size)
-            start_after = response.next_start_with
-            if not start_after:
+            start = response.next_start_with
+            if not start:
                 break
     except Exception as error:
         source.destination_validation_at, source.destination_validation_status = utcnow(), "FAILED"
