@@ -667,12 +667,27 @@ def refresh_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
 
 @app.get("/api/sources")
 def list_sources(session: Session = Depends(get_session)) -> list[dict]:
+    sources = list(session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id)))
+    total_rows = session.execute(
+        select(ObjectRecord.source_id, func.count(ObjectRecord.id),
+               func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.VERIFIED, 1), else_=0)), 0),
+               func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0))
+        .where(ObjectRecord.source_id.in_([s.id for s in sources])).group_by(ObjectRecord.source_id)
+    ).all() if sources else []
+    totals = {source_id: (int(total), int(verified), int(transferred)) for source_id, total, verified, transferred in total_rows}
+    def migration_status(source: Source) -> str:
+        total, verified, transferred = totals.get(source.id, (0, 0, 0))
+        if source.status == "DISCOVERED" and total and verified == total:
+            return "COMPLETED"
+        if source.status == "DISCOVERED" and total and transferred == total:
+            return "AWAITING_INTEGRITY_VERIFICATION"
+        return "IN_PROGRESS" if total else "NOT_STARTED"
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
              "discovery_error": s.discovery_error, "archived_at": s.archived_at,
-             "can_delete": not source_has_executed_wave(session, s.id)}
-            for s in session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id))]
+             "migration_status": migration_status(s), "can_delete": not source_has_executed_wave(session, s.id)}
+            for s in sources]
 
 
 @app.post("/api/sources", status_code=201)
@@ -806,7 +821,8 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
         .group_by(ObjectRecord.state)
     ).all())
     source = source_or_404(session, source_id)
-    return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states,
+    migration_status = "COMPLETED" if source.status == "DISCOVERED" and count and states.get(ObjectState.VERIFIED, 0) == count else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count else "IN_PROGRESS" if count else "NOT_STARTED"
+    return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states, "migration_status": migration_status,
             "discovery": {"status": source.status, "requested_at": source.discovery_requested_at,
                           "completed_at": source.discovery_completed_at, "error": source.discovery_error}}
 
