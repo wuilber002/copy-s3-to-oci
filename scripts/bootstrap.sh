@@ -11,8 +11,10 @@ mkdir -p "$data_root/postgres" "$secret_root" "$runtime_root"
 chmod 700 "$secret_root"
 if [[ ! -f "$oci_runtime_config" ]]; then
   printf '{"secret_ocids":{}}\n' >"$oci_runtime_config"
-  chmod 600 "$oci_runtime_config"
 fi
+# The OCI runtime config contains OCIDs, not secret values. The application
+# container must read it; Vault still protects every credential value.
+chmod 644 "$oci_runtime_config"
 
 # Vault is the source of truth. A first boot materializes the Terraform-created
 # password locally without writing its value to a command line or service log.
