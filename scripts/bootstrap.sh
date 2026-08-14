@@ -34,7 +34,7 @@ podman run -d --name s3-oci-postgres --replace --restart unless-stopped \
   -e POSTGRES_USER=migration \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   -v "$data_root/postgres:/var/lib/postgresql/data:Z" \
-  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,Z" \
+  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
   docker.io/library/postgres:16-alpine
 
 postgres_ready=false
@@ -57,9 +57,9 @@ podman run -d --name s3-oci-app --replace --restart unless-stopped \
   -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
-  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,Z" \
-  -v "$runtime_root:/run/platform-status:ro,Z" \
-  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,Z" \
+  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
+  -v "$runtime_root:/run/platform-status:ro,z" \
+  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,z" \
   localhost/s3-oci-migration:latest
 
 # The API startup performs safe additive schema migrations. Wait for it before
@@ -85,8 +85,8 @@ podman run -d --name s3-oci-real-worker --replace --restart unless-stopped \
   -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
-  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,Z" \
-  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,Z" \
+  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
+  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,z" \
   localhost/s3-oci-migration:latest python3 -m app.real_worker
 
 cat >/etc/systemd/system/s3-oci-migration.service <<'EOF'
