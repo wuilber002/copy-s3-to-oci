@@ -68,6 +68,12 @@ class TaskState(StrEnum):
     FAILED = "FAILED"
 
 
+ARCHIVE_STORAGE_CLASSES = {
+    "GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS",
+    "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS",
+}
+
+
 class Source(Base):
     __tablename__ = "sources"
 
@@ -547,12 +553,20 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     ).all())
     window_seconds = 300
     since = utcnow() - timedelta(seconds=window_seconds)
-    transferred_bytes, transferred_files = session.execute(
-        select(func.coalesce(func.sum(ObjectRecord.size_bytes), 0), func.count(ObjectRecord.id)).where(
+    transferred_bytes, transferred_files, first_transfer = session.execute(
+        select(func.coalesce(func.sum(ObjectRecord.size_bytes), 0), func.count(ObjectRecord.id), func.min(ObjectRecord.transferred_at)).where(
             ObjectRecord.transferred_at >= since
         )
     ).one()
-    transferred_bytes, transferred_files, restored_files = int(transferred_bytes or 0), int(transferred_files or 0), int(session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.restored_at >= since)) or 0)
+    restored_files, first_restore = session.execute(
+        select(func.count(ObjectRecord.id), func.min(ObjectRecord.restored_at)).where(
+            ObjectRecord.restored_at >= since,
+            ObjectRecord.storage_class.in_(ARCHIVE_STORAGE_CLASSES),
+        )
+    ).one()
+    transferred_bytes, transferred_files, restored_files = int(transferred_bytes or 0), int(transferred_files or 0), int(restored_files or 0)
+    transfer_seconds = min(window_seconds, max(1, (utcnow() - first_transfer).total_seconds())) if first_transfer else window_seconds
+    restore_seconds = min(window_seconds, max(1, (utcnow() - first_restore).total_seconds())) if first_restore else window_seconds
     live_transfer_mbps = float(session.scalar(select(func.coalesce(func.sum(ObjectRecord.transfer_rate_mbps), 0)).where(
         ObjectRecord.state == ObjectState.TRANSFERRING,
         ObjectRecord.wave_id.in_(select(Task.wave_id).where(Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING)),
@@ -590,11 +604,11 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "window_seconds": window_seconds,
             "transfer_bytes": transferred_bytes,
             "transfer_files": transferred_files,
-            "transfer_mbps": round((transferred_bytes * 8) / window_seconds / 1_000_000, 2),
+            "transfer_mbps": round((transferred_bytes * 8) / transfer_seconds / 1_000_000, 2),
             "transfer_live_mbps": round(live_transfer_mbps, 2),
             "restored_files": restored_files,
-            "restored_per_minute": round(restored_files / (window_seconds / 60), 2),
-            "restored_per_hour": round(restored_files / (window_seconds / 3600), 2),
+            "restored_per_minute": round(restored_files / (restore_seconds / 60), 2),
+            "restored_per_hour": round(restored_files / (restore_seconds / 3600), 2),
             "active_transfers": active_transfers,
         },
         "disk": {"total": volume.total, "used": volume.used, "free": volume.free},
