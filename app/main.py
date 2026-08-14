@@ -1160,6 +1160,10 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
         select(Task.wave_id).join(Wave).where(Wave.source_id == source_id, Task.kind == "TRANSFER_WAVE",
                                                Task.state == TaskState.RUNNING)
     ))
+    ready_transfer_wave_ids = set(session.scalars(
+        select(Task.wave_id).join(Wave).where(Wave.source_id == source_id, Task.kind == "TRANSFER_WAVE",
+                                               Task.state == TaskState.READY)
+    ))
     rows = session.execute(
         select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
                func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at))
@@ -1168,7 +1172,9 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
         .group_by(Wave.id)
         .order_by(Wave.id)
     )
-    return [{"id": wave.id, "name": wave.name, "status": wave.status, "restore_tier": wave.restore_tier,
+    return [{"id": wave.id, "name": wave.name,
+             "status": "RESTORED" if wave.status == "TRANSFERRING" and wave.id in ready_transfer_wave_ids else wave.status,
+             "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
              "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and wave.status in {"TRANSFERRED", "VERIFIED"} else None,
              "last_poll_at": wave.last_poll_at,

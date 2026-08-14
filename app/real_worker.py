@@ -104,6 +104,10 @@ def retry(session, task: Task, error: Exception | str, seconds: int | None = Non
     task.state, task.lease_expires_at = TaskState.READY, None
     task.available_at = utcnow() + timedelta(seconds=delay)
     task.error = str(error)[:8000]
+    if task.kind == "TRANSFER_WAVE":
+        wave = session.get(Wave, task.wave_id)
+        if wave and wave.status == "TRANSFERRING":
+            wave.status = "RESTORED"
     event(session, "TASK_RETRY_QUEUED", f"{task.kind} retry in {delay}s: {task.error}", wave_id=task.wave_id)
     session.commit()
 
