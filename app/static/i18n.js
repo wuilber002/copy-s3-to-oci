@@ -33,7 +33,7 @@
     'Workers de': 'Workers', 'transferência': 'transfer',
     'Limite de throughput': 'Throughput limit', 'Tamanho padrão da': 'Default wave', 'onda (TB)': 'size (TB)',
     'Retenção padrão': 'Default retention', 'do restore (dias)': 'for restore (days)',
-    'Tier padrão de': 'Default restore',
+    'Tier padrão de': 'Default',
     'Lease da tarefa': 'Task lease', '(segundos)': '(seconds)',
     'Worker de': 'Simulation', 'simulação': 'worker', 'Habilitar': 'Enable',
     'Salvar parâmetros': 'Save operational', 'operacionais': 'parameters', 'Salvar configuração': 'Save configuration',
@@ -73,29 +73,54 @@
     'Arquivos transferidos': 'Transferred files', 'Transferência concluída': 'Completed transfer', 'Taxa atual': 'Current rate',
     'Memória da VM': 'VM memory', 'CPU da VM': 'VM CPU', 'Restores': 'Restores',
     'disponíveis': 'available', 'solicitados': 'requested', 'concluídos': 'completed', 'em cópia': 'copying',
-    'Idioma': 'Language', 'Português': 'Portuguese'
+    'Idioma': 'Language', 'Português': 'Portuguese',
+    'Fontes': 'Sources', 'Inventário': 'Inventory', 'Fila pronta': 'Ready queue', 'Fila em execução': 'Running queue', 'Espaço livre': 'Free space',
+    'Serviços da VM': 'VM services', 'Serviço da plataforma': 'Platform service', 'Aplicação web': 'Web application',
+    'Timer de backup PostgreSQL': 'PostgreSQL backup timer', 'Timer de estado': 'Status timer', 'Worker de simulação': 'Simulation worker',
+    'Nenhuma auditoria profunda aguardando ou em execução.': 'No deep audit is queued or running.',
+    'Valida as Secrets OCI e os ARNs configurados localmente. Quando preenchidos, testa a credencial AWS e a role de migração sem listar ou restaurar objetos.': 'Validates locally configured OCI Secrets and ARNs. When supplied, it tests the AWS credential and migration role without listing or restoring objects.',
+    'Selecione uma origem': 'Select a source', 'Nome completo ou trecho do caminho': 'Full name or path fragment',
+    'Atualize e selecione um bucket OCI': 'Refresh and select an OCI bucket',
+    'Ex.: arquivo-legado': 'Ex.: legacy-archive', 'Ex.: meu-bucket-origem': 'Ex.: my-source-bucket', 'Ex.: dados/2024/': 'Ex.: data/2024/',
+    'Selecione a próxima sequência de objetos descobertos da origem até o limite. Ela gera uma tarefa persistente; o restore só será submetido pelo worker AWS após sua configuração.': 'Selects the next sequence of discovered source objects up to the limit. It creates a persistent task; restore is submitted by the AWS worker only after configuration.',
+    'O worker simulado não acessa AWS ou OCI. Quando habilitado, ele avança ondas fictícias por restore, polling e transferência para testar fila, retomada e auditoria.': 'The simulation worker does not access AWS or OCI. When enabled, it advances fictional waves through restore, polling and transfer to test queueing, resumption and auditing.',
+    'Último backup lógico:': 'Latest logical backup:', 'Nenhum backup lógico encontrado ainda.': 'No logical backup found yet.',
+    'Estado gerado em': 'Status generated at', 'Estado dos serviços da VM indisponível.': 'VM service status unavailable.',
+    'Aguardando primeira atualização': 'Waiting for first refresh', 'Estado dos serviços indisponível:': 'Service status unavailable:',
+    'Nenhuma origem com transferência ativa.': 'No source has an active transfer.',
+    'Não foi possível carregar atividade de migração.': 'Could not load migration activity.',
+    'Os ARNs identificam as roles IAM utilizadas pela plataforma. Eles não são credenciais e ficam persistidos localmente no PostgreSQL da VM.': 'The ARNs identify the IAM roles used by the platform. They are not credentials and are stored locally in the VM PostgreSQL database.',
+    'Consulta manualmente o OCI Resource Search no tenancy inteiro e guarda a lista localmente. A consulta não concede acesso a objetos; a policy da VM continua determinando quais buckets podem ser usados como destino.': 'Manually queries OCI Resource Search across the tenancy and stores the list locally. The query does not grant object access; the VM policy still determines which buckets can be used as destinations.',
+    'Usa a identidade dinâmica da VM para OCI e, quando configurada, valida AWS por STS/AssumeRole. Não revela Secrets, lista objetos nem grava no bucket.': 'Uses the VM dynamic identity for OCI and, when configured, validates AWS through STS/AssumeRole. It does not reveal Secrets, list objects, or write to a bucket.',
+    'RAIJIN conduz migrações controladas de AWS S3 para OCI Object Storage, com inventário persistente, ondas operacionais, retomada segura, rastreabilidade e verificação criptográfica de integridade.': 'RAIJIN performs controlled migrations from AWS S3 to OCI Object Storage with persistent inventory, operational waves, safe resumption, traceability, and cryptographic integrity verification.',
+    'Inspirado em Raijin, a divindade japonesa do trovão, o emblema representa força, movimento e condução precisa: cada objeto sai da origem com evidências de transferência e chega ao destino preservando sua integridade operacional.': 'Inspired by Raijin, the Japanese deity of thunder, the emblem represents strength, movement, and precise guidance: every object leaves the source with transfer evidence and reaches the destination while preserving its operational integrity.',
+    'Ver projeto no GitHub ↗': 'View project on GitHub ↗'
   };
-  const entries = Object.entries(ptToEn).sort(([a], [b]) => b.length - a.length);
-  const enToPt = entries.map(([pt, en]) => [en, pt]).sort(([a], [b]) => b.length - a.length);
   let language = localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'pt';
   let translating = false;
+  const textSources = new WeakMap();
+  const attributeSources = new WeakMap();
 
-  const translate = (value, direction) => {
-    if (!value || !value.trim()) return value;
-    let result = value;
-    for (const [from, to] of direction) result = result.split(from).join(to);
-    return result;
+  const translate = value => {
+    if (!value || !value.trim() || language !== 'en') return value;
+    const prefix = value.match(/^\s*/)?.[0] || '';
+    const suffix = value.match(/\s*$/)?.[0] || '';
+    const core = value.slice(prefix.length, value.length - suffix.length);
+    return `${prefix}${ptToEn[core] || core}${suffix}`;
   };
   const localizeElement = (element) => {
-    const direction = language === 'en' ? entries : enToPt;
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
       acceptNode: node => ['SCRIPT', 'STYLE'].includes(node.parentElement?.tagName) ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT
     });
     const nodes = []; while (walker.nextNode()) nodes.push(walker.currentNode);
-    nodes.forEach(node => { node.nodeValue = translate(node.nodeValue, direction); });
+    nodes.forEach(node => { if (!textSources.has(node)) textSources.set(node, node.nodeValue); node.nodeValue = translate(textSources.get(node)); });
     element.querySelectorAll?.('[placeholder],[title],[aria-label],[data-help]').forEach(node => {
       ['placeholder', 'title', 'aria-label', 'data-help'].forEach(attribute => {
-        if (node.hasAttribute(attribute)) node.setAttribute(attribute, translate(node.getAttribute(attribute), direction));
+        if (!node.hasAttribute(attribute)) return;
+        if (!attributeSources.has(node)) attributeSources.set(node, {});
+        const sources = attributeSources.get(node);
+        if (!(attribute in sources)) sources[attribute] = node.getAttribute(attribute);
+        node.setAttribute(attribute, translate(sources[attribute]));
       });
     });
   };
@@ -107,7 +132,8 @@
     translating = false;
   };
   window.raijinLocale = () => language === 'en' ? 'en-US' : 'pt-BR';
-  window.setLanguage = value => { language = value === 'en' ? 'en' : 'pt'; localStorage.setItem(STORAGE_KEY, language); applyLanguage(); };
+  window.uiText = text => language === 'en' ? (ptToEn[text] || text) : text;
+  window.setLanguage = value => { language = value === 'en' ? 'en' : 'pt'; localStorage.setItem(STORAGE_KEY, language); applyLanguage(); document.dispatchEvent(new CustomEvent('raijin:language-changed')); };
   window.addEventListener('DOMContentLoaded', () => {
     applyLanguage();
     new MutationObserver(records => { if (!translating) records.forEach(record => record.addedNodes.forEach(node => { if (node.nodeType === Node.ELEMENT_NODE) localizeElement(node); })); }).observe(document.body, {childList: true, subtree: true});
