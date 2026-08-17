@@ -56,3 +56,12 @@ def test_transfer_queue_uses_compact_style_for_batch_job_id():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert ".queue-restore code" in page
     assert "padding:.18rem .35rem" in page
+
+
+def test_aws_connection_sync_and_safe_configuration_controls_are_available():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "viewAwsConnectionConfiguration" in page
+    assert "syncAwsConnection" in page
+    assert "syncSourceAwsRegion" in page
+    assert "Campos ocultos" in page
+    assert "Tentativas de restore" in page

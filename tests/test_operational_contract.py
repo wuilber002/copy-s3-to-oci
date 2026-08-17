@@ -13,12 +13,30 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary
+from app.real_worker import validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
     columns = ObjectRecord.__table__.columns
     assert {"multipart_upload_id", "multipart_part_size", "multipart_parts_json", "multipart_updated_at"} <= set(columns.keys())
+
+
+def test_restore_models_preserve_attempt_and_per_object_evidence():
+    assert {"restore_attempt_id"} <= set(ObjectRecord.__table__.columns.keys())
+    assert {"job_id", "expected_objects", "succeeded_objects", "failed_objects", "report_manifest_key"} <= set(RestoreAttempt.__table__.columns.keys())
+    assert {"attempt_id", "object_id", "task_status", "http_status", "error_code"} <= set(RestoreObjectResult.__table__.columns.keys())
+    assert ObjectState.RESTORE_REQUEST_ACCEPTED == "RESTORE_REQUEST_ACCEPTED"
+
+
+def test_restore_preflight_blocks_source_region_mismatch_before_batch_submission():
+    class Client:
+        def head_bucket(self, Bucket):
+            return {"ResponseMetadata": {"HTTPHeaders": {"x-amz-bucket-region": "sa-east-1"}}}
+
+    source = type("Source", (), {"s3_bucket": "source", "aws_region": "us-east-1", "aws_bucket_region": None})()
+    with pytest.raises(RuntimeError, match="region mismatch"):
+        validate_restore_preflight(None, source, Client(), {"control_bucket": "control"})
 
 
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):

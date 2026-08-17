@@ -46,6 +46,40 @@ connection, source and wave IDs.
    and control bucket without listing source objects or starting a restore.
 5. In **Migrations**, select the connection when creating each source.
 
+The **View configuration** action shows only non-sensitive fields from the
+current Secret version: account, default region, control bucket and the two
+role ARNs. The bootstrap access key and secret access key are never returned
+to the browser. Use **Sync Secret** after rotating or correcting a Secret
+version: it updates the connection's displayed region and control bucket while
+preserving the immutable local label and AWS account identity.
+
+Sources can belong to different AWS regions within the same account
+connection. Before discovery and before every paid Batch restore submission,
+RAIJIN checks the region returned by `HeadBucket` for both the source and the
+control bucket. A restore is blocked unless the configured source region, the
+actual source-bucket region and the control-bucket region are identical. The
+operator can use **Sync AWS region** on a source to correct its local region
+from AWS without repeating discovery; any pending restore task is superseded
+so that the operator explicitly creates a new safe attempt.
+
+## Restore evidence and failure handling
+
+Each Batch restore submission creates an immutable local restore attempt with
+the AWS Batch Job ID, region, manifest ETag, expected object count and later
+the completion-report location and ETag. A wave does **not** move to
+`RESTORING` merely because the Batch Job is `Complete`. RAIJIN requires that
+the job counters match the manifest, every task succeeds and the completion
+report is imported per object before it records `RESTORE_REQUEST_ACCEPTED`.
+
+For each report row, RAIJIN preserves the object/version, task result, HTTP
+status, AWS error code and error message. If the job has failures, the wave is
+placed in `RESTORE_REQUEST_FAILED`; transfer and availability polling stop.
+Some all-failed jobs do not produce a completion report, so RAIJIN persists
+the Batch Job counters and explicitly records the missing evidence rather than
+claiming that a restore is in progress. Reprocessing retains the previous
+attempt for audit and creates a new Batch Job only after the operator has
+corrected the cause.
+
 Only currently compatible Secrets appear in the registration combobox. A
 connection already registered remains in the database if a later Secret version
 is invalid; its pre-check and operations then report the incompatibility.

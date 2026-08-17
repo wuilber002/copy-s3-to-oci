@@ -58,6 +58,7 @@ class ObjectState(StrEnum):
     DISCOVERED = "DISCOVERED"
     WAVE_ASSIGNED = "WAVE_ASSIGNED"
     RESTORE_REQUESTED = "RESTORE_REQUESTED"
+    RESTORE_REQUEST_ACCEPTED = "RESTORE_REQUEST_ACCEPTED"
     RESTORING = "RESTORING"
     RESTORED = "RESTORED"
     TRANSFERRING = "TRANSFERRING"
@@ -92,6 +93,7 @@ class Source(Base):
     s3_bucket: Mapped[str] = mapped_column(String(255))
     s3_prefix: Mapped[str] = mapped_column(String(1024), default="")
     aws_region: Mapped[str] = mapped_column(String(64))
+    aws_bucket_region: Mapped[str | None] = mapped_column(String(64), nullable=True)
     aws_connection_id: Mapped[int | None] = mapped_column(ForeignKey("aws_connections.id"), nullable=True, index=True)
     destination_bucket: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="CONFIGURED")
@@ -160,6 +162,7 @@ class ObjectRecord(Base):
     destination_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
     checksum_algorithm: Mapped[str | None] = mapped_column(String(32), nullable=True)
     restore_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    restore_attempt_id: Mapped[int | None] = mapped_column(ForeignKey("restore_attempts.id"), nullable=True, index=True)
     restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -221,6 +224,43 @@ class Wave(Base):
     source: Mapped[Source] = relationship(back_populates="waves")
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="wave")
     tasks: Mapped[list[Task]] = relationship(back_populates="wave")
+
+
+class RestoreAttempt(Base):
+    """Immutable evidence for one S3 Batch Operations restore submission."""
+    __tablename__ = "restore_attempts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    wave_id: Mapped[int] = mapped_column(ForeignKey("waves.id"), index=True)
+    aws_region: Mapped[str] = mapped_column(String(64))
+    job_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    job_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    manifest_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    expected_objects: Mapped[int] = mapped_column(Integer, default=0)
+    succeeded_objects: Mapped[int] = mapped_column(Integer, default=0)
+    failed_objects: Mapped[int] = mapped_column(Integer, default=0)
+    report_manifest_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    report_manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    failure_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class RestoreObjectResult(Base):
+    """Per-object outcome imported from the S3 Batch completion report."""
+    __tablename__ = "restore_object_results"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    attempt_id: Mapped[int] = mapped_column(ForeignKey("restore_attempts.id"), index=True)
+    object_id: Mapped[int] = mapped_column(ForeignKey("objects.id"), index=True)
+    task_status: Mapped[str] = mapped_column(String(32), default="PENDING")
+    http_status: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    report_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    report_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class Task(Base):
@@ -386,6 +426,7 @@ def create_schema() -> None:
         "destination_checksum": "VARCHAR(256)",
         "checksum_algorithm": "VARCHAR(32)",
         "restore_requested_at": "TIMESTAMP WITH TIME ZONE",
+        "restore_attempt_id": "BIGINT",
         "restored_at": "TIMESTAMP WITH TIME ZONE",
         "transferred_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_started_at": "TIMESTAMP WITH TIME ZONE",
@@ -420,7 +461,7 @@ def create_schema() -> None:
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "aws_connection_id": "INTEGER"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
@@ -570,6 +611,23 @@ def connection_summary(session: Session, connection: AwsConnection) -> dict:
             "aws_account_id": connection.aws_account_id, "default_region": connection.default_region,
             "control_bucket": connection.control_bucket, "archived_at": connection.archived_at,
             "created_at": connection.created_at, "sources": int(sources)}
+
+
+def aws_connection_configuration(connection: AwsConnection, secret: dict) -> dict:
+    """Non-sensitive Secret fields safe to display to an authenticated local operator."""
+    return {
+        "id": connection.id,
+        "label": connection.label,
+        "secret_ocid": connection.secret_ocid,
+        "schema_version": secret["schema_version"],
+        "connection_name": secret["connection_name"],
+        "aws_account_id": secret["aws_account_id"],
+        "default_region": secret["default_region"],
+        "migration_role_arn": secret["migration_role_arn"],
+        "batch_operations_role_arn": secret["batch_operations_role_arn"],
+        "control_bucket": secret["control_bucket"],
+        "redacted_fields": ["bootstrap_access_key_id", "bootstrap_secret_access_key"],
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1167,6 +1225,38 @@ def precheck_aws_connection(connection_id: int, session: Session = Depends(get_s
     return {"id": connection.id, "status": "VALIDATED", "aws_account_id": account_id, "control_bucket": connection.control_bucket}
 
 
+@app.get("/api/aws-connections/{connection_id}/configuration")
+def get_aws_connection_configuration(connection_id: int, session: Session = Depends(get_session)) -> dict:
+    connection = connection_or_404(session, connection_id)
+    try:
+        return aws_connection_configuration(connection, aws_secret_payload(connection.secret_ocid))
+    except Exception as error:
+        raise HTTPException(status_code=422, detail=f"AWS connection Secret is no longer compatible: {type(error).__name__}") from error
+
+
+@app.post("/api/aws-connections/{connection_id}/sync")
+def sync_aws_connection(connection_id: int, session: Session = Depends(get_session)) -> dict:
+    """Synchronize non-sensitive connection metadata while preserving its immutable label and identity."""
+    connection = connection_or_404(session, connection_id)
+    try:
+        secret = aws_secret_payload(connection.secret_ocid)
+    except Exception as error:
+        raise HTTPException(status_code=422, detail=f"AWS connection Secret is no longer compatible: {type(error).__name__}") from error
+    if secret["aws_account_id"] != connection.aws_account_id:
+        raise HTTPException(status_code=409, detail="Secret AWS account ID differs from the immutable registered connection")
+    before = {"default_region": connection.default_region, "control_bucket": connection.control_bucket}
+    connection.default_region, connection.control_bucket = secret["default_region"], secret["control_bucket"]
+    cached = session.scalar(select(AwsSecretCache).where(AwsSecretCache.secret_ocid == connection.secret_ocid))
+    if cached:
+        cached.schema_version, cached.connection_name = secret["schema_version"], secret["connection_name"]
+        cached.aws_account_id, cached.default_region, cached.valid, cached.validation_error = secret["aws_account_id"], secret["default_region"], True, None
+        cached.refreshed_at = utcnow()
+    changed = [field for field, old in before.items() if getattr(connection, field) != old]
+    record_event(session, "AWS_CONNECTION_SYNCED", f"AWS connection '{connection.label}' synchronized from its current Secret version; changed: {', '.join(changed) or 'none'}")
+    session.commit()
+    return {"connection": connection_summary(session, connection), "changed": changed, "configuration": aws_connection_configuration(connection, secret)}
+
+
 @app.delete("/api/aws-connections/{connection_id}")
 def delete_aws_connection(connection_id: int, session: Session = Depends(get_session)) -> dict:
     connection = connection_or_404(session, connection_id)
@@ -1200,6 +1290,7 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
         return "IN_PROGRESS" if total else "NOT_STARTED"
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
+             "aws_bucket_region": s.aws_bucket_region,
              "aws_connection_id": s.aws_connection_id,
              "aws_connection_label": s.aws_connection.label if s.aws_connection else "Unassigned AWS connection",
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
@@ -1222,8 +1313,6 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
         connection = connection_or_404(session, payload.aws_connection_id)
         if connection.archived_at:
             raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by new sources")
-        if payload.aws_region != connection.default_region:
-            raise HTTPException(status_code=422, detail="Source AWS region must match the selected AWS connection")
     source = Source(**payload.model_dump())
     session.add(source)
     session.flush()
@@ -1248,13 +1337,50 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
         connection = connection_or_404(session, payload.aws_connection_id)
         if connection.archived_at:
             raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by sources")
-        if payload.aws_region != connection.default_region:
-            raise HTTPException(status_code=422, detail="Source AWS region must match the selected AWS connection")
     for field, value in payload.model_dump().items():
         setattr(source, field, value)
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
+
+
+def aws_bucket_region_from_connection(connection: AwsConnection, bucket: str) -> str:
+    """Use HeadBucket's region header; it needs no Secret value in API responses."""
+    import boto3
+    from botocore.config import Config
+    values = aws_secret_payload(connection.secret_ocid)
+    config = Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 3, "mode": "standard"})
+    bootstrap = boto3.Session(aws_access_key_id=values["bootstrap_access_key_id"], aws_secret_access_key=values["bootstrap_secret_access_key"], region_name=values["default_region"])
+    assumed = bootstrap.client("sts", config=config).assume_role(RoleArn=values["migration_role_arn"], RoleSessionName="raijin-source-region-sync", DurationSeconds=900)["Credentials"]
+    s3 = boto3.Session(aws_access_key_id=assumed["AccessKeyId"], aws_secret_access_key=assumed["SecretAccessKey"], aws_session_token=assumed["SessionToken"], region_name=values["default_region"]).client("s3", config=config)
+    headers = s3.head_bucket(Bucket=bucket).get("ResponseMetadata", {}).get("HTTPHeaders", {})
+    region = headers.get("x-amz-bucket-region")
+    if not region:
+        raise RuntimeError("AWS did not return the source bucket region")
+    return "eu-west-1" if region == "EU" else region
+
+
+@app.post("/api/sources/{source_id}/sync-aws-region")
+def sync_source_aws_region(source_id: int, session: Session = Depends(get_session)) -> dict:
+    """Correct a source region using AWS' HeadBucket response without rediscovery."""
+    source = active_source_or_409(session, source_id)
+    if not source.aws_connection:
+        raise HTTPException(status_code=422, detail="Source has no AWS connection")
+    running = session.scalar(select(Task.id).join(Wave).where(Wave.source_id == source.id, Task.state == TaskState.RUNNING).limit(1))
+    if running:
+        raise HTTPException(status_code=409, detail="Wait for the running task before synchronizing the source region")
+    try:
+        actual = aws_bucket_region_from_connection(source.aws_connection, source.s3_bucket)
+    except Exception as error:
+        raise HTTPException(status_code=422, detail=f"Source AWS region lookup failed: {safe_aws_error_summary(error)}") from error
+    previous = source.aws_region
+    source.aws_bucket_region, source.aws_region = actual, actual
+    superseded = session.query(Task).join(Wave).filter(
+        Wave.source_id == source.id, Task.kind.in_(["SUBMIT_BATCH_RESTORE", "POLL_RESTORE"]), Task.state == TaskState.READY
+    ).update({Task.state: TaskState.FAILED, Task.error: "Superseded after source AWS region synchronization"}, synchronize_session=False)
+    record_event(session, "SOURCE_AWS_REGION_SYNCED", f"Source '{source.name}' region synchronized from {previous} to {actual}; {superseded} pending restore task(s) superseded", source_id=source.id)
+    session.commit()
+    return {"source_id": source.id, "previous_region": previous, "aws_region": actual, "superseded_tasks": superseded}
 
 
 @app.post("/api/sources/{source_id}/migrate-aws-connection")
@@ -1822,8 +1948,14 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
             func.coalesce(func.sum(case((ObjectRecord.integrity_error.is_not(None), 1), else_=0)), 0),
         ).where(ObjectRecord.wave_id == wave_id)
     ).one()
+    attempts = list(session.scalars(select(RestoreAttempt).where(RestoreAttempt.wave_id == wave_id).order_by(RestoreAttempt.id.desc())))
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
             "batch": {"job_id": wave.batch_job_id, "status": wave.batch_job_status, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
+            "restore_attempts": [{"id": attempt.id, "job_id": attempt.job_id, "region": attempt.aws_region, "status": attempt.job_status,
+                                  "expected": attempt.expected_objects, "succeeded": attempt.succeeded_objects, "failed": attempt.failed_objects,
+                                  "report_manifest_key": attempt.report_manifest_key, "failure_summary": attempt.failure_summary,
+                                  "created_at": attempt.created_at, "completed_at": attempt.completed_at}
+                                 for attempt in attempts],
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 
@@ -1923,7 +2055,16 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
     queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
     if queued:
         raise HTTPException(status_code=409, detail="This wave already has a queued or running task")
-    wave.status = "READY_FOR_RESTORE"
+    if wave.batch_job_id and not session.scalar(select(RestoreAttempt.id).where(RestoreAttempt.job_id == wave.batch_job_id)):
+        session.add(RestoreAttempt(wave_id=wave.id, aws_region=wave.source.aws_region, job_id=wave.batch_job_id,
+                                   job_status=wave.batch_job_status, manifest_key=wave.manifest_key,
+                                   manifest_etag=wave.manifest_etag, expected_objects=session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id)) or 0,
+                                   failure_summary="Historic Batch job retained while starting a new restore attempt"))
+    reset_states = [ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING]
+    for obj in session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_(reset_states))):
+        obj.state, obj.restored_at = ObjectState.WAVE_ASSIGNED, None
+    wave.status, wave.batch_job_id, wave.batch_job_status = "READY_FOR_RESTORE", None, None
+    wave.manifest_key, wave.manifest_etag, wave.last_poll_at, wave.poll_count = None, None, None, 0
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
     record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}' by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()

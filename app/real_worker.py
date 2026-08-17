@@ -17,7 +17,7 @@ import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import boto3
 import oci
@@ -25,7 +25,7 @@ from botocore.config import Config
 from sqlalchemy import func, or_, select
 
 from app.main import (
-    AwsConnection, Event, ObjectRecord, ObjectState, SessionLocal, Source, Task, TaskState,
+    AwsConnection, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
     Wave, parse_aws_connection_payload, runtime_settings, utcnow,
 )
 
@@ -197,7 +197,7 @@ def fail_permanently(session, task: Task, error: str) -> None:
     """End a task that cannot succeed without an operator correction."""
     task.state, task.lease_expires_at, task.error = TaskState.FAILED, None, error[:8000]
     wave = session.get(Wave, task.wave_id)
-    if wave and wave.status not in {"PAUSED", "VERIFIED"}:
+    if wave and wave.status not in {"PAUSED", "VERIFIED", "RESTORE_REQUEST_FAILED"}:
         wave.status = "FAILED"
     event(session, "TASK_FAILED_PERMANENTLY", f"{task.kind} requires operator action: {task.error}", wave_id=task.wave_id)
     session.commit()
@@ -232,6 +232,88 @@ def batch_manifest_fields(has_versions: bool) -> list[str]:
     return ["Bucket", "Key"] + (["VersionId"] if has_versions else [])
 
 
+def reported_bucket_region(client, bucket: str) -> str:
+    """Read HeadBucket's region header, including redirects from a wrong endpoint."""
+    try:
+        response = client.head_bucket(Bucket=bucket)
+        headers = response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+    except Exception as error:
+        headers = (getattr(error, "response", {}) or {}).get("ResponseMetadata", {}).get("HTTPHeaders", {})
+        if not headers.get("x-amz-bucket-region"):
+            raise
+    region = headers.get("x-amz-bucket-region")
+    if not region:
+        raise RuntimeError(f"AWS did not return a region for bucket '{bucket}'")
+    return "eu-west-1" if region == "EU" else region
+
+
+def validate_restore_preflight(session, source: Source, s3, operation: dict[str, str]) -> None:
+    """Block a charged Batch job when region or control-bucket topology is invalid."""
+    source_region = reported_bucket_region(s3, source.s3_bucket)
+    control_region = reported_bucket_region(s3, operation["control_bucket"])
+    source.aws_bucket_region = source_region
+    if source.aws_region != source_region:
+        raise RuntimeError(f"Source AWS region mismatch: configured {source.aws_region}, bucket is {source_region}")
+    if control_region != source_region:
+        raise RuntimeError(f"Control bucket region mismatch: {control_region}; restore source bucket is {source_region}")
+
+
+def restore_attempt_for_job(session, wave: Wave, source: Source) -> RestoreAttempt:
+    attempt = session.scalar(select(RestoreAttempt).where(RestoreAttempt.job_id == wave.batch_job_id)) if wave.batch_job_id else None
+    if attempt:
+        return attempt
+    attempt = RestoreAttempt(wave_id=wave.id, aws_region=source.aws_region, job_id=wave.batch_job_id,
+                             job_status=wave.batch_job_status, manifest_key=wave.manifest_key,
+                             manifest_etag=wave.manifest_etag,
+                             expected_objects=session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id)) or 0,
+                             failure_summary="Legacy restore attempt observed after platform upgrade")
+    session.add(attempt)
+    session.flush()
+    return attempt
+
+
+def import_completion_report(session, s3, operation: dict[str, str], attempt: RestoreAttempt, objects: list[ObjectRecord]) -> bool:
+    """Import per-object S3 Batch evidence. False means AWS has not published it yet."""
+    prefix = f"{operation['control_prefix'].rstrip('/')}/reports/wave-{attempt.wave_id}/attempt-{attempt.id}/"
+    keys = [entry["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=operation["control_bucket"], Prefix=prefix) for entry in page.get("Contents", [])]
+    manifest_key = next((key for key in keys if key.endswith("manifest.json")), None)
+    if not manifest_key:
+        return False
+    manifest_response = s3.get_object(Bucket=operation["control_bucket"], Key=manifest_key)
+    manifest_body = manifest_response["Body"].read().decode("utf-8")
+    manifest = json.loads(manifest_body)
+    attempt.report_manifest_key = manifest_key
+    attempt.report_manifest_etag = manifest_response.get("ETag", "").strip('"') or None
+    objects_by_key = {(obj.object_key, obj.version_id or ""): obj for obj in objects}
+    for result in manifest.get("Results", []):
+        report_key = result.get("Key")
+        if not report_key:
+            continue
+        report = s3.get_object(Bucket=result.get("Bucket", operation["control_bucket"]), Key=report_key)
+        report_etag = report.get("ETag", "").strip('"') or None
+        for row in csv.reader(io.StringIO(report["Body"].read().decode("utf-8", "replace"))):
+            if len(row) < 7:
+                continue
+            _, key, version_id, task_status, http_status, error_code, error_message = (row + [""] * 7)[:7]
+            obj = objects_by_key.get((unquote(key), version_id or "")) or objects_by_key.get((key, version_id or ""))
+            if not obj:
+                continue
+            outcome = session.scalar(select(RestoreObjectResult).where(RestoreObjectResult.attempt_id == attempt.id, RestoreObjectResult.object_id == obj.id))
+            if not outcome:
+                outcome = RestoreObjectResult(attempt_id=attempt.id, object_id=obj.id)
+                session.add(outcome)
+            outcome.task_status, outcome.http_status = task_status.upper(), int(http_status) if http_status.isdigit() else None
+            outcome.error_code, outcome.error_message, outcome.report_key, outcome.report_etag = error_code or None, error_message or None, report_key, report_etag
+    return True
+
+
+def fail_restore_attempt(session, task: Task, wave: Wave, attempt: RestoreAttempt, message: str) -> None:
+    attempt.failure_summary, attempt.completed_at = message[:8000], utcnow()
+    wave.status, wave.batch_job_status = "RESTORE_REQUEST_FAILED", attempt.job_status
+    event(session, "RESTORE_REQUEST_FAILED", message[:8000], source_id=wave.source_id, wave_id=wave.id)
+    fail_permanently(session, task, message)
+
+
 def submit_restore(session, task: Task, settings) -> None:
     wave = session.get(Wave, task.wave_id)
     source = wave.source
@@ -246,6 +328,10 @@ def submit_restore(session, task: Task, settings) -> None:
     if not operation["control_bucket"] or not operation["batch_role_arn"]:
         raise RuntimeError("AWS control bucket and Batch Operations role ARN must be configured")
     s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
+    validate_restore_preflight(session, source, s3, operation)
+    attempt = RestoreAttempt(wave_id=wave.id, aws_region=source.aws_region, expected_objects=len(archives))
+    session.add(attempt)
+    session.flush()
     has_versions = any(obj.version_id for obj in archives)
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\n")
@@ -254,21 +340,23 @@ def submit_restore(session, task: Task, settings) -> None:
         if has_versions:
             row.append(obj.version_id or "")
         writer.writerow(row)
-    manifest_key = f"{operation['control_prefix'].rstrip('/')}/manifests/wave-{wave.id}-{int(time.time())}.csv"
+    manifest_key = f"{operation['control_prefix'].rstrip('/')}/manifests/wave-{wave.id}/attempt-{attempt.id}.csv"
     response = s3.put_object(Bucket=operation["control_bucket"], Key=manifest_key, Body=output.getvalue().encode("utf-8"), ContentType="text/csv")
     fields = batch_manifest_fields(has_versions)
     job = s3control.create_job(
         AccountId=account_id, ConfirmationRequired=False, Priority=10, RoleArn=operation["batch_role_arn"],
         Operation={"S3InitiateRestoreObject": {"ExpirationInDays": wave.restore_days, "GlacierJobTier": wave.restore_tier}},
         Manifest={"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": fields}, "Location": {"ObjectArn": f"arn:aws:s3:::{operation['control_bucket']}/{manifest_key}", "ETag": response["ETag"].strip('"')}},
-        Report={"Bucket": f"arn:aws:s3:::{operation['control_bucket']}", "Prefix": f"{operation['control_prefix'].rstrip('/')}/reports/wave-{wave.id}/", "Format": "Report_CSV_20180820", "Enabled": True, "ReportScope": "AllTasks"},
+        Report={"Bucket": f"arn:aws:s3:::{operation['control_bucket']}", "Prefix": f"{operation['control_prefix'].rstrip('/')}/reports/wave-{wave.id}/attempt-{attempt.id}/", "Format": "Report_CSV_20180820", "Enabled": True, "ReportScope": "AllTasks"},
         Description=f"S3 to OCI restore wave {wave.id}",
         ClientRequestToken=f"s3-oci-wave-{wave.id}",
     )
+    attempt.job_id, attempt.job_status, attempt.manifest_key, attempt.manifest_etag = job["JobId"], "Preparing", manifest_key, response["ETag"].strip('"')
     wave.batch_job_id, wave.batch_job_status, wave.manifest_key, wave.manifest_etag, wave.status = job["JobId"], "Preparing", manifest_key, response["ETag"].strip('"'), "RESTORE_REQUESTED"
     for obj in archives:
-        obj.state, obj.restore_requested_at = ObjectState.RESTORE_REQUESTED, utcnow()
-    event(session, "BATCH_RESTORE_SUBMITTED", f"Batch job {wave.batch_job_id} submitted for {len(archives)} archive object(s)", source_id=source.id, wave_id=wave.id)
+        obj.state, obj.restore_requested_at, obj.restore_attempt_id = ObjectState.RESTORE_REQUESTED, utcnow(), attempt.id
+        session.add(RestoreObjectResult(attempt_id=attempt.id, object_id=obj.id))
+    event(session, "BATCH_RESTORE_SUBMITTED", f"Batch job {wave.batch_job_id} submitted for {len(archives)} archive object(s); awaiting per-object acceptance evidence", source_id=source.id, wave_id=wave.id)
     succeed(session, task, "POLL_RESTORE")
 
 
@@ -276,14 +364,46 @@ def poll_restore(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
     s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
     if wave.batch_job_id:
+        attempt = restore_attempt_for_job(session, wave, source)
         job = s3control.describe_job(AccountId=account_id, JobId=wave.batch_job_id)["Job"]
-        wave.batch_job_status = job.get("Status")
+        attempt.job_status = wave.batch_job_status = job.get("Status")
         wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
         if job["Status"] not in {"Complete", "Completed"}:
+            if job["Status"] in {"Failed", "Cancelled", "Canceled"}:
+                fail_restore_attempt(session, task, wave, attempt, f"Batch job {wave.batch_job_id} ended as {job['Status']}")
+                return
             wave.status = "RESTORING"
             session.commit()
             retry(session, task, f"Batch job status is {job['Status']}", min(1800, 300 + wave.poll_count * 60))
             return
+        progress = job.get("ProgressSummary", {}) or {}
+        attempt.succeeded_objects = int(progress.get("NumberOfTasksSucceeded") or 0)
+        attempt.failed_objects = int(progress.get("NumberOfTasksFailed") or 0)
+        total = int(progress.get("TotalNumberOfTasks") or 0)
+        if total != attempt.expected_objects or attempt.failed_objects or attempt.succeeded_objects != attempt.expected_objects:
+            message = f"Batch job completed with {attempt.succeeded_objects}/{attempt.expected_objects} succeeded and {attempt.failed_objects} failed"
+            if attempt.failed_objects == attempt.expected_objects:
+                for result in session.scalars(select(RestoreObjectResult).where(RestoreObjectResult.attempt_id == attempt.id)):
+                    result.task_status, result.error_message = "FAILED", "Batch job completed with no successful restore requests; completion report unavailable"
+            fail_restore_attempt(session, task, wave, attempt, message)
+            return
+        objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
+        if not import_completion_report(session, s3, operation, attempt, objects):
+            wave.status = "RESTORE_REQUESTED"
+            session.commit()
+            retry(session, task, "Batch job accepted all objects; waiting for completion report evidence", 60)
+            return
+        failed_results = session.scalar(select(func.count(RestoreObjectResult.id)).where(RestoreObjectResult.attempt_id == attempt.id, RestoreObjectResult.task_status != "SUCCEEDED")) or 0
+        if failed_results:
+            fail_restore_attempt(session, task, wave, attempt, f"Completion report contains {failed_results} failed or unknown restore request(s)")
+            return
+        attempt.completed_at = utcnow()
+        for obj in objects:
+            if obj.storage_class in ARCHIVE_CLASSES and obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING}:
+                obj.state = ObjectState.RESTORE_REQUEST_ACCEPTED
+        wave.status = "RESTORE_REQUEST_ACCEPTED"
+        event(session, "RESTORE_REQUEST_ACCEPTED", f"Batch job {wave.batch_job_id} accepted all {attempt.expected_objects} archive restore request(s) with per-object evidence", source_id=source.id, wave_id=wave.id)
+        session.commit()
     ready_keys: set[str] = set()
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=source.s3_bucket, Prefix=source.s3_prefix, OptionalObjectAttributes=["RestoreStatus"]):
         for item in page.get("Contents", []):
@@ -293,11 +413,11 @@ def poll_restore(session, task: Task, settings) -> None:
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
     for obj in objects:
         if obj.storage_class not in ARCHIVE_CLASSES or obj.object_key in ready_keys:
-            if obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING, ObjectState.WAVE_ASSIGNED}:
+            if obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING, ObjectState.WAVE_ASSIGNED}:
                 obj.state, obj.restored_at = ObjectState.RESTORED, obj.restored_at or utcnow()
-        elif obj.state == ObjectState.RESTORE_REQUESTED:
+        elif obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED}:
             obj.state = ObjectState.RESTORING
-    pending = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING]))) or 0
+    pending = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING]))) or 0
     wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
     if pending:
         wave.status = "RESTORING"
