@@ -162,6 +162,11 @@ def archive_objects(session, wave_id: int) -> list[ObjectRecord]:
     return list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave_id, ObjectRecord.storage_class.in_(ARCHIVE_CLASSES), ObjectRecord.state == ObjectState.WAVE_ASSIGNED).order_by(ObjectRecord.object_key)))
 
 
+def batch_manifest_fields(has_versions: bool) -> list[str]:
+    """Field names mandated by the S3 Batch Operations CSV manifest format."""
+    return ["Bucket", "Key"] + (["VersionId"] if has_versions else [])
+
+
 def submit_restore(session, task: Task, settings) -> None:
     wave = session.get(Wave, task.wave_id)
     source = wave.source
@@ -185,7 +190,7 @@ def submit_restore(session, task: Task, settings) -> None:
         writer.writerow(row)
     manifest_key = f"{settings.aws_control_prefix.rstrip('/')}/manifests/wave-{wave.id}-{int(time.time())}.csv"
     response = s3.put_object(Bucket=settings.aws_control_bucket, Key=manifest_key, Body=output.getvalue().encode("utf-8"), ContentType="text/csv")
-    fields = ["S3Bucket", "S3Key"] + (["S3VersionId"] if has_versions else [])
+    fields = batch_manifest_fields(has_versions)
     job = s3control.create_job(
         AccountId=account_id, ConfirmationRequired=False, Priority=10, RoleArn=settings.aws_batch_role_arn,
         Operation={"S3InitiateRestoreObject": {"ExpirationInDays": wave.restore_days, "GlacierJobTier": wave.restore_tier}},

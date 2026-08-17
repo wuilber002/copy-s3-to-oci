@@ -15,6 +15,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from app.real_worker import (
     AWS_CLIENT_CONFIG,
+    batch_manifest_fields,
     WORKER_ID,
     effective_multipart_part_size,
     expected_part_size,
@@ -113,3 +114,8 @@ def test_aws_clients_have_bounded_network_retries():
     assert AWS_CLIENT_CONFIG.connect_timeout == 10
     assert AWS_CLIENT_CONFIG.read_timeout == 120
     assert AWS_CLIENT_CONFIG.retries["max_attempts"] == 4
+
+
+def test_batch_manifest_uses_aws_required_csv_field_names():
+    assert batch_manifest_fields(False) == ["Bucket", "Key"]
+    assert batch_manifest_fields(True) == ["Bucket", "Key", "VersionId"]
