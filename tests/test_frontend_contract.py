@@ -42,3 +42,10 @@ def test_registered_aws_connection_secrets_are_disabled_in_the_registration_form
     assert "Secret já cadastrado na conexão" in page
     assert "id=\"aws-connection-register\"" in page
     assert "updateAwsConnectionRegistrationState" in page
+
+
+def test_source_summary_identifies_its_aws_connection_with_an_orange_tag():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "aws-connection-tag" in page
+    assert "aws_connection_label" in page
+    assert "#fb923c" in page
