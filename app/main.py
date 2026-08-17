@@ -78,6 +78,11 @@ ARCHIVE_STORAGE_CLASSES = {
     "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS",
 }
 
+# OCI Resource Search uses this resource type for OCI Vault Secret metadata.
+# It deliberately retrieves only Secret identifiers and metadata; values are
+# read later, one at a time, only to validate the registered JSON schema.
+OCI_VAULT_SECRET_SEARCH_QUERY = "query vaultsecret resources"
+
 
 class Source(Base):
     __tablename__ = "sources"
@@ -498,6 +503,14 @@ def safe_aws_error_summary(error: Exception) -> str:
     detail = response.get("Error", {}) if isinstance(response, dict) else {}
     status = metadata.get("HTTPStatusCode")
     code = detail.get("Code")
+    context = " ".join(str(value) for value in (status, code) if value)
+    return f"{type(error).__name__}{f' ({context})' if context else ''}"
+
+
+def safe_oci_error_summary(error: Exception) -> str:
+    """Return OCI status/code only, never request identifiers or service text."""
+    status = getattr(error, "status", None)
+    code = getattr(error, "code", None)
     context = " ".join(str(value) for value in (status, code) if value)
     return f"{type(error).__name__}{f' ({context})' if context else ''}"
 
@@ -1070,7 +1083,7 @@ def refresh_aws_secret_cache(session: Session = Depends(get_session)) -> dict:
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
         search = oci.resource_search.ResourceSearchClient({}, signer=signer)
         secrets_client = oci.secrets.SecretsClient({}, signer=signer)
-        query = "query secret resources"
+        query = OCI_VAULT_SECRET_SEARCH_QUERY
         response = search.search_resources(oci.resource_search.models.StructuredSearchDetails(query=query))
         listed = list(response.data.items)
         while response.next_page:
@@ -1099,7 +1112,7 @@ def refresh_aws_secret_cache(session: Session = Depends(get_session)) -> dict:
             cached.connection_name, cached.aws_account_id, cached.default_region = payload["connection_name"], payload["aws_account_id"], payload["default_region"]
             cached.valid, compatible = True, compatible + 1
         except Exception as error:
-            cached.validation_error = str(error)[:512]
+            cached.validation_error = safe_oci_error_summary(error)
     if seen:
         session.query(AwsSecretCache).filter(AwsSecretCache.secret_ocid.not_in(seen)).delete(synchronize_session=False)
     else:

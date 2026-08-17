@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -63,6 +63,11 @@ def test_aws_error_summary_exposes_only_status_and_code():
     assert safe_aws_error_summary(error) == "ClientError (403 AccessDenied)"
 
 
+def test_oci_error_summary_excludes_request_details():
+    error = type("ServiceError", (Exception,), {"status": 404, "code": "NotAuthorizedOrNotFound", "message": "secret OCID must stay private"})()
+    assert safe_oci_error_summary(error) == "ServiceError (404 NotAuthorizedOrNotFound)"
+
+
 def test_restore_queue_contract_exposes_durable_batch_wait_details_only():
     now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
     wave = type("Wave", (), {"batch_job_id": "job-123", "batch_job_status": "Preparing", "status": "RESTORING", "last_poll_at": now, "poll_count": 3})()
@@ -88,3 +93,7 @@ def test_aws_connection_secret_schema_requires_matching_account_role_arns():
     payload["migration_role_arn"] = "arn:aws:iam::000000000000:role/migration"
     with pytest.raises(ValueError, match="aws_account_id"):
         parse_aws_connection_payload(__import__("json").dumps(payload))
+
+
+def test_oci_secret_discovery_uses_the_vaultsecret_resource_type():
+    assert OCI_VAULT_SECRET_SEARCH_QUERY == "query vaultsecret resources"
