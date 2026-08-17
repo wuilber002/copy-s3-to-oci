@@ -8,7 +8,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 os.environ.setdefault("POSTGRES_PASSWORD_FILE", str(_password))
 os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.json")
 
-from app.main import ObjectRecord, Source, observability, prometheus_metrics
+from datetime import datetime, timezone
+
+from app.main import ObjectRecord, Source, destination_provenance_matches, observability, prometheus_metrics
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -19,10 +21,22 @@ def test_object_model_contains_durable_multipart_checkpoint_fields():
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):
     class Data:
         def __getitem__(self, key):
-            return {"tasks": {"failed": 2, "retrying": 3}, "transfers": {"active_multipart_checkpoints": 4}, "disk": {"free_bytes": 5}}[key]
+            return {"tasks": {"failed": 2, "retrying": 3, "stale_leases": 4}, "transfers": {"active_multipart_checkpoints": 5, "stalled": 6}, "events": {"failures_last_24h": 7}, "disk": {"free_bytes": 8}}[key]
 
     monkeypatch.setattr("app.main.observability", lambda _session: Data())
     response = prometheus_metrics(object())
     assert response.media_type.startswith("text/plain")
     assert "raijin_failed_tasks 2" in response.body.decode()
-    assert "raijin_active_multipart_checkpoints 4" in response.body.decode()
+    body = response.body.decode()
+    assert "raijin_active_multipart_checkpoints 5" in body
+    assert "raijin_stale_task_leases 4" in body
+    assert "raijin_stalled_transfers 6" in body
+    assert "raijin_failures_last_24h 7" in body
+
+
+def test_destination_provenance_requires_s3_etag_and_last_modified_when_known():
+    obj = type("Object", (), {"etag": "source-etag", "last_modified": datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)})()
+    headers = {"opc-meta-s3-oci-source-etag": "source-etag", "opc-meta-s3-oci-source-last-modified": "2026-08-17T12:00:00+00:00"}
+    assert destination_provenance_matches(obj, headers)
+    headers["opc-meta-s3-oci-source-last-modified"] = "2026-08-17T12:01:00+00:00"
+    assert not destination_provenance_matches(obj, headers)

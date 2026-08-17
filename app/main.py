@@ -517,14 +517,37 @@ def prometheus_metrics(session: Session = Depends(get_session)) -> Response:
         "# HELP raijin_retrying_tasks Number of tasks waiting for a retry.",
         "# TYPE raijin_retrying_tasks gauge",
         f"raijin_retrying_tasks {data['tasks']['retrying']}",
+        "# HELP raijin_stale_task_leases Number of running tasks whose lease expired.",
+        "# TYPE raijin_stale_task_leases gauge",
+        f"raijin_stale_task_leases {data['tasks']['stale_leases']}",
         "# HELP raijin_active_multipart_checkpoints Incomplete resumable OCI multipart uploads.",
         "# TYPE raijin_active_multipart_checkpoints gauge",
         f"raijin_active_multipart_checkpoints {data['transfers']['active_multipart_checkpoints']}",
+        "# HELP raijin_stalled_transfers Transfers with no persisted progress for more than ten minutes.",
+        "# TYPE raijin_stalled_transfers gauge",
+        f"raijin_stalled_transfers {data['transfers']['stalled']}",
+        "# HELP raijin_failures_last_24h Persisted migration failures during the previous 24 hours.",
+        "# TYPE raijin_failures_last_24h gauge",
+        f"raijin_failures_last_24h {data['events']['failures_last_24h']}",
         "# HELP raijin_disk_free_bytes Free bytes on the persistent VM volume.",
         "# TYPE raijin_disk_free_bytes gauge",
         f"raijin_disk_free_bytes {data['disk']['free_bytes']}",
     ]
     return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+
+
+def destination_provenance_matches(obj: ObjectRecord, headers: dict) -> bool:
+    """Validate the immutable S3 provenance stored by the upload worker.
+
+    This deliberately uses OCI headers only: it catches a destination object
+    replaced under the same key and size without charging AWS requests or
+    rereading object data.
+    """
+    if obj.etag and headers.get("opc-meta-s3-oci-source-etag", "") != obj.etag:
+        return False
+    if obj.last_modified and headers.get("opc-meta-s3-oci-source-last-modified", "") != obj.last_modified.isoformat():
+        return False
+    return True
 
 
 @app.get("/api/readiness")
@@ -1118,7 +1141,7 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
             continue
         try:
             headers = client.head_object(namespace, source.destination_bucket, key).headers
-            if headers.get("opc-meta-s3-oci-source-etag", "") != obj.etag:
+            if not destination_provenance_matches(obj, headers):
                 metadata_mismatched.append(key)
         except Exception:
             metadata_mismatched.append(key)

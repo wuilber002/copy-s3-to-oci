@@ -100,6 +100,28 @@
     'Tamanho base de cada parte enviada ao OCI para arquivos grandes. 64 MiB reduz memória e custo de reenvio após falha; 128 MiB reduz chamadas. A plataforma aumenta automaticamente o valor quando necessário para respeitar o máximo OCI de 10.000 partes. A alteração vale para novos uploads; um upload já iniciado preserva seu tamanho para poder retomar com segurança.': 'Base size of each part uploaded to OCI for large files. 64 MiB reduces memory use and retry cost after failure; 128 MiB reduces calls. The platform automatically increases it when needed to respect OCI’s 10,000-part maximum. The change applies to new uploads; an upload already started keeps its size so it can resume safely.',
     'Define o idioma da interface neste navegador. A escolha é armazenada localmente e não altera a configuração operacional da plataforma.': 'Sets the interface language in this browser. The choice is stored locally and does not alter the platform operational configuration.'
   };
+  const phraseToEn = {
+    'objetos': 'objects', 'objeto(s)': 'object(s)', 'sem objetos': 'no objects',
+    'em cópia': 'copying', 'concluídos': 'completed', 'disponíveis': 'available', 'solicitados': 'requested',
+    'Origem salva.': 'Source saved.', 'Configuração salva; worker real habilitado.': 'Configuration saved; real worker enabled.',
+    'Configuração salva; worker real desabilitado.': 'Configuration saved; real worker disabled.',
+    'Selecione uma origem antes de validar o destino OCI.': 'Select a source before validating the OCI destination.',
+    'Validando destino OCI…': 'Validating OCI destination…',
+    'Destino OCI validado: todos os objetos existem, têm o tamanho esperado e preservam a proveniência.': 'OCI destination validated: all objects exist, have the expected size, and preserve provenance.',
+    'Destino OCI divergente:': 'OCI destination diverges:', 'ausente(s)': 'missing', 'com tamanho diferente': 'with a different size',
+    'com metadado divergente.': 'with mismatched metadata.', 'Exemplo ausente:': 'Missing example:',
+    'Destino OCI:': 'OCI destination:', 'validado': 'validated', 'divergente': 'divergent',
+    'tamanho divergente': 'size mismatch', 'proveniência divergente': 'provenance mismatch', 'extra(s)': 'extra(s)',
+    'Configuração:': 'Configuration:', 'Saúde:': 'Health:', 'Buckets OCI:': 'OCI buckets:',
+    'Nenhum bucket em cache. Atualize a lista antes de cadastrar uma origem.': 'No cached buckets. Refresh the list before creating a source.',
+    'Inventário OCI indisponível.': 'OCI inventory unavailable.', 'Consultando OCI Resource Search…': 'Querying OCI Resource Search…',
+    'Pré-check concluído.': 'Pre-check completed.', 'Há pendências antes da operação.': 'There are pending requirements before operation.',
+    'Falha no pré-check.': 'Pre-check failed.', 'Executando pré-check OCI e AWS…': 'Running OCI and AWS pre-check…',
+    'Nenhum objeto. O discovery AWS ainda não foi executado.': 'No objects. AWS discovery has not run yet.',
+    'Nenhum objeto encontrado para a busca.': 'No objects found for the search.', 'Anterior': 'Previous', 'Próxima': 'Next',
+    'Descoberta': 'Discovery', 'Discovery:': 'Discovery:', 'em execução.': 'running.', 'tarefa(s) falha(s). Abra Migrações para investigar.': 'failed task(s). Open Migrations to investigate.',
+    'Espaço livre abaixo de 10 GB:': 'Free space below 10 GB:', 'Serviço(s) inativo(s):': 'Inactive service(s):'
+  };
   let language = localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'pt';
   let translating = false;
   const textSources = new WeakMap();
@@ -110,7 +132,10 @@
     const prefix = value.match(/^\s*/)?.[0] || '';
     const suffix = value.match(/\s*$/)?.[0] || '';
     const core = value.slice(prefix.length, value.length - suffix.length);
-    return `${prefix}${ptToEn[core] || core}${suffix}`;
+    if (ptToEn[core]) return `${prefix}${ptToEn[core]}${suffix}`;
+    const translated = Object.entries(phraseToEn).sort(([a], [b]) => b.length - a.length)
+      .reduce((result, [pt, en]) => result.replaceAll(pt, en), core);
+    return `${prefix}${translated}${suffix}`;
   };
   const localizeElement = (element) => {
     const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT, {
