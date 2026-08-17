@@ -166,10 +166,18 @@
     translating = false;
   };
   window.raijinLocale = () => language === 'en' ? 'en-US' : 'pt-BR';
-  window.uiText = text => language === 'en' ? (ptToEn[text] || text) : text;
+  window.uiText = text => language === 'en' ? translate(text) : text;
   window.setLanguage = value => { language = value === 'en' ? 'en' : 'pt'; localStorage.setItem(STORAGE_KEY, language); applyLanguage(); document.dispatchEvent(new CustomEvent('raijin:language-changed')); };
   window.addEventListener('DOMContentLoaded', () => {
     applyLanguage();
-    new MutationObserver(records => { if (!translating) records.forEach(record => record.addedNodes.forEach(node => { if (node.nodeType === Node.ELEMENT_NODE) localizeElement(node); })); }).observe(document.body, {childList: true, subtree: true});
+    new MutationObserver(records => { if (!translating) records.forEach(record => record.addedNodes.forEach(node => {
+      if (node.nodeType === Node.ELEMENT_NODE) localizeElement(node);
+      // Dynamic cards frequently insert a bare text node by innerHTML.  The
+      // previous observer skipped those nodes, leaving mixed PT/EN screens.
+      if (node.nodeType === Node.TEXT_NODE) {
+        if (!textSources.has(node)) textSources.set(node, node.nodeValue);
+        node.nodeValue = translate(textSources.get(node));
+      }
+    })); }).observe(document.body, {childList: true, subtree: true});
   });
 })();
