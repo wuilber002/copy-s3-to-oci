@@ -1066,37 +1066,30 @@ def list_aws_secret_cache(session: Session = Depends(get_session)) -> dict:
 def refresh_aws_secret_cache(session: Session = Depends(get_session)) -> dict:
     """Explicitly inspect readable Secrets and cache only compatibility metadata."""
     try:
-        runtime = read_oci_runtime_config()
-        compartments = runtime.get("secret_compartment_ocids") or ([runtime["secrets_compartment_ocid"]] if runtime.get("secrets_compartment_ocid") else [])
-        if not compartments:
-            raise RuntimeError("No Secret compartments are configured")
         import oci
         signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-        vaults = oci.vault.VaultsClient({}, signer=signer)
+        search = oci.resource_search.ResourceSearchClient({}, signer=signer)
         secrets_client = oci.secrets.SecretsClient({}, signer=signer)
-        listed = []
-        for compartment_id in compartments:
-            page = None
-            while True:
-                response = vaults.list_secrets(compartment_id=compartment_id, limit=1000, page=page)
-                listed.extend((item, compartment_id) for item in response.data)
-                page = response.next_page
-                if not page:
-                    break
+        query = "query secret resources"
+        response = search.search_resources(oci.resource_search.models.StructuredSearchDetails(query=query))
+        listed = list(response.data.items)
+        while response.next_page:
+            response = search.search_resources(oci.resource_search.models.StructuredSearchDetails(query=query), page=response.next_page)
+            listed.extend(response.data.items)
     except Exception as error:
         raise HTTPException(status_code=502, detail=f"OCI Secret discovery failed: {type(error).__name__}") from error
 
     now, seen, compatible = utcnow(), set(), 0
-    for secret, compartment_id in listed:
-        secret_ocid = getattr(secret, "id", None)
+    for secret in listed:
+        secret_ocid = getattr(secret, "identifier", None)
         if not secret_ocid:
             continue
         seen.add(secret_ocid)
         cached = session.scalar(select(AwsSecretCache).where(AwsSecretCache.secret_ocid == secret_ocid))
         if not cached:
-            cached = AwsSecretCache(secret_ocid=secret_ocid, name=getattr(secret, "secret_name", secret_ocid), compartment_id=compartment_id)
+            cached = AwsSecretCache(secret_ocid=secret_ocid, name=getattr(secret, "display_name", secret_ocid), compartment_id=getattr(secret, "compartment_id", ""))
             session.add(cached)
-        cached.name, cached.compartment_id, cached.refreshed_at = getattr(secret, "secret_name", secret_ocid), compartment_id, now
+        cached.name, cached.compartment_id, cached.refreshed_at = getattr(secret, "display_name", secret_ocid), getattr(secret, "compartment_id", ""), now
         cached.valid, cached.validation_error = False, None
         cached.schema_version = cached.connection_name = cached.aws_account_id = cached.default_region = None
         try:
