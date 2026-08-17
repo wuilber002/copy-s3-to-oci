@@ -5,6 +5,16 @@ packages:
   - podman
 
 write_files:
+  - path: /etc/ssh/sshd_config.d/99-raijin-key-only.conf
+    owner: root:root
+    permissions: '0600'
+    content: |
+      # Raijin administration is exclusively by the Terraform-provided SSH key.
+      PasswordAuthentication no
+      KbdInteractiveAuthentication no
+      ChallengeResponseAuthentication no
+      PubkeyAuthentication yes
+      PermitRootLogin no
   - path: /etc/s3-oci-migration/oci-runtime.json
     owner: root:root
     permissions: '0600'
@@ -12,6 +22,7 @@ write_files:
       ${oci_runtime_config}
 
 runcmd:
+  - [ bash, -lc, "sshd -t && systemctl reload sshd" ]
   - [ mkdir, -p, /opt/s3-oci-migration ]
   - [ bash, -lc, "git clone --depth 1 --branch '${bootstrap_ref}' '${bootstrap_repository}' /opt/s3-oci-migration/release || (rm -rf /opt/s3-oci-migration/release && git clone --depth 1 '${bootstrap_repository}' /opt/s3-oci-migration/release)" ]
   - [ bash, -lc, "if [ -x /opt/s3-oci-migration/release/scripts/bootstrap.sh ]; then /opt/s3-oci-migration/release/scripts/bootstrap.sh; fi" ]

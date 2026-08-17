@@ -11,7 +11,7 @@
 
 1. Crie um Stack a partir de `terraform/orm` neste repositório.
 2. Preencha o formulário. Use 8 OCPUs, 32 GB e boot volume de 500 GB como ponto de partida.
-   Em subnet pública, habilite `Assign public IP to VM` somente se a security list/NSG restringir a porta 22 à rede administrativa. Em subnet privada, mantenha desligado e use o bastion/VPN do cliente.
+   A VM aceita administração SSH exclusivamente por chave pública/privada: senha, teclado interativo e login direto de root são desabilitados pelo cloud-init e reforçados pelo bootstrap. A porta 8080 nunca deve ser liberada; ela é publicada apenas em `127.0.0.1` na VM. O cliente pode manter a regra de SSH sem restrição de CIDR conforme sua política, desde que preserve a proteção da chave privada.
 3. Mantenha a criação de Vault, Key e Secrets: esses recursos são obrigatórios e sempre criados.
 4. Se criar policy, informe os buckets OCI de destino em `destination_buckets_json`. Agrupe buckets no mesmo compartment sempre que possível.
 5. Aplique o stack. Por padrão, ele cria e associa uma policy de backup incremental diário do boot volume, com retenção de 14 dias. É possível informar uma policy existente em vez disso.
@@ -52,6 +52,8 @@ Os parâmetros operacionais são persistidos no PostgreSQL. O **worker AWS/OCI r
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 
+O bloco **Observabilidade operacional** acompanha, sem chamar AWS ou OCI: tarefas falhas e em retry, leases vencidos, checkpoints multipart pendentes de retomada, transferências sem progresso há mais de dez minutos, falhas persistidas nas últimas 24 horas e espaço livre do volume persistente. Para um coletor local compatível, `http://127.0.0.1:8080/metrics` expõe as métricas essenciais no formato Prometheus; mantenha-o atrás do mesmo túnel SSH ou de um agente local, nunca em uma porta pública.
+
 O cartão **Credenciais e integrações** no Status e o botão **Executar pré-check OCI** em Configurações usam a identidade dinâmica da VM para ler a versão atual de cada Secret e listar no máximo um objeto em cada bucket OCI já cadastrado. Quando todas as credenciais AWS estão preenchidas, o pré-check também executa `GetCallerIdentity` e `AssumeRole` na role de migração; ele não lista, restaura, baixa nem cobra operações de S3. Valores de Secret nunca entram na resposta, nos logs ou na tela.
 
 - **Vermelho** (`PLACEHOLDER`): o valor ainda é o texto instrutivo criado pelo Terraform, ou há uma configuração ausente.
@@ -68,7 +70,7 @@ Como o valor gerado pelo provider `random` fica no state do Terraform, o state d
 
 O discovery produtivo usa somente `ListObjectsV2` paginado: registra chave, tamanho, ETag, classe de armazenamento e última modificação sem restaurar, baixar, fazer `HeadObject` ou listar tags. Metadados e tags são lidos somente no momento da cópia de cada objeto já restaurado. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
 
-Em caso de desligamento, reinicie `s3-oci-migration.service`. PostgreSQL mantém inventário, fila, leases e evidências; tarefas com lease expirado são reassumidas pelo worker. O backup lógico diário é complementar ao backup de volume OCI e pode ser restaurado conforme o procedimento de recuperação desta documentação.
+Em caso de desligamento, reinicie `s3-oci-migration.service`. PostgreSQL mantém inventário, fila, leases e evidências; tarefas com lease expirado são reassumidas pelo worker. Para uploads grandes, o `upload_id` multipart OCI e as partes já aceitas ficam no PostgreSQL: após reinício, o worker consulta essas partes e envia somente as faltantes. O backup lógico diário é complementar ao backup de volume OCI e pode ser restaurado conforme o procedimento de recuperação desta documentação.
 
 ## Instalação de release
 

@@ -10,11 +10,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.14.0
-      - name: Compile Python application
-        run: python3 -m py_compile app/main.py
+      - name: Install and test Python application
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements-dev.txt
+          python3 -m py_compile app/main.py app/real_worker.py
+          python3 -m pytest -q
       - name: Format Terraform
         run: terraform -chdir=terraform/orm fmt -check
       - name: Initialize Terraform without backend

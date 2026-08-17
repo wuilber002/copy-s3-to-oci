@@ -18,10 +18,13 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker
 
 - Uma única VM Linux; PostgreSQL será banco e fila durável.
 - Interface web somente em `localhost`, acessível por túnel SSH.
+- SSH apenas por chave pública/privada; senha, teclado interativo e login root são desabilitados.
 - Vault, Key e Secrets OCI sempre criados pelo Terraform, com placeholders instrutivos.
 - Credenciais AWS de bootstrap somente com access key/secret key; a aplicação assume uma role AWS de menor privilégio.
 - Restore em lote via S3 Batch Operations; chamadas AWS por objeto são evitadas sempre que houver alternativa bulk.
-- Integridade padrão por objeto: a cópia calcula SHA-256 na leitura do S3 e o OCI valida SHA-256 antes de aceitar um `PutObject` pequeno ou cada parte de um multipart. A evidência de aceitação nativa fica persistida sem reler o destino. ETag S3 não é tratado como MD5 universal.
+- Integridade padrão por objeto: a cópia calcula SHA-256 na leitura do S3 e o OCI valida SHA-256 antes de aceitar um `PutObject` pequeno ou cada parte de um multipart. A evidência de aceitação nativa fica persistida sem reler o destino. Para objetos grandes, `upload_id` e partes aceitas são checkpoints persistentes: uma interrupção retoma somente as partes ausentes. ETag S3 não é tratado como MD5 universal.
+- Reconciliação final sob demanda: lista o destino OCI por chave e tamanho e usa `HeadObject` apenas nos candidatos para conferir a proveniência da origem preservada nos metadados; não relê payload nem chama AWS.
+- Observabilidade local: Status mostra falhas/retries, checkpoints multipart, transferências estagnadas e espaço do volume; `/metrics` oferece a mesma base no formato Prometheus somente em localhost.
 - **Auditoria profunda SHA-256**: operação excepcional que relê todo o objeto OCI e compara o SHA-256 linear. A tela informa volume, tempo mínimo teórico, exige rolar o aviso e marcar confirmação antes de habilitar o início; o Status acompanha o progresso.
 - Metadados S3 são copiados para metadados OCI quando compatíveis; tags são preservadas integralmente no PostgreSQL e em uma representação JSON limitada nos metadados OCI.
 - Ondas de no máximo 10 TB; referência inicial de VM: 8 OCPUs, 32 GB RAM e 500 GB de boot volume.

@@ -220,6 +220,33 @@ def sha256_b64(data: bytes) -> str:
     return base64.b64encode(hashlib.sha256(data).digest()).decode("ascii")
 
 
+def expected_part_size(total_size: int, part_number: int, part_size: int) -> int:
+    """Return the exact size of a 1-based OCI multipart part."""
+    start = (part_number - 1) * part_size
+    return max(0, min(part_size, total_size - start))
+
+
+def multipart_parts_on_oci(client, namespace: str, bucket: str, key: str, upload_id: str) -> dict[int, dict]:
+    """List already accepted parts, including pagination, without reading data."""
+    result: dict[int, dict] = {}
+    page = None
+    while True:
+        kwargs = {"limit": 1000}
+        if page:
+            kwargs["page"] = page
+        response = client.list_multipart_upload_parts(namespace, bucket, key, upload_id, **kwargs)
+        for part in response.data.parts:
+            result[int(part.part_num)] = {"etag": part.etag, "size": int(part.size)}
+        page = getattr(response, "headers", {}).get("opc-next-page")
+        if not page:
+            return result
+
+
+def reusable_multipart_part(remote: dict | None, evidence: dict, expected_size: int) -> bool:
+    """A part is reusable only when OCI and local SHA evidence agree it exists."""
+    return bool(remote and remote.get("size") == expected_size and evidence.get("sha256"))
+
+
 def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: str,
                     object_id: int, rate_bytes_per_second: float, preserve_s3_tags: bool) -> None:
     """Copy one object using an independent database session.
@@ -252,6 +279,13 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
         # equivalent OCI tag API, so their complete evidence remains in the
         # control database and a bounded JSON copy is stored as metadata.
         metadata = {str(k).lower(): str(v) for k, v in response.get("Metadata", {}).items()}
+        # These immutable source facts let a later OCI-only reconciliation
+        # prove that the object is associated with this discovered S3 version
+        # without downloading the payload again.
+        if obj.etag:
+            metadata["s3-oci-source-etag"] = obj.etag
+        if obj.last_modified:
+            metadata["s3-oci-source-last-modified"] = obj.last_modified.isoformat()
         tags_json = json.dumps({tag["Key"]: tag["Value"] for tag in tags}, separators=(",", ":"), ensure_ascii=False)
         if preserve_s3_tags:
             metadata["s3-oci-tags-json"] = tags_json[:1800]
@@ -316,55 +350,96 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
             record_progress(len(payload))
             delivery_algorithm, delivery_checksum = "SHA256", checksum_b64
         else:
-            create = oci_client.create_multipart_upload(
-                namespace, destination_bucket,
-                oci.object_storage.models.CreateMultipartUploadDetails(
-                    object=obj.object_key, content_type=response.get("ContentType"), metadata=metadata,
-                ),
-                opc_checksum_algorithm="SHA256",
-            )
-            upload_id, parts, part_digests = create.data.upload_id, [], []
-            try:
-                part_number = 1
-                while True:
-                    payload = read_part(MULTIPART_PART_SIZE)
-                    if not payload:
-                        break
-                    digest_b64 = sha256_b64(payload)
-                    upload_started = time.monotonic()
-                    uploaded = oci_client.upload_part(
-                        namespace, destination_bucket, obj.object_key, upload_id, part_number, payload,
-                        content_length=len(payload), opc_checksum_algorithm="SHA256", opc_content_sha256=digest_b64,
-                    )
-                    throttle_uploaded(len(payload), upload_started)
-                    record_progress(len(payload))
-                    parts.append(oci.object_storage.models.CommitMultipartUploadPartDetails(
-                        part_num=part_number, etag=uploaded.headers["etag"],
-                    ))
-                    part_digests.append(base64.b64decode(digest_b64))
-                    part_number += 1
-                if not parts:
-                    raise RuntimeError("Multipart upload did not receive any part")
-                oci_client.commit_multipart_upload(
-                    namespace, destination_bucket, obj.object_key, upload_id,
-                    oci.object_storage.models.CommitMultipartUploadDetails(parts_to_commit=parts),
+            # A multipart upload is a durable transaction.  Do not abort it on
+            # a transient failure: its upload id and accepted-part evidence are
+            # checkpointed in PostgreSQL and a subsequent worker resumes it.
+            upload_id = obj.multipart_upload_id
+            persisted_parts = json.loads(obj.multipart_parts_json or "{}")
+            remote_parts: dict[int, dict] = {}
+            if upload_id:
+                try:
+                    remote_parts = multipart_parts_on_oci(oci_client, namespace, destination_bucket, obj.object_key, upload_id)
+                except Exception:
+                    # OCI may have expired or explicitly removed an incomplete
+                    # upload. Clear only the local checkpoint and start a fresh
+                    # transaction; completed destination objects are never removed.
+                    upload_id, persisted_parts, remote_parts = None, {}, {}
+                    obj.multipart_upload_id, obj.multipart_parts_json = None, "{}"
+                    worker_session.commit()
+            if not upload_id:
+                create = oci_client.create_multipart_upload(
+                    namespace, destination_bucket,
+                    oci.object_storage.models.CreateMultipartUploadDetails(
+                        object=obj.object_key, content_type=response.get("ContentType"), metadata=metadata,
+                    ),
                     opc_checksum_algorithm="SHA256",
                 )
-            except Exception:
-                try:
-                    oci_client.abort_multipart_upload(namespace, destination_bucket, obj.object_key, upload_id)
-                except Exception:
-                    pass
-                raise
+                upload_id = create.data.upload_id
+                obj.multipart_upload_id = upload_id
+                obj.multipart_part_size = MULTIPART_PART_SIZE
+                obj.multipart_parts_json, obj.multipart_updated_at = "{}", utcnow()
+                worker_session.commit()
+
+            part_size = int(obj.multipart_part_size or MULTIPART_PART_SIZE)
+            total_parts = (obj.size_bytes + part_size - 1) // part_size
+            completed_bytes = 0
+            parts = []
+            part_digests: list[bytes] = []
+            for part_number in range(1, total_parts + 1):
+                expected_size = expected_part_size(obj.size_bytes, part_number, part_size)
+                remote = remote_parts.get(part_number)
+                evidence = persisted_parts.get(str(part_number), {})
+                if reusable_multipart_part(remote, evidence, expected_size):
+                    completed_bytes += expected_size
+                    part_digests.append(base64.b64decode(evidence["sha256"]))
+                    parts.append(oci.object_storage.models.CommitMultipartUploadPartDetails(part_num=part_number, etag=remote["etag"]))
+                    continue
+
+                start = (part_number - 1) * part_size
+                part_args = dict(args)
+                part_args["Range"] = f"bytes={start}-{start + expected_size - 1}"
+                part_response = s3.get_object(**part_args)
+                payload = part_response["Body"].read()
+                if len(payload) != expected_size:
+                    raise RuntimeError(f"S3 range ended early for multipart part {part_number}: expected {expected_size}, received {len(payload)}")
+                full_digest.update(payload)
+                digest_b64 = sha256_b64(payload)
+                upload_started = time.monotonic()
+                uploaded = oci_client.upload_part(
+                    namespace, destination_bucket, obj.object_key, upload_id, part_number, payload,
+                    content_length=len(payload), opc_checksum_algorithm="SHA256", opc_content_sha256=digest_b64,
+                )
+                throttle_uploaded(len(payload), upload_started)
+                completed_bytes += len(payload)
+                progress_bytes = completed_bytes
+                record_progress(0)
+                persisted_parts[str(part_number)] = {"etag": uploaded.headers["etag"], "size": len(payload), "sha256": digest_b64}
+                obj.multipart_parts_json = json.dumps(persisted_parts, separators=(",", ":"))
+                obj.multipart_updated_at = utcnow()
+                worker_session.commit()
+                parts.append(oci.object_storage.models.CommitMultipartUploadPartDetails(part_num=part_number, etag=uploaded.headers["etag"]))
+                part_digests.append(base64.b64decode(digest_b64))
+            if len(parts) != total_parts:
+                raise RuntimeError("Multipart upload has incomplete part evidence")
+            oci_client.commit_multipart_upload(
+                namespace, destination_bucket, obj.object_key, upload_id,
+                oci.object_storage.models.CommitMultipartUploadDetails(parts_to_commit=parts),
+                opc_checksum_algorithm="SHA256",
+            )
+            obj.multipart_upload_id, obj.multipart_updated_at = None, utcnow()
             delivery_algorithm = "SHA256_MULTIPART"
             delivery_checksum = base64.b64encode(hashlib.sha256(b"".join(part_digests)).digest()).decode("ascii")
-        checksum = full_digest.hexdigest()
+        # A resumed multipart transfer may deliberately skip already-accepted
+        # source ranges, so a linear source SHA-256 is unavailable in that run.
+        # Per-part SHA-256 evidence and OCI acceptance remain the normal
+        # cryptographic control; a deep audit can request a full reread later.
+        checksum = full_digest.hexdigest() if obj.size_bytes <= DIRECT_SHA_LIMIT or not remote_parts else None
         obj.metadata_json, obj.tags_json = json.dumps(response.get("Metadata", {})), tags_json
         obj.source_checksum, obj.destination_checksum = checksum, None
         # OCI independently verifies the submitted SHA-256 before accepting a
         # direct object or every multipart part. This is the normal integrity
         # control; a full destination reread remains an explicit deep audit.
-        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error = "SHA256", None, None
+        obj.checksum_algorithm, obj.integrity_verified_at, obj.integrity_error = ("SHA256" if checksum else "SHA256_MULTIPART_PARTS"), None, None
         obj.delivery_integrity_algorithm = delivery_algorithm
         obj.delivery_integrity_checksum = delivery_checksum
         obj.delivery_integrity_status, obj.delivery_integrity_verified_at = "OCI_ACCEPTED", utcnow()

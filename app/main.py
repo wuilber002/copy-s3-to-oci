@@ -8,7 +8,12 @@ leases durable even if a VM is restarted during a long restore.
 """
 
 from datetime import datetime, timedelta, timezone
-from enum import StrEnum
+from enum import Enum
+try:  # Keep local validation possible on Oracle Linux Python 3.10 too.
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - exercised only on Python < 3.11
+    class StrEnum(str, Enum):
+        pass
 from typing import Generator
 import os
 import csv
@@ -19,7 +24,7 @@ import re
 import shutil
 
 from fastapi import Depends, FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
@@ -92,6 +97,8 @@ class Source(Base):
     destination_validation_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     destination_missing_count: Mapped[int] = mapped_column(Integer, default=0)
     destination_size_mismatch_count: Mapped[int] = mapped_column(Integer, default=0)
+    destination_metadata_mismatch_count: Mapped[int] = mapped_column(Integer, default=0)
+    destination_extra_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="source")
     waves: Mapped[list[Wave]] = relationship(back_populates="source")
@@ -125,6 +132,12 @@ class ObjectRecord(Base):
     delivery_integrity_checksum: Mapped[str | None] = mapped_column(String(256), nullable=True)
     delivery_integrity_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
     delivery_integrity_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # OCI multipart checkpoints are intentionally durable.  They make a VM
+    # restart resume only the missing parts instead of discarding a large file.
+    multipart_upload_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    multipart_part_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    multipart_parts_json: Mapped[str] = mapped_column(Text, default="{}")
+    multipart_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     audit_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     audit_progress_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     audit_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -335,6 +348,10 @@ def create_schema() -> None:
         "delivery_integrity_checksum": "VARCHAR(256)",
         "delivery_integrity_status": "VARCHAR(32)",
         "delivery_integrity_verified_at": "TIMESTAMP WITH TIME ZONE",
+        "multipart_upload_id": "VARCHAR(255)",
+        "multipart_part_size": "INTEGER",
+        "multipart_parts_json": "TEXT NOT NULL DEFAULT '{}'",
+        "multipart_updated_at": "TIMESTAMP WITH TIME ZONE",
         "audit_started_at": "TIMESTAMP WITH TIME ZONE",
         "audit_progress_bytes": "BIGINT NOT NULL DEFAULT 0",
         "audit_progress_at": "TIMESTAMP WITH TIME ZONE",
@@ -355,7 +372,7 @@ def create_schema() -> None:
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
-    source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0"})
+    source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
@@ -460,6 +477,50 @@ def platform_status() -> dict:
             "services": {},
             "last_postgres_backup": None,
         }
+
+
+@app.get("/api/observability")
+def observability(session: Session = Depends(get_session)) -> dict:
+    """Local, non-sensitive operational signals for operators and monitors."""
+    now = utcnow()
+    stale_cutoff = now - timedelta(minutes=10)
+    failed_tasks = session.scalar(select(func.count(Task.id)).where(Task.state == TaskState.FAILED)) or 0
+    retrying_tasks = session.scalar(select(func.count(Task.id)).where(Task.state == TaskState.READY, Task.attempts > 1)) or 0
+    stale_leases = session.scalar(select(func.count(Task.id)).where(Task.state == TaskState.RUNNING, Task.lease_expires_at < now)) or 0
+    recent_failures = session.scalar(select(func.count(Event.id)).where(Event.kind.like("%FAILED%"), Event.created_at >= now - timedelta(hours=24))) or 0
+    active_multipart = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.multipart_upload_id.is_not(None))) or 0
+    stalled_transfers = session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.state == ObjectState.TRANSFERRING,
+        ObjectRecord.transfer_progress_at.is_not(None), ObjectRecord.transfer_progress_at < stale_cutoff,
+    )) or 0
+    volume = shutil.disk_usage("/")
+    return {
+        "generated_at": now, "tasks": {"failed": int(failed_tasks), "retrying": int(retrying_tasks), "stale_leases": int(stale_leases)},
+        "transfers": {"active_multipart_checkpoints": int(active_multipart), "stalled": int(stalled_transfers)},
+        "events": {"failures_last_24h": int(recent_failures)},
+        "disk": {"free_bytes": volume.free, "used_percent": round(volume.used * 100 / volume.total, 2)},
+    }
+
+
+@app.get("/metrics", include_in_schema=False)
+def prometheus_metrics(session: Session = Depends(get_session)) -> Response:
+    """Prometheus text exposition, loopback-only with the rest of the API."""
+    data = observability(session)
+    lines = [
+        "# HELP raijin_failed_tasks Number of failed durable tasks.",
+        "# TYPE raijin_failed_tasks gauge",
+        f"raijin_failed_tasks {data['tasks']['failed']}",
+        "# HELP raijin_retrying_tasks Number of tasks waiting for a retry.",
+        "# TYPE raijin_retrying_tasks gauge",
+        f"raijin_retrying_tasks {data['tasks']['retrying']}",
+        "# HELP raijin_active_multipart_checkpoints Incomplete resumable OCI multipart uploads.",
+        "# TYPE raijin_active_multipart_checkpoints gauge",
+        f"raijin_active_multipart_checkpoints {data['transfers']['active_multipart_checkpoints']}",
+        "# HELP raijin_disk_free_bytes Free bytes on the persistent VM volume.",
+        "# TYPE raijin_disk_free_bytes gauge",
+        f"raijin_disk_free_bytes {data['disk']['free_bytes']}",
+    ]
+    return Response("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
 
 @app.get("/api/readiness")
@@ -1004,17 +1065,18 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
     migration_status = "DESTINATION_DIVERGENT" if source.destination_validation_status == "DIFFERENT" else "COMPLETED" if source.status == "DISCOVERED" and count and (states.get(ObjectState.VERIFIED, 0) == count or (all_transferred and delivery_verified == count)) else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and all_transferred else "IN_PROGRESS" if count else "NOT_STARTED"
     return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states, "migration_status": migration_status,
             "destination_validation": {"status": source.destination_validation_status, "at": source.destination_validation_at,
-                                       "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count},
+                                       "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count,
+                                       "metadata_mismatches": source.destination_metadata_mismatch_count, "extras": source.destination_extra_count},
             "discovery": {"status": source.status, "requested_at": source.discovery_requested_at,
                           "completed_at": source.discovery_completed_at, "error": source.discovery_error}}
 
 
 @app.post("/api/sources/{source_id}/validate-destination")
 def validate_destination(source_id: int, session: Session = Depends(get_session)) -> dict:
-    """Explicitly reconcile the persisted S3 discovery inventory with OCI listing."""
+    """Explicit OCI-only final reconciliation against the durable discovery."""
     source = active_source_or_409(session, source_id)
-    expected = {key: int(size) for key, size in session.execute(
-        select(ObjectRecord.object_key, ObjectRecord.size_bytes).where(ObjectRecord.source_id == source.id)
+    expected = {obj.object_key: obj for obj in session.scalars(
+        select(ObjectRecord).where(ObjectRecord.source_id == source.id)
     )}
     if not expected:
         raise HTTPException(status_code=409, detail="Run discovery before validating the destination")
@@ -1042,12 +1104,27 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
         session.commit()
         raise HTTPException(status_code=502, detail=f"OCI destination validation failed: {type(error).__name__}") from error
     missing = sorted(key for key in expected if key not in found)
-    mismatched = sorted(key for key, size in expected.items() if key in found and found[key] != size)
+    mismatched = sorted(key for key, obj in expected.items() if key in found and found[key] != obj.size_bytes)
+    # The listing establishes coverage cheaply.  HeadObject is performed only
+    # for matching objects and verifies source provenance metadata that the
+    # worker persisted at upload time; no S3 call and no object-body read occur.
+    metadata_mismatched: list[str] = []
+    for key, obj in expected.items():
+        if key not in found or found[key] != obj.size_bytes or not obj.etag:
+            continue
+        try:
+            headers = client.head_object(namespace, source.destination_bucket, key).headers
+            if headers.get("opc-meta-s3-oci-source-etag", "") != obj.etag:
+                metadata_mismatched.append(key)
+        except Exception:
+            metadata_mismatched.append(key)
+    extras = sorted(key for key in found if key not in expected)
     source.destination_validation_at = utcnow()
     source.destination_missing_count, source.destination_size_mismatch_count = len(missing), len(mismatched)
-    source.destination_validation_status = "VALID" if not missing and not mismatched else "DIFFERENT"
+    source.destination_metadata_mismatch_count, source.destination_extra_count = len(metadata_mismatched), len(extras)
+    source.destination_validation_status = "VALID" if not missing and not mismatched and not metadata_mismatched else "DIFFERENT"
     affected_wave_counts: dict[int, int] = {}
-    divergent_keys = missing + mismatched
+    divergent_keys = sorted(set(missing + mismatched + metadata_mismatched))
     for offset in range(0, len(divergent_keys), 1000):
         objects = list(session.scalars(select(ObjectRecord).where(
             ObjectRecord.source_id == source.id, ObjectRecord.object_key.in_(divergent_keys[offset:offset + 1000])
@@ -1056,7 +1133,7 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
             obj.integrity_verified_at, obj.destination_checksum, obj.transferred_at = None, None, None
             obj.delivery_integrity_algorithm, obj.delivery_integrity_checksum = None, None
             obj.delivery_integrity_status, obj.delivery_integrity_verified_at = None, None
-            obj.integrity_error = "OCI destination validation found object missing or with a different size"
+            obj.integrity_error = "OCI destination reconciliation found object missing, size-mismatched, or with mismatched provenance metadata"
             if obj.wave_id:
                 obj.state = ObjectState.WAVE_ASSIGNED
                 affected_wave_counts[obj.wave_id] = affected_wave_counts.get(obj.wave_id, 0) + 1
@@ -1067,9 +1144,9 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
         wave.status, wave.batch_job_id, wave.manifest_key, wave.manifest_etag = "READY_FOR_RESTORE", None, None, None
         wave.last_poll_at, wave.poll_count = None, 0
         record_event(session, "DESTINATION_DIVERGENCE_REOPENED_WAVE", f"Wave reopened after OCI destination validation; {affected_objects} object(s) require reprocessing", source_id=source.id, wave_id=wave.id)
-    record_event(session, "DESTINATION_VALIDATED", f"OCI destination validation: {len(missing)} missing and {len(mismatched)} size mismatch(es)", source_id=source.id)
+    record_event(session, "DESTINATION_VALIDATED", f"OCI destination reconciliation: {len(missing)} missing, {len(mismatched)} size mismatch(es), {len(metadata_mismatched)} metadata mismatch(es), {len(extras)} extra object(s)", source_id=source.id)
     session.commit()
-    return {"source_id": source.id, "status": source.destination_validation_status, "expected": len(expected), "found": len(found), "missing": len(missing), "size_mismatches": len(mismatched), "missing_examples": missing[:50], "size_mismatch_examples": mismatched[:50], "validated_at": source.destination_validation_at}
+    return {"source_id": source.id, "status": source.destination_validation_status, "expected": len(expected), "found": len(found), "missing": len(missing), "size_mismatches": len(mismatched), "metadata_mismatches": len(metadata_mismatched), "extras": len(extras), "missing_examples": missing[:50], "size_mismatch_examples": mismatched[:50], "metadata_mismatch_examples": metadata_mismatched[:50], "extra_examples": extras[:50], "validated_at": source.destination_validation_at}
 
 
 @app.get("/api/sources/{source_id}/inventory")

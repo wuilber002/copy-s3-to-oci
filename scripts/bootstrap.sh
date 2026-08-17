@@ -9,6 +9,17 @@ oci_runtime_config=/etc/s3-oci-migration/oci-runtime.json
 
 mkdir -p "$data_root/postgres" "$secret_root" "$runtime_root"
 chmod 700 "$secret_root"
+# The web service is loopback-only. SSH is the sole administrative entrypoint,
+# and it accepts only the public key provisioned by Terraform/cloud-init.
+install -d -m 0755 /etc/ssh/sshd_config.d
+cat >/etc/ssh/sshd_config.d/99-raijin-key-only.conf <<'EOF'
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+PubkeyAuthentication yes
+PermitRootLogin no
+EOF
+sshd -t && systemctl reload sshd
 if [[ ! -f "$oci_runtime_config" ]]; then
   printf '{"secret_ocids":{}}\n' >"$oci_runtime_config"
 fi
