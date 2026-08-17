@@ -130,9 +130,9 @@ cat >"$WORKDIR/migration-policy.json" <<EOF
       "Condition": {"StringLike": {"s3:prefix": ["${SOURCE_PREFIX}*"]}}
     },
     {
-      "Sid": "ReadAndRestoreSourceObjects",
+      "Sid": "ReadSourceObjectsAndTags",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging", "s3:RestoreObject"],
+      "Action": ["s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging", "s3:GetObjectVersionTagging"],
       "Resource": "${SOURCE_OBJECT_ARN}"
     },
     {
@@ -168,6 +168,8 @@ aws iam put-role-policy \
   --policy-name 's3-oci-migration' \
   --policy-document "file://$WORKDIR/migration-policy.json"
 ```
+
+`LocateControlBucket` é obrigatório mesmo quando a aplicação só grava manifestos sob um prefixo: o pré-check usa `HeadBucket` sem escrita e exige `s3:ListBucket` no ARN do bucket. Não adicione `s3:ListBucket` ao ARN de objetos nem conceda `s3:RestoreObject` a esta role; o restore é executado exclusivamente pela role de S3 Batch Operations abaixo.
 
 Copie o ARN retornado abaixo para o campo **Configurações → ARN da role AWS de migração** na interface web. ARN não é segredo e não deve ser colocado no Vault:
 
