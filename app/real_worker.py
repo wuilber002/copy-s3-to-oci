@@ -38,6 +38,42 @@ ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCES
 # checkpoint and lets the worker resume the accepted OCI parts safely.
 AWS_CLIENT_CONFIG = Config(connect_timeout=10, read_timeout=120, retries={"max_attempts": 4, "mode": "standard"})
 
+# Retrying an invalid policy, a missing bucket, or a malformed Batch request
+# only produces charged calls and hides the actionable fault.  Keep this list
+# deliberately conservative: unknown programming/configuration errors fail
+# visibly, while known service/network pressure is retried by the durable task.
+TRANSIENT_AWS_CODES = {
+    "RequestTimeout", "RequestTimeoutException", "SlowDown", "Throttling",
+    "ThrottlingException", "TooManyRequestsException", "RequestLimitExceeded",
+    "InternalError", "ServiceUnavailable", "ServiceUnavailableException",
+}
+PERMANENT_AWS_CODES = {
+    "AccessDenied", "AccessDeniedException", "AllAccessDisabled", "NoSuchBucket",
+    "NoSuchKey", "NoSuchVersion", "InvalidRequest", "InvalidArgument",
+    "InvalidManifestContent", "MalformedPolicyDocument", "ValidationException",
+    "KMS.NotFoundException", "KMS.AccessDeniedException",
+}
+
+
+def classify_task_error(error: Exception) -> tuple[str, str]:
+    """Classify an external worker failure without exposing AWS response text.
+
+    Returns ``(retry|failed, safe_summary)``.  The SDK already retries bounded
+    request attempts; this decision controls only the durable queue retry.
+    """
+    response = getattr(error, "response", None) or {}
+    metadata, details = response.get("ResponseMetadata", {}), response.get("Error", {})
+    status, code = metadata.get("HTTPStatusCode"), details.get("Code")
+    name = type(error).__name__
+    summary = f"{name} ({status} {code})" if status or code else f"{name}: {str(error)[:500]}"
+    if code in TRANSIENT_AWS_CODES or status in {429, 500, 502, 503, 504}:
+        return "retry", summary
+    if code in PERMANENT_AWS_CODES or (isinstance(status, int) and 400 <= status < 500):
+        return "failed", summary
+    if name in {"EndpointConnectionError", "ConnectTimeoutError", "ReadTimeoutError", "ConnectionClosedError"}:
+        return "retry", summary
+    return "failed", summary
+
 
 def event(session, kind: str, message: str, source_id: int | None = None, wave_id: int | None = None) -> None:
     session.add(Event(kind=kind, message=message, source_id=source_id, wave_id=wave_id))
@@ -138,6 +174,16 @@ def retry(session, task: Task, error: Exception | str, seconds: int | None = Non
     session.commit()
 
 
+def fail_permanently(session, task: Task, error: str) -> None:
+    """End a task that cannot succeed without an operator correction."""
+    task.state, task.lease_expires_at, task.error = TaskState.FAILED, None, error[:8000]
+    wave = session.get(Wave, task.wave_id)
+    if wave and wave.status not in {"PAUSED", "VERIFIED"}:
+        wave.status = "FAILED"
+    event(session, "TASK_FAILED_PERMANENTLY", f"{task.kind} requires operator action: {task.error}", wave_id=task.wave_id)
+    session.commit()
+
+
 def discover(session, source: Source, settings) -> None:
     source.status, source.discovery_error = "DISCOVERING", None
     session.commit()
@@ -199,7 +245,7 @@ def submit_restore(session, task: Task, settings) -> None:
         Description=f"S3 to OCI restore wave {wave.id}",
         ClientRequestToken=f"s3-oci-wave-{wave.id}",
     )
-    wave.batch_job_id, wave.manifest_key, wave.manifest_etag, wave.status = job["JobId"], manifest_key, response["ETag"].strip('"'), "RESTORE_REQUESTED"
+    wave.batch_job_id, wave.batch_job_status, wave.manifest_key, wave.manifest_etag, wave.status = job["JobId"], "Preparing", manifest_key, response["ETag"].strip('"'), "RESTORE_REQUESTED"
     for obj in archives:
         obj.state, obj.restore_requested_at = ObjectState.RESTORE_REQUESTED, utcnow()
     event(session, "BATCH_RESTORE_SUBMITTED", f"Batch job {wave.batch_job_id} submitted for {len(archives)} archive object(s)", source_id=source.id, wave_id=wave.id)
@@ -211,6 +257,7 @@ def poll_restore(session, task: Task, settings) -> None:
     s3, s3control, account_id = aws_clients(settings, source.aws_region)
     if wave.batch_job_id:
         job = s3control.describe_job(AccountId=account_id, JobId=wave.batch_job_id)["Job"]
+        wave.batch_job_status = job.get("Status")
         wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
         if job["Status"] not in {"Complete", "Completed"}:
             wave.status = "RESTORING"
@@ -658,7 +705,12 @@ def run_once() -> None:
             elif task.kind == "TRANSFER_WAVE": transfer_wave(session, task, settings)
             elif task.kind == "VERIFY_WAVE": verify_wave(session, task)
             else: raise RuntimeError(f"Unsupported real worker task {task.kind}")
-        except Exception as error: retry(session, task, error)
+        except Exception as error:
+            disposition, summary = classify_task_error(error)
+            if disposition == "retry":
+                retry(session, task, summary)
+            else:
+                fail_permanently(session, task, summary)
 
 
 if __name__ == "__main__":

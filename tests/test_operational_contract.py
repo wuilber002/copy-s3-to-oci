@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import ObjectRecord, RuntimeSettingsUpdate, Source, destination_provenance_matches, observability, prometheus_metrics, safe_aws_error_summary
+from app.main import ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, prometheus_metrics, restore_queue_details, safe_aws_error_summary
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -61,3 +61,15 @@ def test_multipart_size_runtime_setting_has_safe_bounds():
 def test_aws_error_summary_exposes_only_status_and_code():
     error = type("ClientError", (Exception,), {"response": {"ResponseMetadata": {"HTTPStatusCode": 403}, "Error": {"Code": "AccessDenied", "Message": "sensitive detail"}}})()
     assert safe_aws_error_summary(error) == "ClientError (403 AccessDenied)"
+
+
+def test_restore_queue_contract_exposes_durable_batch_wait_details_only():
+    now = datetime(2026, 8, 17, 12, 0, tzinfo=timezone.utc)
+    wave = type("Wave", (), {"batch_job_id": "job-123", "batch_job_status": "Preparing", "status": "RESTORING", "last_poll_at": now, "poll_count": 3})()
+    task = type("Task", (), {"kind": "POLL_RESTORE", "state": TaskState.READY, "available_at": now, "created_at": datetime(2026, 8, 17, 11, 30, tzinfo=timezone.utc), "error": "Batch job status is Preparing"})()
+    detail = restore_queue_details(wave, task, now)
+    assert detail["batch_job_id"] == "job-123"
+    assert detail["batch_status"] == "Preparing"
+    assert detail["poll_count"] == 3
+    assert detail["waiting_seconds"] == 1800
+    assert detail["next_attempt_at"] == now

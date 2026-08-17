@@ -34,7 +34,7 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker
 - `terraform/orm`: Stack Terraform para OCI Resource Manager e seu formulário.
 - `docs`: arquitetura, deployment, IAM AWS/OCI e plano de validação.
 
-Consulte [arquitetura](docs/architecture.md), [deploy](docs/deployment.md), [IAM AWS](docs/aws-setup.md), [IAM OCI](docs/oci-iam.md) e [plano de validação](docs/validation-test-plan.md).
+Consulte [arquitetura](docs/architecture.md), [deploy](docs/deployment.md), [IAM AWS](docs/aws-setup.md), [IAM OCI](docs/oci-iam.md), [plano de validação](docs/validation-test-plan.md), [teste de objetos grandes](docs/large-object-test-runbook.md) e [cleanup controlado de testes](docs/test-cleanup.md).
 
 ## Uso da console web
 

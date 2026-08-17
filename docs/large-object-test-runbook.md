@@ -25,6 +25,6 @@ Este roteiro valida multipart, retomada e reconciliação sem usar dados de prod
 - O objeto deve manter a mesma chave e tamanho no OCI.
 - O histórico deve mostrar retomada segura; partes OCI já aceitas não devem ser reenviadas.
 - O destino deve preservar ETag e última modificação da versão S3 como metadados de proveniência.
-- Ao final, exclua os objetos sob o prefixo exclusivo no S3 e OCI, arquive a origem de teste e registre o resultado no histórico de testes do cliente.
+- Ao final, use o [procedimento de cleanup controlado](test-cleanup.md), que exige uma lista de chaves exatas, revisão do plano e confirmação explícita antes de remover qualquer objeto. Depois arquive a origem de teste e registre o resultado no histórico de testes do cliente.
 
 Não use este procedimento em objetos Glacier/Deep Archive sem aprovar previamente o restore e seu custo. O teste de Archive deve seguir o roteiro separado em `docs/validation-test-plan.md`.

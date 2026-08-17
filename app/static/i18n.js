@@ -121,6 +121,11 @@
     'Nenhum objeto encontrado para a busca.': 'No objects found for the search.', 'Anterior': 'Previous', 'Próxima': 'Next',
     'Descoberta': 'Discovery', 'Discovery:': 'Discovery:', 'em execução.': 'running.', 'tarefa(s) falha(s). Abra Migrações para investigar.': 'failed task(s). Open Migrations to investigate.',
     'Espaço livre abaixo de 10 GB:': 'Free space below 10 GB:', 'Serviço(s) inativo(s):': 'Inactive service(s):'
+    ,'Observabilidade operacional': 'Operational observability', 'Carregando indicadores operacionais…': 'Loading operational indicators…'
+    ,'Batch Job:': 'Batch job:', 'Status AWS:': 'AWS status:', 'Último poll:': 'Last poll:', 'Próxima tentativa:': 'Next attempt:', 'Tempo aguardando:': 'Waiting time:', 'Último retorno:': 'Last result:'
+    ,'Onda em transferência': 'Wave in transfer', 'Próxima onda da fila': 'Next queued wave', 'Solicitar restore': 'Request restore', 'Aguardar restore': 'Wait for restore', 'Transferir arquivos': 'Transfer files'
+    ,'Tempo acumulado de cópia': 'Accumulated copy time', 'Status da tarefa': 'Task status', 'Workers de transferência': 'Transfer workers', 'Estado': 'State', 'Arquivo': 'File', 'Progresso': 'Progress', 'Demais ondas na fila': 'Other queued waves', 'Etapa': 'Step', 'Tempo acumulado': 'Accumulated time'
+    ,'Não foi possível carregar a fila de transferência.': 'Could not load the transfer queue.', 'Fila de transferência:': 'Transfer queue:'
   };
   let language = localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'pt';
   let translating = false;

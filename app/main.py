@@ -173,6 +173,7 @@ class Wave(Base):
     restore_tier: Mapped[str] = mapped_column(String(16))
     status: Mapped[str] = mapped_column(String(32), default="DRAFT")
     batch_job_id: Mapped[str | None] = mapped_column(String(128), nullable=True, unique=True)
+    batch_job_status: Mapped[str | None] = mapped_column(String(64), nullable=True)
     manifest_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -376,7 +377,7 @@ def create_schema() -> None:
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
-    wave_columns = {"batch_job_id": "VARCHAR(128)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
@@ -760,6 +761,19 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     }
 
 
+def restore_queue_details(wave: Wave, task: Task, now: datetime) -> dict:
+    """Safe, local-only restore diagnostics used by the dashboard queue API."""
+    return {
+        "batch_job_id": wave.batch_job_id,
+        "batch_status": wave.batch_job_status,
+        "last_poll_at": wave.last_poll_at,
+        "poll_count": int(wave.poll_count or 0),
+        "next_attempt_at": task.available_at if task.state == TaskState.READY else None,
+        "waiting_seconds": max(0, int((now - task.created_at).total_seconds())) if task.kind in {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE"} else 0,
+        "last_error": task.error,
+    }
+
+
 @app.get("/api/transfer-queue")
 def transfer_queue(session: Session = Depends(get_session)) -> dict:
     """Queue view for the dashboard; it only reads the local control database."""
@@ -814,6 +828,10 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
             "wave_id": wave.id, "wave_name": wave.name, "source_name": wave.source.name,
             "status": wave.status, "task_kind": task.kind, "task_state": task.state,
             "available_at": task.available_at, "active": active,
+            # Batch data comes from durable local records only.  It makes the
+            # wait explainable without turning dashboard refreshes into AWS API
+            # calls (and therefore without adding request cost).
+            "restore": restore_queue_details(wave, task, now),
             "transferred_files": len(completed), "total_files": len(objects),
             "transferred_bytes": sum(obj.size_bytes for obj in completed),
             "total_bytes": sum(obj.size_bytes for obj in objects),
@@ -1181,7 +1199,7 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
                 obj.state = ObjectState.DISCOVERED
     for wave_id, affected_objects in affected_wave_counts.items():
         wave = session.get(Wave, wave_id)
-        wave.status, wave.batch_job_id, wave.manifest_key, wave.manifest_etag = "READY_FOR_RESTORE", None, None, None
+        wave.status, wave.batch_job_id, wave.batch_job_status, wave.manifest_key, wave.manifest_etag = "READY_FOR_RESTORE", None, None, None, None
         wave.last_poll_at, wave.poll_count = None, 0
         record_event(session, "DESTINATION_DIVERGENCE_REOPENED_WAVE", f"Wave reopened after OCI destination validation; {affected_objects} object(s) require reprocessing", source_id=source.id, wave_id=wave.id)
     record_event(session, "DESTINATION_VALIDATED", f"OCI destination reconciliation: {len(missing)} missing, {len(mismatched)} size mismatch(es), {len(metadata_mismatched)} metadata mismatch(es), {len(extras)} extra object(s)", source_id=source.id)
@@ -1501,7 +1519,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
         ).where(ObjectRecord.wave_id == wave_id)
     ).one()
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
-            "batch": {"job_id": wave.batch_job_id, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
+            "batch": {"job_id": wave.batch_job_id, "status": wave.batch_job_status, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 

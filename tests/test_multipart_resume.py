@@ -16,6 +16,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 from app.real_worker import (
     AWS_CLIENT_CONFIG,
     batch_manifest_fields,
+    classify_task_error,
     WORKER_ID,
     effective_multipart_part_size,
     expected_part_size,
@@ -119,3 +120,18 @@ def test_aws_clients_have_bounded_network_retries():
 def test_batch_manifest_uses_aws_required_csv_field_names():
     assert batch_manifest_fields(False) == ["Bucket", "Key"]
     assert batch_manifest_fields(True) == ["Bucket", "Key", "VersionId"]
+
+
+def test_aws_task_errors_retry_only_for_transient_service_pressure():
+    throttled = type("ClientError", (Exception,), {"response": {"ResponseMetadata": {"HTTPStatusCode": 503}, "Error": {"Code": "SlowDown"}}})()
+    denied = type("ClientError", (Exception,), {"response": {"ResponseMetadata": {"HTTPStatusCode": 403}, "Error": {"Code": "AccessDenied"}}})()
+    malformed = type("ClientError", (Exception,), {"response": {"ResponseMetadata": {"HTTPStatusCode": 400}, "Error": {"Code": "InvalidRequest"}}})()
+    assert classify_task_error(throttled)[0] == "retry"
+    assert classify_task_error(denied)[0] == "failed"
+    assert classify_task_error(malformed)[0] == "failed"
+
+
+def test_unknown_worker_errors_fail_instead_of_looping_indefinitely():
+    disposition, summary = classify_task_error(ValueError("bad local configuration"))
+    assert disposition == "failed"
+    assert "ValueError" in summary
