@@ -25,3 +25,12 @@ def test_aws_connection_interface_never_places_secret_content_in_javascript():
     assert "/api/aws-secrets/refresh" in page
     assert "/api/aws-connections" in page
     assert "bootstrap_secret_access_key" not in page.split("<script>", 1)[1]
+
+
+def test_aws_connection_template_is_formatted_and_copyable():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="aws-secret-json-template"' in page
+    assert "copyAwsSecretTemplate()" in page
+    assert "navigator.clipboard.writeText" in page
+    assert ".json-key" in page and ".json-string" in page
+    assert "Nenhuma conexão AWS cadastrada" in page
