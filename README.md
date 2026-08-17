@@ -19,7 +19,7 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker
 - Uma única VM Linux; PostgreSQL será banco e fila durável.
 - Interface web somente em `localhost`, acessível por túnel SSH.
 - SSH apenas por chave pública/privada; senha, teclado interativo e login root são desabilitados.
-- Vault, Key e Secrets OCI sempre criados pelo Terraform, com placeholders instrutivos.
+- O Terraform pode criar Vault/Key ou reutilizar recursos existentes; a descoberta de conexões AWS usa apenas Secrets OCI que a VM pode inspecionar e ler.
 - Credenciais AWS de bootstrap somente com access key/secret key; a aplicação assume uma role AWS de menor privilégio.
 - Restore em lote via S3 Batch Operations; chamadas AWS por objeto são evitadas sempre que houver alternativa bulk.
 - Integridade padrão por objeto: a cópia calcula SHA-256 na leitura do S3 e o OCI valida SHA-256 antes de aceitar um `PutObject` pequeno ou cada parte de um multipart. A evidência de aceitação nativa fica persistida sem reler o destino. Para objetos grandes, `upload_id`, tamanho de parte e partes aceitas são checkpoints persistentes: uma interrupção retoma somente as partes ausentes. O tamanho-base multipart é configurável em **Configurações → Configuração operacional** (64 MiB por padrão); a plataforma o ajusta automaticamente quando necessário para não ultrapassar o limite OCI de 10.000 partes. ETag S3 não é tratado como MD5 universal.
@@ -34,7 +34,7 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker
 - `terraform/orm`: Stack Terraform para OCI Resource Manager e seu formulário.
 - `docs`: arquitetura, deployment, IAM AWS/OCI e plano de validação.
 
-Consulte [arquitetura](docs/architecture.md), [deploy](docs/deployment.md), [IAM AWS](docs/aws-setup.md), [IAM OCI](docs/oci-iam.md), [plano de validação](docs/validation-test-plan.md), [teste de objetos grandes](docs/large-object-test-runbook.md) e [cleanup controlado de testes](docs/test-cleanup.md).
+Consulte [arquitetura](docs/architecture.md), [deploy](docs/deployment.md), [IAM AWS](docs/aws-setup.md), [IAM OCI](docs/oci-iam.md), [conexões AWS](docs/aws-connections.md), [plano de validação](docs/validation-test-plan.md), [teste de objetos grandes](docs/large-object-test-runbook.md) e [cleanup controlado de testes](docs/test-cleanup.md).
 
 ## Uso da console web
 

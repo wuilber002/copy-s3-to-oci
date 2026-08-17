@@ -12,10 +12,10 @@
 1. Crie um Stack a partir de `terraform/orm` neste repositório.
 2. Preencha o formulário. Use 8 OCPUs, 32 GB e boot volume de 500 GB como ponto de partida.
    A VM aceita administração SSH exclusivamente por chave pública/privada: senha, teclado interativo e login direto de root são desabilitados pelo cloud-init e reforçados pelo bootstrap. A porta 8080 nunca deve ser liberada; ela é publicada apenas em `127.0.0.1` na VM. O cliente pode manter a regra de SSH sem restrição de CIDR conforme sua política, desde que preserve a proteção da chave privada.
-3. Mantenha a criação de Vault, Key e Secrets: esses recursos são obrigatórios e sempre criados.
+3. Escolha criar Vault/Key ou informar os OCIDs de recursos existentes. O stack pode criar os Secrets de plataforma e um template JSON inicial de conexão AWS; quando esses recursos são externos, o cliente deve fornecer o Secret de senha PostgreSQL e as policies correspondentes.
 4. Se criar policy, informe os buckets OCI de destino em `destination_buckets_json`. Agrupe buckets no mesmo compartment sempre que possível.
 5. Aplique o stack. Por padrão, ele cria e associa uma policy de backup incremental diário do boot volume, com retenção de 14 dias. É possível informar uma policy existente em vez disso.
-6. No Console OCI, crie uma nova versão para cada Secret, substituindo o placeholder pelo valor real. Não altere o placeholder via Terraform.
+6. Para conexões AWS, crie ou atualize um único Secret JSON seguindo [Conexões AWS](aws-connections.md). Em **Configurações → Conexões AWS**, atualize os Secrets, cadastre a conexão e execute seu pré-check.
 7. Confirme que a policy automática de backup está associada ao boot volume.
 
 Depois do deploy, abra **Configurações → Inventário de buckets OCI** e use **Atualizar buckets OCI**. A consulta ocorre somente sob demanda via OCI Resource Search no tenancy e o resultado é persistido no PostgreSQL. O cadastro de origem aceita apenas um bucket presente nesse cache; a policy da Dynamic Group continua sendo a autorização efetiva para escrita.
@@ -36,7 +36,7 @@ Depois, acesse `http://127.0.0.1:8080`. A porta da aplicação não deve ser lib
 
 A console é o plano de controle local e persiste suas operações no PostgreSQL da VM. Ela oferece:
 
-- cadastro e seleção de uma origem S3 e de seu bucket OCI de destino;
+- cadastro de conexões AWS reutilizáveis e seleção de uma conexão, origem S3 e bucket OCI de destino;
 - totais e amostra paginada do inventário que foi descoberto;
 - criação manual de uma onda, criação automática por tamanho e criação automática restrita a um prefixo S3, todas de no máximo 10 TB, com tier e duração de restore;
 - prévia local antes da criação automática, com objetos, bytes, estimativa de ondas e alerta para objetos acima do tamanho alvo;

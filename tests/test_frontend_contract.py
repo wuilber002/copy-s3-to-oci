@@ -9,6 +9,8 @@ def test_language_selector_is_available_only_in_interface_settings():
     assert page.count('id="language-selector"') == 1
     assert page.index('id="view-settings"') < page.index('id="language-selector"')
     assert 'id="set-multipart-part-size"' in page
+    assert 'id="aws-connection"' in page
+    assert 'id="aws-connection-secret"' in page
 
 
 def test_translation_catalog_covers_multipart_dynamic_feedback_and_restore_queue():
@@ -16,3 +18,10 @@ def test_translation_catalog_covers_multipart_dynamic_feedback_and_restore_queue
     for phrase in ("Multipart upload", "OCI destination validated", "Missing example:", "Interface language", "Batch job:", "Next attempt:"):
         assert phrase in catalog
     assert "node.nodeType === Node.TEXT_NODE" in catalog
+
+
+def test_aws_connection_interface_never_places_secret_content_in_javascript():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "/api/aws-secrets/refresh" in page
+    assert "/api/aws-connections" in page
+    assert "bootstrap_secret_access_key" not in page.split("<script>", 1)[1]

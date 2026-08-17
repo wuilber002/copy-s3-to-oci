@@ -25,8 +25,8 @@ from botocore.config import Config
 from sqlalchemy import func, or_, select
 
 from app.main import (
-    Event, ObjectRecord, ObjectState, SessionLocal, Source, Task, TaskState,
-    Wave, read_oci_runtime_config, runtime_settings, utcnow,
+    AwsConnection, Event, ObjectRecord, ObjectState, SessionLocal, Source, Task, TaskState,
+    Wave, parse_aws_connection_payload, read_oci_runtime_config, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -90,15 +90,48 @@ def secret_values() -> dict[str, str]:
     return values
 
 
-def aws_clients(settings, region: str):
+def connection_values(connection: AwsConnection) -> dict[str, str]:
+    """Read the current connection payload; credentials never enter PostgreSQL."""
+    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+    bundle = oci.secrets.SecretsClient({}, signer=signer).get_secret_bundle(connection.secret_ocid).data
+    values = parse_aws_connection_payload(base64.b64decode(bundle.secret_bundle_content.content).decode("utf-8").strip())
+    if values["aws_account_id"] != connection.aws_account_id:
+        raise RuntimeError("AWS connection Secret account ID no longer matches its registered connection")
+    return values
+
+
+def aws_operation_config(source: Source, settings) -> dict[str, str]:
+    """Resolve a source-specific AWS identity, retaining legacy settings only for existing sources."""
+    if source.aws_connection:
+        values = connection_values(source.aws_connection)
+        return {
+            "access_key_id": values["bootstrap_access_key_id"],
+            "secret_access_key": values["bootstrap_secret_access_key"],
+            "migration_role_arn": values["migration_role_arn"],
+            "batch_role_arn": values["batch_operations_role_arn"],
+            "control_bucket": values["control_bucket"],
+            # Generated IDs, never a human label, isolate manifests/reports.
+            "control_prefix": f"raijin/connections/{source.aws_connection.id}/sources/{source.id}",
+            "expected_account_id": values["aws_account_id"],
+        }
     values = secret_values()
+    return {
+        "access_key_id": values["aws_access_key_id"], "secret_access_key": values["aws_secret_access_key"],
+        "migration_role_arn": settings.aws_migration_role_arn, "batch_role_arn": settings.aws_batch_role_arn,
+        "control_bucket": settings.aws_control_bucket, "control_prefix": settings.aws_control_prefix.rstrip("/"),
+        "expected_account_id": "",
+    }
+
+
+def aws_clients(settings, region: str, source: Source):
+    values = aws_operation_config(source, settings)
     bootstrap = boto3.Session(
-        aws_access_key_id=values["aws_access_key_id"],
-        aws_secret_access_key=values["aws_secret_access_key"],
+        aws_access_key_id=values["access_key_id"],
+        aws_secret_access_key=values["secret_access_key"],
         region_name=region,
     )
     assumed = bootstrap.client("sts", config=AWS_CLIENT_CONFIG).assume_role(
-        RoleArn=settings.aws_migration_role_arn,
+        RoleArn=values["migration_role_arn"],
         RoleSessionName="s3-oci-migration-worker",
         DurationSeconds=3600,
     )["Credentials"]
@@ -108,10 +141,13 @@ def aws_clients(settings, region: str):
         aws_session_token=assumed["SessionToken"],
         region_name=region,
     )
+    account_id = session.client("sts", config=AWS_CLIENT_CONFIG).get_caller_identity()["Account"]
+    if values["expected_account_id"] and account_id != values["expected_account_id"]:
+        raise RuntimeError("Assumed AWS account does not match the registered AWS connection")
     return (
         session.client("s3", config=AWS_CLIENT_CONFIG),
         session.client("s3control", config=AWS_CLIENT_CONFIG),
-        session.client("sts", config=AWS_CLIENT_CONFIG).get_caller_identity()["Account"],
+        account_id,
     )
 
 
@@ -187,7 +223,7 @@ def fail_permanently(session, task: Task, error: str) -> None:
 def discover(session, source: Source, settings) -> None:
     source.status, source.discovery_error = "DISCOVERING", None
     session.commit()
-    s3, _, _ = aws_clients(settings, source.aws_region)
+    s3, _, _ = aws_clients(settings, source.aws_region, source)
     paginator = s3.get_paginator("list_objects_v2")
     inserted = 0
     for page in paginator.paginate(Bucket=source.s3_bucket, Prefix=source.s3_prefix):
@@ -223,9 +259,10 @@ def submit_restore(session, task: Task, settings) -> None:
         wave.status = "RESTORED"
         succeed(session, task, "TRANSFER_WAVE")
         return
-    if not settings.aws_control_bucket or not settings.aws_batch_role_arn:
+    operation = aws_operation_config(source, settings)
+    if not operation["control_bucket"] or not operation["batch_role_arn"]:
         raise RuntimeError("AWS control bucket and Batch Operations role ARN must be configured")
-    s3, s3control, account_id = aws_clients(settings, source.aws_region)
+    s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
     has_versions = any(obj.version_id for obj in archives)
     output = io.StringIO()
     writer = csv.writer(output, lineterminator="\n")
@@ -234,14 +271,14 @@ def submit_restore(session, task: Task, settings) -> None:
         if has_versions:
             row.append(obj.version_id or "")
         writer.writerow(row)
-    manifest_key = f"{settings.aws_control_prefix.rstrip('/')}/manifests/wave-{wave.id}-{int(time.time())}.csv"
-    response = s3.put_object(Bucket=settings.aws_control_bucket, Key=manifest_key, Body=output.getvalue().encode("utf-8"), ContentType="text/csv")
+    manifest_key = f"{operation['control_prefix'].rstrip('/')}/manifests/wave-{wave.id}-{int(time.time())}.csv"
+    response = s3.put_object(Bucket=operation["control_bucket"], Key=manifest_key, Body=output.getvalue().encode("utf-8"), ContentType="text/csv")
     fields = batch_manifest_fields(has_versions)
     job = s3control.create_job(
-        AccountId=account_id, ConfirmationRequired=False, Priority=10, RoleArn=settings.aws_batch_role_arn,
+        AccountId=account_id, ConfirmationRequired=False, Priority=10, RoleArn=operation["batch_role_arn"],
         Operation={"S3InitiateRestoreObject": {"ExpirationInDays": wave.restore_days, "GlacierJobTier": wave.restore_tier}},
-        Manifest={"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": fields}, "Location": {"ObjectArn": f"arn:aws:s3:::{settings.aws_control_bucket}/{manifest_key}", "ETag": response["ETag"].strip('"')}},
-        Report={"Bucket": f"arn:aws:s3:::{settings.aws_control_bucket}", "Prefix": f"{settings.aws_control_prefix.rstrip('/')}/reports/wave-{wave.id}/", "Format": "Report_CSV_20180820", "Enabled": True, "ReportScope": "AllTasks"},
+        Manifest={"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": fields}, "Location": {"ObjectArn": f"arn:aws:s3:::{operation['control_bucket']}/{manifest_key}", "ETag": response["ETag"].strip('"')}},
+        Report={"Bucket": f"arn:aws:s3:::{operation['control_bucket']}", "Prefix": f"{operation['control_prefix'].rstrip('/')}/reports/wave-{wave.id}/", "Format": "Report_CSV_20180820", "Enabled": True, "ReportScope": "AllTasks"},
         Description=f"S3 to OCI restore wave {wave.id}",
         ClientRequestToken=f"s3-oci-wave-{wave.id}",
     )
@@ -254,7 +291,7 @@ def submit_restore(session, task: Task, settings) -> None:
 
 def poll_restore(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
-    s3, s3control, account_id = aws_clients(settings, source.aws_region)
+    s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
     if wave.batch_job_id:
         job = s3control.describe_job(AccountId=account_id, JobId=wave.batch_job_id)["Job"]
         wave.batch_job_status = job.get("Status")
@@ -562,7 +599,7 @@ def transfer_wave(session, task: Task, settings) -> None:
     # which never needs a restore request.
     wave.status = "TRANSFERRING"
     session.commit()
-    s3, _, _ = aws_clients(settings, source.aws_region)
+    s3, _, _ = aws_clients(settings, source.aws_region, source)
     namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
     if not namespace:
         raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")

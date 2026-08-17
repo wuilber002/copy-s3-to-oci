@@ -12,15 +12,16 @@ ALL {instance.id = '<VM_OCID>'}
 
 ## Policy mínima
 
-Para `N` compartments distintos que guardam buckets de destino, a policy possui `1 + 2N` statements:
+Para `N` compartments distintos que guardam buckets de destino e `S` compartments de Secrets, as policies possuem `2N + 2S` statements:
 
-1. um para ler os Secret Bundles;
+1. um `inspect secret-family` e um `read secret-bundles` por compartment de Secrets;
 2. um `inspect buckets` por compartment de destino, para que o OCI Resource Search retorne apenas metadados desses compartments;
 3. um `manage objects` por compartment distinto de bucket, consolidando todos os buckets autorizados naquele compartment.
 
 Exemplo com três buckets em dois compartments:
 
 ```text
+Allow dynamic-group s3-oci-migration-vm to inspect secret-family in compartment id <SECRETS_COMPARTMENT_OCID>
 Allow dynamic-group s3-oci-migration-vm to read secret-bundles in compartment id <SECRETS_COMPARTMENT_OCID>
 Allow dynamic-group s3-oci-migration-vm to inspect buckets in compartment id <COMPARTMENT_A_OCID>
 Allow dynamic-group s3-oci-migration-vm to manage objects in compartment id <COMPARTMENT_A_OCID> where any {target.bucket.name='destination-finance', target.bucket.name='destination-legal'}

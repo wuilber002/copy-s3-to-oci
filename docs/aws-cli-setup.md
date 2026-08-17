@@ -6,7 +6,7 @@ Este capítulo cria os recursos AWS mínimos para uma origem S3: um usuário de 
 
 ## Antes de começar
 
-É necessário ter permissão para criar usuário, access key, roles e policies IAM, além de criar o bucket de controle. Este procedimento presume uma única conta AWS. Para origem, role ou bucket de controle em contas diferentes, adapte as trust policies e bucket policies com o time IAM.
+É necessário ter permissão para criar usuário, access key, roles e policies IAM, além de criar o bucket de controle. Execute este roteiro uma vez por conta AWS. Cada execução gera uma [conexão AWS](aws-connections.md) independente, que pode ser reutilizada por vários sources dessa conta.
 
 Os nomes abaixo são exemplos. O bucket de controle é criado sem versionamento para que o cleanup opcional seja direto. Ele é apenas para manifestos e relatórios; **nunca** coloque os dados de origem nele.
 
@@ -28,7 +28,7 @@ export BATCH_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/${BATCH_ROLE}"
 export SOURCE_BUCKET_ARN="arn:aws:s3:::${SOURCE_BUCKET}"
 export SOURCE_OBJECT_ARN="${SOURCE_BUCKET_ARN}/${SOURCE_PREFIX}*"
 export CONTROL_BUCKET_ARN="arn:aws:s3:::${CONTROL_BUCKET}"
-export CONTROL_OBJECT_ARN="${CONTROL_BUCKET_ARN}/s3-oci-control/*"
+export CONTROL_OBJECT_ARN="${CONTROL_BUCKET_ARN}/raijin/*"
 
 aws sts get-caller-identity
 ```
@@ -91,12 +91,7 @@ aws iam create-access-key \
   --output text
 ```
 
-No OCI Vault, crie uma nova versão destas Secrets, sem prefixos, aspas ou quebra de linha:
-
-| Secret OCI | Valor |
-| --- | --- |
-| `aws_access_key_id` | primeira coluna da saída |
-| `aws_secret_access_key` | segunda coluna da saída |
+Guarde os dois valores somente durante este roteiro, em local seguro. Ao final, eles serão incluídos em **um único Secret JSON de conexão AWS**; não use mais as antigas Secrets separadas `aws_access_key_id` e `aws_secret_access_key`.
 
 ## 3. Criar a role de migração
 
@@ -171,7 +166,7 @@ aws iam put-role-policy \
 
 `LocateControlBucket` é obrigatório mesmo quando a aplicação só grava manifestos sob um prefixo: o pré-check usa `HeadBucket` sem escrita e exige `s3:ListBucket` no ARN do bucket. Não adicione `s3:ListBucket` ao ARN de objetos nem conceda `s3:RestoreObject` a esta role; o restore é executado exclusivamente pela role de S3 Batch Operations abaixo.
 
-Copie o ARN retornado abaixo para o campo **Configurações → ARN da role AWS de migração** na interface web. ARN não é segredo e não deve ser colocado no Vault:
+Guarde o ARN retornado para compor o Secret JSON de conexão AWS ao final:
 
 ```bash
 aws iam get-role --role-name "$MIGRATION_ROLE" --query 'Role.Arn' --output text
@@ -231,7 +226,7 @@ aws iam put-role-policy \
 aws iam get-role --role-name "$BATCH_ROLE" --query 'Role.Arn' --output text
 ```
 
-Copie esse último ARN para **Configurações → ARN da role AWS Batch Operations**. ARN não é segredo e não deve ser colocado no Vault.
+Guarde esse ARN para compor o Secret JSON de conexão AWS ao final.
 
 ## 5. Verificar e validar na plataforma
 
@@ -243,7 +238,7 @@ aws iam get-role --role-name "$BATCH_ROLE" --query 'Role.AssumeRolePolicyDocumen
 aws s3api head-bucket --bucket "$CONTROL_BUCKET" --region "$AWS_REGION"
 ```
 
-Depois de preencher as duas Secrets AWS no OCI Vault e os dois ARNs em **Configurações**, acesse a interface web por túnel SSH e use **Status → Credenciais e integrações → Validar agora**. O pré-check faz somente `GetCallerIdentity` e `AssumeRole` para a role de migração. Ele não faz discovery, restore, download ou upload.
+Crie um Secret OCI com o schema descrito em [Conexões AWS](aws-connections.md), preenchendo `aws_account_id`, região, access key, secret key, os dois ARNs e `CONTROL_BUCKET`. Depois, na interface, acesse **Configurações → Conexões AWS**, atualize a descoberta, cadastre o Secret e execute o pré-check da conexão. Ele faz somente `GetCallerIdentity`, `AssumeRole` e `HeadBucket` no bucket de controle; não lista objetos de origem, restaura, baixa ou envia dados.
 
 ## Cleanup ao terminar o procedimento
 

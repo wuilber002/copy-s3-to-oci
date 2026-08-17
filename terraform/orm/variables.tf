@@ -90,18 +90,80 @@ variable "resource_name_prefix" {
 }
 
 variable "vault_compartment_ocid" {
-  description = "Compartment where the Vault is created."
+  description = "Compartment where the Vault is created when create_vault_key is true."
   type        = string
+  default     = ""
 }
 
 variable "key_compartment_ocid" {
-  description = "Compartment where the Vault encryption key is created."
+  description = "Compartment where the Vault encryption key is created when create_vault_key is true."
   type        = string
+  default     = ""
 }
 
 variable "secrets_compartment_ocid" {
-  description = "Compartment where the Vault Secrets are created."
+  description = "Primary compartment where the Vault Secrets are created or discovered."
   type        = string
+}
+
+variable "create_vault_key" {
+  description = "Create a new OCI Vault and Key. Set false to use the existing OCIDs below."
+  type        = bool
+  default     = true
+}
+
+variable "existing_vault_ocid" {
+  description = "Existing Vault OCID when create_vault_key is false."
+  type        = string
+  default     = ""
+}
+
+variable "existing_vault_key_ocid" {
+  description = "Existing Vault Key OCID when create_vault_key is false."
+  type        = string
+  default     = ""
+}
+
+variable "secret_compartment_ocids_json" {
+  description = "JSON array of Secret compartment OCIDs that RAIJIN may discover, e.g. [\"ocid1.compartment...\"]."
+  type        = string
+  default     = "[]"
+}
+
+variable "manage_secret_access_policy" {
+  description = "Create least-privilege inspect/read Secret policies in every configured Secret compartment. Disable only when the customer manages those policies externally."
+  type        = bool
+  default     = true
+}
+
+variable "create_platform_secrets" {
+  description = "Create the PostgreSQL password and legacy compatibility Secrets in the selected Vault. Disable only when the customer supplies external_postgres_password_secret_ocid and manages all Secrets externally."
+  type        = bool
+  default     = true
+}
+
+variable "create_initial_aws_connection_secret" {
+  description = "Create one optional JSON-template Secret for the first AWS connection."
+  type        = bool
+  default     = false
+}
+
+variable "initial_aws_connection_secret_name" {
+  description = "Name of the optional initial AWS connection Secret."
+  type        = string
+  default     = ""
+}
+
+variable "initial_aws_connection_secret_compartment_ocid" {
+  description = "Compartment for the optional initial AWS connection Secret; blank uses secrets_compartment_ocid."
+  type        = string
+  default     = ""
+}
+
+variable "external_postgres_password_secret_ocid" {
+  description = "Existing PostgreSQL-password Secret OCID when the customer does not allow Terraform to create platform Secrets."
+  type        = string
+  default     = ""
 }
 
 variable "create_dynamic_group" {

@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, prometheus_metrics, restore_queue_details, safe_aws_error_summary
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -73,3 +73,18 @@ def test_restore_queue_contract_exposes_durable_batch_wait_details_only():
     assert detail["poll_count"] == 3
     assert detail["waiting_seconds"] == 1800
     assert detail["next_attempt_at"] == now
+
+
+def test_aws_connection_secret_schema_requires_matching_account_role_arns():
+    payload = {
+        "schema_version": AWS_CONNECTION_SCHEMA_VERSION, "connection_name": "Finance Production",
+        "aws_account_id": "123456789012", "default_region": "us-east-1",
+        "bootstrap_access_key_id": "AKIAEXAMPLE", "bootstrap_secret_access_key": "secret",
+        "migration_role_arn": "arn:aws:iam::123456789012:role/migration",
+        "batch_operations_role_arn": "arn:aws:iam::123456789012:role/batch",
+        "control_bucket": "finance-raijin-control",
+    }
+    assert parse_aws_connection_payload(__import__("json").dumps(payload))["connection_name"] == "Finance Production"
+    payload["migration_role_arn"] = "arn:aws:iam::000000000000:role/migration"
+    with pytest.raises(ValueError, match="aws_account_id"):
+        parse_aws_connection_payload(__import__("json").dumps(payload))

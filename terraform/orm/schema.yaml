@@ -19,11 +19,20 @@ groupings:
       - resource_name_prefix
       - bootstrap_repository
       - bootstrap_ref
-  - title: Vault and Secrets (always created)
+  - title: Vault, Key and Secrets
     variables:
+      - create_vault_key
       - vault_compartment_ocid
       - key_compartment_ocid
+      - existing_vault_ocid
+      - existing_vault_key_ocid
       - secrets_compartment_ocid
+      - secret_compartment_ocids_json
+      - create_platform_secrets
+      - external_postgres_password_secret_ocid
+      - create_initial_aws_connection_secret
+      - initial_aws_connection_secret_name
+      - initial_aws_connection_secret_compartment_ocid
   - title: Instance principal and OCI policy
     variables:
       - create_dynamic_group
@@ -32,6 +41,7 @@ groupings:
       - create_oci_policy
       - policy_compartment_ocid
       - destination_buckets_json
+      - manage_secret_access_policy
   - title: Recovery
     variables:
       - backup_policy_id
@@ -106,15 +116,62 @@ variables:
   vault_compartment_ocid:
     title: Vault compartment
     type: oci:identity:compartment:id
-    required: true
+    visible: ${create_vault_key}
   key_compartment_ocid:
     title: Key compartment
     type: oci:identity:compartment:id
-    required: true
+    visible: ${create_vault_key}
   secrets_compartment_ocid:
     title: Secrets compartment
     type: oci:identity:compartment:id
     required: true
+  create_vault_key:
+    title: Create Vault and Key
+    type: boolean
+    default: true
+    required: true
+    description: When disabled, provide existing Vault and Key OCIDs. Terraform can still create platform Secrets in that Vault.
+  existing_vault_ocid:
+    title: Existing Vault OCID
+    type: string
+    required: true
+    visible: ${create_vault_key == false}
+  existing_vault_key_ocid:
+    title: Existing Vault Key OCID
+    type: string
+    required: true
+    visible: ${create_vault_key == false}
+  secret_compartment_ocids_json:
+    title: AWS Secret discovery compartments JSON
+    type: string
+    default: '[]'
+    description: Additional compartments whose readable Secrets should appear in RAIJIN after explicit refresh, e.g. ["ocid1.compartment..."].
+  create_platform_secrets:
+    title: Create platform Secrets
+    type: boolean
+    default: true
+    required: true
+    description: Creates the PostgreSQL password and legacy compatibility Secrets. Disable only when the customer supplies them and manages Secret access outside this stack.
+  external_postgres_password_secret_ocid:
+    title: Existing PostgreSQL password Secret OCID
+    type: string
+    required: true
+    visible: ${create_platform_secrets == false}
+  create_initial_aws_connection_secret:
+    title: Create initial AWS connection JSON Secret
+    type: boolean
+    default: false
+    required: true
+    description: Creates an optional template Secret. Replace placeholders, then refresh OCI Secrets and register it in Settings → AWS Connections.
+  initial_aws_connection_secret_name:
+    title: Initial AWS connection Secret name
+    type: string
+    required: true
+    visible: ${create_initial_aws_connection_secret}
+  initial_aws_connection_secret_compartment_ocid:
+    title: Initial Secret compartment (optional)
+    type: oci:identity:compartment:id
+    visible: ${create_initial_aws_connection_secret}
   create_dynamic_group:
     title: Create dynamic group
     type: boolean
@@ -135,7 +192,7 @@ variables:
     type: boolean
     default: true
     required: true
-    description: Warning: OCI limits the number of policy statements by compartment. This stack uses one Secret statement plus two statements per distinct destination-bucket compartment: inspect bucket metadata and manage objects for the selected buckets.
+    description: Warning: OCI limits the number of policy statements by compartment. Destination policies use two statements per distinct bucket compartment; Secret access policies are configured separately and use two statements per Secret compartment.
   policy_compartment_ocid:
     title: Policy compartment
     type: oci:identity:compartment:id
@@ -148,6 +205,12 @@ variables:
     required: true
     visible: ${create_oci_policy}
     description: '[{"name":"destination-a","compartment_id":"ocid1.compartment..."}]. Buckets in the same compartment become one policy statement.'
+  manage_secret_access_policy:
+    title: Create Secret discovery/read policies
+    type: boolean
+    default: true
+    required: true
+    description: Creates two least-privilege statements in each configured Secret compartment: inspect Secret metadata and read Secret bundles. Disable only when the customer creates these policies independently.
   backup_policy_id:
     title: Existing boot-volume backup policy OCID (optional)
     type: string

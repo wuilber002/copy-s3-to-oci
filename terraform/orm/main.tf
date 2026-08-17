@@ -31,11 +31,12 @@ locals {
     )
   ]
 
-  common_policy_statements = [
-    "Allow dynamic-group ${local.dynamic_group_name} to read secret-bundles in compartment id ${var.secrets_compartment_ocid}",
-  ]
+  policy_statements = concat(local.bucket_inspection_policy_statements, local.object_storage_policy_statements)
 
-  policy_statements = concat(local.common_policy_statements, local.bucket_inspection_policy_statements, local.object_storage_policy_statements)
+  secret_compartment_ocids        = distinct(concat([var.secrets_compartment_ocid], jsondecode(var.secret_compartment_ocids_json)))
+  vault_id                        = var.create_vault_key ? oci_kms_vault.migration[0].id : trimspace(var.existing_vault_ocid)
+  vault_key_id                    = var.create_vault_key ? oci_kms_key.migration[0].id : trimspace(var.existing_vault_key_ocid)
+  initial_secret_compartment_ocid = trimspace(var.initial_aws_connection_secret_compartment_ocid) != "" ? var.initial_aws_connection_secret_compartment_ocid : var.secrets_compartment_ocid
 
   effective_backup_policy_id = var.create_boot_volume_backup_policy ? oci_core_volume_backup_policy.migration[0].id : trimspace(var.backup_policy_id)
 
@@ -73,15 +74,17 @@ resource "random_password" "postgres" {
 }
 
 resource "oci_kms_vault" "migration" {
+  count          = var.create_vault_key ? 1 : 0
   compartment_id = var.vault_compartment_ocid
   display_name   = "${var.resource_name_prefix}-vault"
   vault_type     = "DEFAULT"
 }
 
 resource "oci_kms_key" "migration" {
+  count               = var.create_vault_key ? 1 : 0
   compartment_id      = var.key_compartment_ocid
   display_name        = "${var.resource_name_prefix}-key"
-  management_endpoint = oci_kms_vault.migration.management_endpoint
+  management_endpoint = oci_kms_vault.migration[0].management_endpoint
   protection_mode     = "SOFTWARE"
 
   key_shape {
@@ -91,12 +94,12 @@ resource "oci_kms_key" "migration" {
 }
 
 resource "oci_vault_secret" "aws" {
-  for_each = local.secret_placeholders
+  for_each = var.create_platform_secrets ? local.secret_placeholders : {}
 
   compartment_id = var.secrets_compartment_ocid
   secret_name    = "${var.resource_name_prefix}-${replace(each.key, "_", "-")}"
-  vault_id       = oci_kms_vault.migration.id
-  key_id         = oci_kms_key.migration.id
+  vault_id       = local.vault_id
+  key_id         = local.vault_key_id
   description    = "Initial placeholder only. Replace this secret version with the customer value before operating the migration."
 
   secret_content {
@@ -114,10 +117,11 @@ resource "oci_vault_secret" "aws" {
 }
 
 resource "oci_vault_secret" "postgres_password" {
+  count          = var.create_platform_secrets ? 1 : 0
   compartment_id = var.secrets_compartment_ocid
   secret_name    = "${var.resource_name_prefix}-postgres-password"
-  vault_id       = oci_kms_vault.migration.id
-  key_id         = oci_kms_key.migration.id
+  vault_id       = local.vault_id
+  key_id         = local.vault_key_id
   description    = "Automatically generated password for the local migration PostgreSQL user. Rotate only through the documented procedure."
 
   secret_content {
@@ -126,6 +130,34 @@ resource "oci_vault_secret" "postgres_password" {
     name         = "terraform-generated"
     stage        = "CURRENT"
   }
+}
+
+resource "oci_vault_secret" "initial_aws_connection" {
+  count          = var.create_initial_aws_connection_secret ? 1 : 0
+  compartment_id = local.initial_secret_compartment_ocid
+  secret_name    = var.initial_aws_connection_secret_name
+  vault_id       = local.vault_id
+  key_id         = local.vault_key_id
+  description    = "RAIJIN AWS connection JSON template. Replace all placeholders before registering the connection in the web console."
+
+  secret_content {
+    content_type = "BASE64"
+    content = base64encode(jsonencode({
+      schema_version              = 1
+      connection_name             = "REPLACE_WITH_IMMUTABLE_LABEL"
+      aws_account_id              = "123456789012"
+      default_region              = "us-east-1"
+      bootstrap_access_key_id     = "REPLACE_WITH_ACCESS_KEY_ID"
+      bootstrap_secret_access_key = "REPLACE_WITH_SECRET_ACCESS_KEY"
+      migration_role_arn          = "arn:aws:iam::123456789012:role/s3-oci-migration-role"
+      batch_operations_role_arn   = "arn:aws:iam::123456789012:role/s3-oci-batch-restore-role"
+      control_bucket              = "REPLACE_WITH_UNIQUE_CONTROL_BUCKET"
+    }))
+    name  = "initial-template"
+    stage = "CURRENT"
+  }
+
+  lifecycle { ignore_changes = [secret_content] }
 }
 
 moved {
@@ -139,8 +171,18 @@ moved {
 }
 
 moved {
-  from = oci_vault_secret.migration["postgres_password"]
-  to   = oci_vault_secret.postgres_password
+  from = oci_kms_vault.migration
+  to   = oci_kms_vault.migration[0]
+}
+
+moved {
+  from = oci_kms_key.migration
+  to   = oci_kms_key.migration[0]
+}
+
+moved {
+  from = oci_vault_secret.postgres_password
+  to   = oci_vault_secret.postgres_password[0]
 }
 
 resource "oci_core_instance" "migration" {
@@ -171,8 +213,10 @@ resource "oci_core_instance" "migration" {
         }
         secret_ocids = merge(
           { for name, secret in oci_vault_secret.aws : name => secret.id },
-          { postgres_password = oci_vault_secret.postgres_password.id },
+          { postgres_password = var.create_platform_secrets ? oci_vault_secret.postgres_password[0].id : var.external_postgres_password_secret_ocid },
         )
+        secrets_compartment_ocid = var.secrets_compartment_ocid
+        secret_compartment_ocids = local.secret_compartment_ocids
       })
     }))
   }
@@ -188,6 +232,18 @@ resource "oci_core_instance" "migration" {
     # cloud-init is first-boot configuration. Updating release metadata must
     # never replace a persistent migration VM.
     ignore_changes = [metadata["user_data"]]
+    precondition {
+      condition     = var.create_vault_key || (trimspace(var.existing_vault_ocid) != "" && trimspace(var.existing_vault_key_ocid) != "")
+      error_message = "Provide existing_vault_ocid and existing_vault_key_ocid when create_vault_key is false."
+    }
+    precondition {
+      condition     = var.create_platform_secrets || trimspace(var.external_postgres_password_secret_ocid) != ""
+      error_message = "Provide external_postgres_password_secret_ocid when create_platform_secrets is false."
+    }
+    precondition {
+      condition     = !var.create_initial_aws_connection_secret || trimspace(var.initial_aws_connection_secret_name) != ""
+      error_message = "Provide initial_aws_connection_secret_name when creating the initial AWS connection Secret."
+    }
   }
 }
 
@@ -220,6 +276,17 @@ resource "oci_identity_policy" "migration_vm" {
       error_message = "Provide policy_compartment_ocid when create_oci_policy is true."
     }
   }
+}
+
+resource "oci_identity_policy" "secret_access" {
+  for_each       = var.manage_secret_access_policy ? toset(local.secret_compartment_ocids) : toset([])
+  compartment_id = each.value
+  name           = "${var.resource_name_prefix}-secret-access-${substr(md5(each.value), 0, 8)}"
+  description    = "Least-privilege Secret discovery and read access for ${var.resource_name_prefix} VM."
+  statements = [
+    "Allow dynamic-group ${local.dynamic_group_name} to inspect secret-family in compartment id ${each.value}",
+    "Allow dynamic-group ${local.dynamic_group_name} to read secret-bundles in compartment id ${each.value}",
+  ]
 }
 
 resource "oci_core_volume_backup_policy" "migration" {

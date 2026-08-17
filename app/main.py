@@ -87,6 +87,7 @@ class Source(Base):
     s3_bucket: Mapped[str] = mapped_column(String(255))
     s3_prefix: Mapped[str] = mapped_column(String(1024), default="")
     aws_region: Mapped[str] = mapped_column(String(64))
+    aws_connection_id: Mapped[int | None] = mapped_column(ForeignKey("aws_connections.id"), nullable=True, index=True)
     destination_bucket: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="CONFIGURED")
     discovery_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -102,6 +103,39 @@ class Source(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="source")
     waves: Mapped[list[Wave]] = relationship(back_populates="source")
+    aws_connection: Mapped["AwsConnection | None"] = relationship(back_populates="sources")
+
+
+class AwsConnection(Base):
+    """Immutable local identity for one customer-managed AWS credential Secret."""
+    __tablename__ = "aws_connections"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    label: Mapped[str] = mapped_column(String(255), unique=True)
+    secret_ocid: Mapped[str] = mapped_column(String(255), unique=True)
+    aws_account_id: Mapped[str] = mapped_column(String(12), index=True)
+    default_region: Mapped[str] = mapped_column(String(64))
+    control_bucket: Mapped[str] = mapped_column(String(255))
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    sources: Mapped[list["Source"]] = relationship(back_populates="aws_connection")
+
+
+class AwsSecretCache(Base):
+    """Non-sensitive cache of Secrets checked during an explicit refresh."""
+    __tablename__ = "aws_secret_cache"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    secret_ocid: Mapped[str] = mapped_column(String(255), unique=True)
+    name: Mapped[str] = mapped_column(String(255))
+    compartment_id: Mapped[str] = mapped_column(String(255))
+    schema_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    connection_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    aws_account_id: Mapped[str | None] = mapped_column(String(12), nullable=True)
+    default_region: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    valid: Mapped[bool] = mapped_column(default=False, index=True)
+    validation_error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
 class ObjectRecord(Base):
@@ -239,11 +273,17 @@ class SourceCreate(BaseModel):
     s3_bucket: str
     s3_prefix: str = ""
     aws_region: str
+    aws_connection_id: int | None = None
     destination_bucket: str
 
 
 class SourceUpdate(SourceCreate):
     pass
+
+
+class AwsConnectionCreate(BaseModel):
+    secret_ocid: str = Field(min_length=20, max_length=255)
+    label: str = Field(min_length=1, max_length=255)
 
 
 class InventoryItem(BaseModel):
@@ -374,7 +414,7 @@ def create_schema() -> None:
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "aws_connection_id": "INTEGER"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
@@ -465,6 +505,59 @@ def safe_aws_error_summary(error: Exception) -> str:
 def read_oci_runtime_config() -> dict:
     with open(oci_runtime_config_file, encoding="utf-8") as config_file:
         return json.load(config_file)
+
+
+AWS_CONNECTION_SCHEMA_VERSION = 1
+
+
+def parse_aws_connection_payload(content: str) -> dict:
+    """Validate a Secret payload without ever returning its credential values."""
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as error:
+        raise ValueError("Secret content is not valid JSON") from error
+    if not isinstance(payload, dict) or payload.get("schema_version") != AWS_CONNECTION_SCHEMA_VERSION:
+        raise ValueError(f"Expected schema_version {AWS_CONNECTION_SCHEMA_VERSION}")
+    required = ("connection_name", "aws_account_id", "default_region", "bootstrap_access_key_id",
+                "bootstrap_secret_access_key", "migration_role_arn", "batch_operations_role_arn", "control_bucket")
+    missing = [name for name in required if not isinstance(payload.get(name), str) or not payload[name].strip()]
+    if missing:
+        raise ValueError(f"Missing or empty field(s): {', '.join(missing)}")
+    placeholders = [name for name in required if payload[name].strip().startswith("REPLACE_") or "..." in payload[name]]
+    if placeholders:
+        raise ValueError(f"Placeholder value(s) must be replaced: {', '.join(placeholders)}")
+    account_id = payload["aws_account_id"].strip()
+    if not re.fullmatch(r"[0-9]{12}", account_id):
+        raise ValueError("aws_account_id must contain 12 digits")
+    for field in ("migration_role_arn", "batch_operations_role_arn"):
+        if not re.fullmatch(rf"arn:(aws|aws-us-gov|aws-cn):iam::{account_id}:role/.+", payload[field].strip()):
+            raise ValueError(f"{field} must be a role ARN for aws_account_id")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", payload["control_bucket"].strip()):
+        raise ValueError("control_bucket is not a valid S3 bucket name")
+    return {name: value.strip() if isinstance(value, str) else value for name, value in payload.items()}
+
+
+def aws_secret_payload(secret_ocid: str) -> dict:
+    """Read one OCI Secret only in the backend and return validated data."""
+    import oci
+    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+    bundle = oci.secrets.SecretsClient({}, signer=signer).get_secret_bundle(secret_ocid).data
+    return parse_aws_connection_payload(base64.b64decode(bundle.secret_bundle_content.content).decode("utf-8").strip())
+
+
+def connection_or_404(session: Session, connection_id: int) -> AwsConnection:
+    connection = session.get(AwsConnection, connection_id)
+    if not connection:
+        raise HTTPException(status_code=404, detail="AWS connection not found")
+    return connection
+
+
+def connection_summary(session: Session, connection: AwsConnection) -> dict:
+    sources = session.scalar(select(func.count(Source.id)).where(Source.aws_connection_id == connection.id)) or 0
+    return {"id": connection.id, "label": connection.label, "secret_ocid": connection.secret_ocid,
+            "aws_account_id": connection.aws_account_id, "default_region": connection.default_region,
+            "control_bucket": connection.control_bucket, "archived_at": connection.archived_at,
+            "created_at": connection.created_at, "sources": int(sources)}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -957,6 +1050,151 @@ def refresh_oci_bucket_cache(session: Session = Depends(get_session)) -> dict:
     return {"buckets": len(found), "refreshed_at": now}
 
 
+@app.get("/api/aws-secrets")
+def list_aws_secret_cache(session: Session = Depends(get_session)) -> dict:
+    secrets = list(session.scalars(select(AwsSecretCache).order_by(AwsSecretCache.name, AwsSecretCache.secret_ocid)))
+    return {"secrets": [{"ocid": item.secret_ocid, "name": item.name, "compartment_id": item.compartment_id,
+                          "schema_version": item.schema_version, "connection_name": item.connection_name,
+                          "aws_account_id": item.aws_account_id, "default_region": item.default_region,
+                          "valid": item.valid, "validation_error": item.validation_error,
+                          "refreshed_at": item.refreshed_at} for item in secrets],
+            "compatible": sum(1 for item in secrets if item.valid),
+            "refreshed_at": max((item.refreshed_at for item in secrets), default=None)}
+
+
+@app.post("/api/aws-secrets/refresh")
+def refresh_aws_secret_cache(session: Session = Depends(get_session)) -> dict:
+    """Explicitly inspect readable Secrets and cache only compatibility metadata."""
+    try:
+        runtime = read_oci_runtime_config()
+        compartments = runtime.get("secret_compartment_ocids") or ([runtime["secrets_compartment_ocid"]] if runtime.get("secrets_compartment_ocid") else [])
+        if not compartments:
+            raise RuntimeError("No Secret compartments are configured")
+        import oci
+        signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
+        vaults = oci.vault.VaultsClient({}, signer=signer)
+        secrets_client = oci.secrets.SecretsClient({}, signer=signer)
+        listed = []
+        for compartment_id in compartments:
+            page = None
+            while True:
+                response = vaults.list_secrets(compartment_id=compartment_id, limit=1000, page=page)
+                listed.extend((item, compartment_id) for item in response.data)
+                page = response.next_page
+                if not page:
+                    break
+    except Exception as error:
+        raise HTTPException(status_code=502, detail=f"OCI Secret discovery failed: {type(error).__name__}") from error
+
+    now, seen, compatible = utcnow(), set(), 0
+    for secret, compartment_id in listed:
+        secret_ocid = getattr(secret, "id", None)
+        if not secret_ocid:
+            continue
+        seen.add(secret_ocid)
+        cached = session.scalar(select(AwsSecretCache).where(AwsSecretCache.secret_ocid == secret_ocid))
+        if not cached:
+            cached = AwsSecretCache(secret_ocid=secret_ocid, name=getattr(secret, "secret_name", secret_ocid), compartment_id=compartment_id)
+            session.add(cached)
+        cached.name, cached.compartment_id, cached.refreshed_at = getattr(secret, "secret_name", secret_ocid), compartment_id, now
+        cached.valid, cached.validation_error = False, None
+        cached.schema_version = cached.connection_name = cached.aws_account_id = cached.default_region = None
+        try:
+            bundle = secrets_client.get_secret_bundle(secret_ocid).data
+            payload = parse_aws_connection_payload(base64.b64decode(bundle.secret_bundle_content.content).decode("utf-8").strip())
+            cached.schema_version = payload["schema_version"]
+            cached.connection_name, cached.aws_account_id, cached.default_region = payload["connection_name"], payload["aws_account_id"], payload["default_region"]
+            cached.valid, compatible = True, compatible + 1
+        except Exception as error:
+            cached.validation_error = str(error)[:512]
+    if seen:
+        session.query(AwsSecretCache).filter(AwsSecretCache.secret_ocid.not_in(seen)).delete(synchronize_session=False)
+    else:
+        session.query(AwsSecretCache).delete(synchronize_session=False)
+    record_event(session, "AWS_SECRET_CACHE_REFRESHED", f"Checked {len(seen)} readable OCI Secret(s); {compatible} match AWS connection schema v{AWS_CONNECTION_SCHEMA_VERSION}")
+    session.commit()
+    return {"secrets": len(seen), "compatible": compatible, "refreshed_at": now}
+
+
+@app.get("/api/aws-connections")
+def list_aws_connections(session: Session = Depends(get_session)) -> list[dict]:
+    return [connection_summary(session, item) for item in session.scalars(select(AwsConnection).order_by(AwsConnection.id))]
+
+
+@app.post("/api/aws-connections", status_code=201)
+def create_aws_connection(payload: AwsConnectionCreate, session: Session = Depends(get_session)) -> dict:
+    cached = session.scalar(select(AwsSecretCache).where(AwsSecretCache.secret_ocid == payload.secret_ocid, AwsSecretCache.valid.is_(True)))
+    if not cached:
+        raise HTTPException(status_code=422, detail="Refresh OCI Secrets and choose a compatible AWS connection Secret")
+    if session.scalar(select(AwsConnection.id).where(AwsConnection.secret_ocid == payload.secret_ocid)):
+        raise HTTPException(status_code=409, detail="This Secret is already registered as an AWS connection")
+    if session.scalar(select(AwsConnection.id).where(AwsConnection.label == payload.label.strip())):
+        raise HTTPException(status_code=409, detail="AWS connection label already exists")
+    try:
+        secret = aws_secret_payload(payload.secret_ocid)
+    except Exception as error:
+        raise HTTPException(status_code=422, detail=f"AWS connection Secret is no longer compatible: {type(error).__name__}") from error
+    duplicate_bucket = session.scalar(select(AwsConnection.id).where(
+        AwsConnection.aws_account_id == secret["aws_account_id"], AwsConnection.control_bucket == secret["control_bucket"]
+    ))
+    if duplicate_bucket:
+        raise HTTPException(status_code=409, detail="This AWS account/control bucket pair is already registered")
+    connection = AwsConnection(label=payload.label.strip(), secret_ocid=payload.secret_ocid,
+                               aws_account_id=secret["aws_account_id"], default_region=secret["default_region"], control_bucket=secret["control_bucket"])
+    session.add(connection)
+    session.flush()
+    record_event(session, "AWS_CONNECTION_CREATED", f"AWS connection '{connection.label}' registered for account {connection.aws_account_id}")
+    session.commit()
+    return connection_summary(session, connection)
+
+
+@app.post("/api/aws-connections/{connection_id}/archive")
+def archive_aws_connection(connection_id: int, session: Session = Depends(get_session)) -> dict:
+    connection = connection_or_404(session, connection_id)
+    if not session.scalar(select(Source.id).where(Source.aws_connection_id == connection.id)):
+        raise HTTPException(status_code=409, detail="An unused AWS connection should be deleted, not archived")
+    connection.archived_at = utcnow()
+    record_event(session, "AWS_CONNECTION_ARCHIVED", f"AWS connection '{connection.label}' archived; historical sources retained")
+    session.commit()
+    return connection_summary(session, connection)
+
+
+@app.post("/api/aws-connections/{connection_id}/precheck")
+def precheck_aws_connection(connection_id: int, session: Session = Depends(get_session)) -> dict:
+    """Validate one connection with STS and its control bucket, never listing source data."""
+    connection = connection_or_404(session, connection_id)
+    try:
+        payload = aws_secret_payload(connection.secret_ocid)
+        import boto3
+        from botocore.config import Config
+        config = Config(connect_timeout=10, read_timeout=30, retries={"max_attempts": 3, "mode": "standard"})
+        bootstrap = boto3.Session(aws_access_key_id=payload["bootstrap_access_key_id"], aws_secret_access_key=payload["bootstrap_secret_access_key"], region_name=payload["default_region"])
+        assumed = bootstrap.client("sts", config=config).assume_role(RoleArn=payload["migration_role_arn"], RoleSessionName="raijin-connection-precheck", DurationSeconds=900)["Credentials"]
+        role = boto3.Session(aws_access_key_id=assumed["AccessKeyId"], aws_secret_access_key=assumed["SecretAccessKey"], aws_session_token=assumed["SessionToken"], region_name=payload["default_region"])
+        account_id = role.client("sts", config=config).get_caller_identity()["Account"]
+        if account_id != connection.aws_account_id or account_id != payload["aws_account_id"]:
+            raise RuntimeError("Assumed account does not match registered connection")
+        role.client("s3", config=config).head_bucket(Bucket=payload["control_bucket"])
+    except Exception as error:
+        record_event(session, "AWS_CONNECTION_PRECHECK_FAILED", f"AWS connection '{connection.label}' pre-check failed: {safe_aws_error_summary(error)}")
+        session.commit()
+        raise HTTPException(status_code=422, detail=f"AWS connection pre-check failed: {safe_aws_error_summary(error)}") from error
+    record_event(session, "AWS_CONNECTION_PRECHECK_VALIDATED", f"AWS connection '{connection.label}' validated for account {account_id}")
+    session.commit()
+    return {"id": connection.id, "status": "VALIDATED", "aws_account_id": account_id, "control_bucket": connection.control_bucket}
+
+
+@app.delete("/api/aws-connections/{connection_id}")
+def delete_aws_connection(connection_id: int, session: Session = Depends(get_session)) -> dict:
+    connection = connection_or_404(session, connection_id)
+    if session.scalar(select(Source.id).where(Source.aws_connection_id == connection.id)):
+        raise HTTPException(status_code=409, detail="An AWS connection with sources must be archived, not deleted")
+    session.delete(connection)
+    record_event(session, "AWS_CONNECTION_DELETED", f"Unused AWS connection '{connection.label}' deleted")
+    session.commit()
+    return {"id": connection_id, "deleted": True}
+
+
 @app.get("/api/sources")
 def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     sources = list(session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id)))
@@ -979,6 +1217,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
         return "IN_PROGRESS" if total else "NOT_STARTED"
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
+             "aws_connection_id": s.aws_connection_id,
+             "aws_connection_label": s.aws_connection.label if s.aws_connection else "Legacy global AWS configuration",
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
              "discovery_error": s.discovery_error, "archived_at": s.archived_at,
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
@@ -991,8 +1231,16 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
 def create_source(payload: SourceCreate, session: Session = Depends(get_session)) -> dict:
     if session.scalar(select(Source).where(Source.name == payload.name)):
         raise HTTPException(status_code=409, detail="Source name already exists")
+    if payload.aws_connection_id is None:
+        raise HTTPException(status_code=422, detail="Select an AWS connection before creating a source")
     if not session.scalar(select(OciBucketCache.id).where(OciBucketCache.name == payload.destination_bucket)):
         raise HTTPException(status_code=422, detail="Choose a destination bucket from the OCI cache; refresh it in Settings first")
+    if payload.aws_connection_id is not None:
+        connection = connection_or_404(session, payload.aws_connection_id)
+        if connection.archived_at:
+            raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by new sources")
+        if payload.aws_region != connection.default_region:
+            raise HTTPException(status_code=422, detail="Source AWS region must match the selected AWS connection")
     source = Source(**payload.model_dump())
     session.add(source)
     session.flush()
@@ -1013,6 +1261,12 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
         raise HTTPException(status_code=409, detail="Source name already exists")
     if not session.scalar(select(OciBucketCache.id).where(OciBucketCache.name == payload.destination_bucket)):
         raise HTTPException(status_code=422, detail="Choose a destination bucket from the OCI cache; refresh it in Settings first")
+    if payload.aws_connection_id is not None:
+        connection = connection_or_404(session, payload.aws_connection_id)
+        if connection.archived_at:
+            raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by sources")
+        if payload.aws_region != connection.default_region:
+            raise HTTPException(status_code=422, detail="Source AWS region must match the selected AWS connection")
     for field, value in payload.model_dump().items():
         setattr(source, field, value)
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
