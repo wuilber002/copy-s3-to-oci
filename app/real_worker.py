@@ -238,7 +238,8 @@ def multipart_parts_on_oci(client, namespace: str, bucket: str, key: str, upload
         # The OCI SDK returns a bare list for this operation (unlike several
         # list APIs that wrap rows in a `.parts` attribute).
         for part in getattr(response.data, "parts", response.data):
-            result[int(part.part_num)] = {"etag": part.etag, "size": int(part.size)}
+            part_number = getattr(part, "part_number", getattr(part, "part_num", None))
+            result[int(part_number)] = {"etag": part.etag, "size": int(part.size)}
         page = getattr(response, "headers", {}).get("opc-next-page")
         if not page:
             return result
