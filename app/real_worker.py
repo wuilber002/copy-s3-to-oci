@@ -26,7 +26,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, Event, ObjectRecord, ObjectState, SessionLocal, Source, Task, TaskState,
-    Wave, parse_aws_connection_payload, read_oci_runtime_config, runtime_settings, utcnow,
+    Wave, parse_aws_connection_payload, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -79,17 +79,6 @@ def event(session, kind: str, message: str, source_id: int | None = None, wave_i
     session.add(Event(kind=kind, message=message, source_id=source_id, wave_id=wave_id))
 
 
-def secret_values() -> dict[str, str]:
-    config = read_oci_runtime_config()
-    signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-    client = oci.secrets.SecretsClient({}, signer=signer)
-    values = {}
-    for name in ("aws_access_key_id", "aws_secret_access_key"):
-        bundle = client.get_secret_bundle(config["secret_ocids"][name]).data
-        values[name] = base64.b64decode(bundle.secret_bundle_content.content).decode().strip()
-    return values
-
-
 def connection_values(connection: AwsConnection) -> dict[str, str]:
     """Read the current connection payload; credentials never enter PostgreSQL."""
     signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
@@ -101,25 +90,19 @@ def connection_values(connection: AwsConnection) -> dict[str, str]:
 
 
 def aws_operation_config(source: Source, settings) -> dict[str, str]:
-    """Resolve a source-specific AWS identity, retaining legacy settings only for existing sources."""
-    if source.aws_connection:
-        values = connection_values(source.aws_connection)
-        return {
-            "access_key_id": values["bootstrap_access_key_id"],
-            "secret_access_key": values["bootstrap_secret_access_key"],
-            "migration_role_arn": values["migration_role_arn"],
-            "batch_role_arn": values["batch_operations_role_arn"],
-            "control_bucket": values["control_bucket"],
-            # Generated IDs, never a human label, isolate manifests/reports.
-            "control_prefix": f"raijin/connections/{source.aws_connection.id}/sources/{source.id}",
-            "expected_account_id": values["aws_account_id"],
-        }
-    values = secret_values()
+    """Resolve the immutable source-specific AWS connection configuration."""
+    if not source.aws_connection:
+        raise RuntimeError("Source has no AWS connection; migrate or archive it before worker execution")
+    values = connection_values(source.aws_connection)
     return {
-        "access_key_id": values["aws_access_key_id"], "secret_access_key": values["aws_secret_access_key"],
-        "migration_role_arn": settings.aws_migration_role_arn, "batch_role_arn": settings.aws_batch_role_arn,
-        "control_bucket": settings.aws_control_bucket, "control_prefix": settings.aws_control_prefix.rstrip("/"),
-        "expected_account_id": "",
+        "access_key_id": values["bootstrap_access_key_id"],
+        "secret_access_key": values["bootstrap_secret_access_key"],
+        "migration_role_arn": values["migration_role_arn"],
+        "batch_role_arn": values["batch_operations_role_arn"],
+        "control_bucket": values["control_bucket"],
+        # Generated IDs, never a human label, isolate manifests/reports.
+        "control_prefix": f"raijin/connections/{source.aws_connection.id}/sources/{source.id}",
+        "expected_account_id": values["aws_account_id"],
     }
 
 

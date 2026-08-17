@@ -50,6 +50,21 @@ Only currently compatible Secrets appear in the registration combobox. A
 connection already registered remains in the database if a later Secret version
 is invalid; its pre-check and operations then report the incompatibility.
 
+## Retiring a legacy installation
+
+Older RAIJIN releases used global AWS fields and separate credential Secrets.
+Before upgrading, register and pre-check an equivalent JSON connection. For
+each active source, use the audited connection-adoption operation; it verifies
+the AWS region, migration role, Batch Operations role and control bucket before
+changing only the source-to-connection reference. Inventory, waves, queue and
+events are retained unchanged. Once every active source has a connection,
+RAIJIN clears the global AWS configuration and no worker fallback remains.
+
+Terraform then removes only the legacy access-key and secret-key Secrets it
+previously managed. Customer-created legacy Secrets should be scheduled for
+deletion through the OCI Console after the connection pre-check and a normal
+worker cycle have succeeded.
+
 ## Terraform options
 
 The Resource Manager stack supports three operating modes:

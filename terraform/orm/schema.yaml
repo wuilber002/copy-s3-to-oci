@@ -151,7 +151,7 @@ variables:
     type: boolean
     default: true
     required: true
-    description: Creates the PostgreSQL password and legacy compatibility Secrets. Disable only when the customer supplies them and manages Secret access outside this stack.
+    description: Creates the PostgreSQL password Secret. Disable only when the customer supplies it and manages Secret access outside this stack.
   external_postgres_password_secret_ocid:
     title: Existing PostgreSQL password Secret OCID
     type: string

@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -97,3 +97,9 @@ def test_aws_connection_secret_schema_requires_matching_account_role_arns():
 
 def test_oci_secret_discovery_uses_the_vaultsecret_resource_type():
     assert OCI_VAULT_SECRET_SEARCH_QUERY == "query vaultsecret resources"
+
+
+def test_legacy_source_adoption_requires_a_concrete_connection_id():
+    assert LegacySourceConnectionMigration(aws_connection_id=1).aws_connection_id == 1
+    with pytest.raises(ValidationError):
+        LegacySourceConnectionMigration(aws_connection_id=0)

@@ -137,7 +137,7 @@ variable "manage_secret_access_policy" {
 }
 
 variable "create_platform_secrets" {
-  description = "Create the PostgreSQL password and legacy compatibility Secrets in the selected Vault. Disable only when the customer supplies external_postgres_password_secret_ocid and manages all Secrets externally."
+  description = "Create the PostgreSQL password Secret in the selected Vault. Disable only when the customer supplies external_postgres_password_secret_ocid and manages Secrets externally."
   type        = bool
   default     = true
 }

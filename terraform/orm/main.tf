@@ -40,20 +40,6 @@ locals {
 
   effective_backup_policy_id = var.create_boot_volume_backup_policy ? oci_core_volume_backup_policy.migration[0].id : trimspace(var.backup_policy_id)
 
-  secret_placeholders = {
-    aws_access_key_id     = <<-EOT
-      REPLACE_THIS_PLACEHOLDER.
-      Enter the AWS Access Key ID for the bootstrap IAM principal.
-      This principal must be permitted only to call sts:AssumeRole on the migration role configured in the web interface.
-      See docs/aws-setup.md before replacing this value.
-    EOT
-    aws_secret_access_key = <<-EOT
-      REPLACE_THIS_PLACEHOLDER.
-      Enter the AWS Secret Access Key paired with aws-access-key-id.
-      Do not enter a session token. This credential is used only to assume the migration role.
-      See docs/aws-setup.md before replacing this value.
-    EOT
-  }
 }
 
 data "oci_objectstorage_namespace" "migration" {
@@ -90,29 +76,6 @@ resource "oci_kms_key" "migration" {
   key_shape {
     algorithm = "AES"
     length    = 32
-  }
-}
-
-resource "oci_vault_secret" "aws" {
-  for_each = var.create_platform_secrets ? local.secret_placeholders : {}
-
-  compartment_id = var.secrets_compartment_ocid
-  secret_name    = "${var.resource_name_prefix}-${replace(each.key, "_", "-")}"
-  vault_id       = local.vault_id
-  key_id         = local.vault_key_id
-  description    = "Initial placeholder only. Replace this secret version with the customer value before operating the migration."
-
-  secret_content {
-    content_type = "BASE64"
-    content      = base64encode(trimspace(each.value))
-    name         = "initial-placeholder"
-    stage        = "CURRENT"
-  }
-
-  # The initial version is only an instruction. The operator replaces it in
-  # Vault; subsequent Terraform runs must never rotate it back to a placeholder.
-  lifecycle {
-    ignore_changes = [secret_content]
   }
 }
 
@@ -161,16 +124,6 @@ resource "oci_vault_secret" "initial_aws_connection" {
 }
 
 moved {
-  from = oci_vault_secret.migration["aws_access_key_id"]
-  to   = oci_vault_secret.aws["aws_access_key_id"]
-}
-
-moved {
-  from = oci_vault_secret.migration["aws_secret_access_key"]
-  to   = oci_vault_secret.aws["aws_secret_access_key"]
-}
-
-moved {
   from = oci_kms_vault.migration
   to   = oci_kms_vault.migration[0]
 }
@@ -211,10 +164,9 @@ resource "oci_core_instance" "migration" {
         destination_compartment_names = {
           for compartment_id, compartment in data.oci_identity_compartment.destination : compartment_id => compartment.name
         }
-        secret_ocids = merge(
-          { for name, secret in oci_vault_secret.aws : name => secret.id },
-          { postgres_password = var.create_platform_secrets ? oci_vault_secret.postgres_password[0].id : var.external_postgres_password_secret_ocid },
-        )
+        secret_ocids = {
+          postgres_password = var.create_platform_secrets ? oci_vault_secret.postgres_password[0].id : var.external_postgres_password_secret_ocid
+        }
         secrets_compartment_ocid = var.secrets_compartment_ocid
         secret_compartment_ocids = local.secret_compartment_ocids
       })

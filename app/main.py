@@ -286,6 +286,11 @@ class SourceUpdate(SourceCreate):
     pass
 
 
+class LegacySourceConnectionMigration(BaseModel):
+    """One-way adoption of a pre-connection source without changing audit data."""
+    aws_connection_id: int = Field(gt=0)
+
+
 class AwsConnectionCreate(BaseModel):
     secret_ocid: str = Field(min_length=20, max_length=255)
     label: str = Field(min_length=1, max_length=255)
@@ -342,10 +347,6 @@ class RuntimeSettingsUpdate(BaseModel):
     default_restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
     task_lease_seconds: int = Field(ge=30, le=3600)
     simulation_enabled: bool = False
-    aws_migration_role_arn: str = Field(default="", max_length=2048, pattern=r"^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/.+")
-    aws_batch_role_arn: str = Field(default="", max_length=2048, pattern=r"^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/.+")
-    aws_control_bucket: str = Field(default="", max_length=255, pattern=r"^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
-    aws_control_prefix: str = Field(default="s3-oci-control/", max_length=1024)
     preserve_s3_tags: bool = True
     real_worker_enabled: bool = False
 
@@ -488,9 +489,7 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "multipart_part_size_mib": settings.multipart_part_size_mib,
             "default_wave_size_bytes": settings.default_wave_size_bytes, "default_restore_days": settings.default_restore_days,
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
-            "simulation_enabled": settings.simulation_enabled, "aws_migration_role_arn": settings.aws_migration_role_arn,
-            "aws_batch_role_arn": settings.aws_batch_role_arn, "aws_control_bucket": settings.aws_control_bucket,
-            "aws_control_prefix": settings.aws_control_prefix, "real_worker_enabled": settings.real_worker_enabled,
+            "simulation_enabled": settings.simulation_enabled, "real_worker_enabled": settings.real_worker_enabled,
             "preserve_s3_tags": settings.preserve_s3_tags,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
             "activity_refresh_seconds": settings.activity_refresh_seconds, "updated_at": settings.updated_at}
@@ -690,9 +689,7 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
     except Exception as error:  # SDK exposes several auth-specific exception types.
         return {"ready": False, "checks": [{"name": "Identidade dinâmica OCI", "status": "FAILED", "detail": type(error).__name__}]}
 
-    expected_secrets = ["aws_access_key_id", "aws_secret_access_key", "postgres_password"]
-    secret_values: dict[str, str] = {}
-    for secret_name in expected_secrets:
+    for secret_name in ["postgres_password"]:
         secret_ocid = secret_ocids.get(secret_name)
         if not secret_ocid:
             checks.append({"name": f"Secret {secret_name}", "status": "NOT_CONFIGURED", "detail": "OCID ausente"})
@@ -702,8 +699,6 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
             encoded_content = bundle.secret_bundle_content.content
             content = base64.b64decode(encoded_content).decode("utf-8").strip()
             status = "PLACEHOLDER" if content.startswith("REPLACE_THIS_PLACEHOLDER") else "CONFIGURED"
-            if status == "CONFIGURED":
-                secret_values[secret_name] = content
             detail = "valor preenchido; a validação funcional é exibida nos cartões AWS" if status == "CONFIGURED" else "placeholder ainda não substituído"
             if secret_name == "postgres_password" and status == "CONFIGURED":
                 probe_engine = create_engine(URL.create("postgresql+psycopg", username="migration", password=content, host="postgres", port=5432, database="migration"), pool_pre_ping=True)
@@ -720,41 +715,23 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
         except Exception as error:
             checks.append({"name": f"Secret {secret_name}", "status": "FAILED", "detail": type(error).__name__})
 
-    settings = runtime_settings(session)
-    migration_role_arn = settings.aws_migration_role_arn.strip()
-    batch_role_arn = settings.aws_batch_role_arn.strip()
-    checks.append({"name": "Configuração role AWS de migração", "status": "CONFIGURED" if migration_role_arn else "NOT_CONFIGURED", "detail": "ARN preenchido na tela Configurações" if migration_role_arn else "preencha o ARN na tela Configurações"})
-    checks.append({"name": "Configuração role AWS Batch Operations", "status": "CONFIGURED" if batch_role_arn else "NOT_CONFIGURED", "detail": "ARN preenchido; validação ocorrerá ao criar o primeiro job" if batch_role_arn else "preencha o ARN na tela Configurações"})
-    control_bucket = settings.aws_control_bucket.strip()
-    checks.append({"name": "Bucket AWS de controle", "status": "CONFIGURED" if control_bucket else "NOT_CONFIGURED", "detail": "bucket configurado; a autorização será testada sem gravar objetos" if control_bucket else "preencha o bucket de manifestos e relatórios"})
-    aws_required = ["aws_access_key_id", "aws_secret_access_key"]
-    if all(name in secret_values for name in aws_required) and migration_role_arn:
+    connections = list(session.scalars(select(AwsConnection).where(AwsConnection.archived_at.is_(None)).order_by(AwsConnection.id)))
+    if not connections:
+        checks.append({"name": "AWS connections", "status": "NOT_CONFIGURED", "detail": "register an AWS connection before operating sources"})
+    for connection in connections:
         try:
+            payload = aws_secret_payload(connection.secret_ocid)
             import boto3
-            aws_region = session.scalar(select(Source.aws_region).order_by(Source.id)) or "us-east-1"
-            sts = boto3.client("sts", region_name=aws_region, aws_access_key_id=secret_values["aws_access_key_id"], aws_secret_access_key=secret_values["aws_secret_access_key"])
-            sts.get_caller_identity()
-            assumed = sts.assume_role(RoleArn=migration_role_arn, RoleSessionName="s3-oci-readiness", DurationSeconds=900)["Credentials"]
-            for check in checks:
-                if check["name"] in {"Secret aws_access_key_id", "Secret aws_secret_access_key", "Configuração role AWS de migração"}:
-                    check["status"] = "VALIDATED"
-                    check["detail"] = "validada no teste AWS STS e AssumeRole"
-            checks.append({"name": "Credenciais AWS e role de migração", "status": "VALIDATED", "detail": "GetCallerIdentity e AssumeRole concluídos"})
-            if control_bucket:
-                try:
-                    s3 = boto3.client("s3", region_name=aws_region, aws_access_key_id=assumed["AccessKeyId"], aws_secret_access_key=assumed["SecretAccessKey"], aws_session_token=assumed["SessionToken"])
-                    s3.head_bucket(Bucket=control_bucket)
-                    for check in checks:
-                        if check["name"] == "Bucket AWS de controle":
-                            check["status"], check["detail"] = "VALIDATED", "HeadBucket concluído; sem escrita"
-                except Exception as error:
-                    for check in checks:
-                        if check["name"] == "Bucket AWS de controle":
-                            check["status"], check["detail"] = "CONFIGURED", f"configurado, mas HeadBucket falhou: {safe_aws_error_summary(error)}"
+            sts = boto3.client("sts", region_name=payload["default_region"], aws_access_key_id=payload["bootstrap_access_key_id"], aws_secret_access_key=payload["bootstrap_secret_access_key"])
+            assumed = sts.assume_role(RoleArn=payload["migration_role_arn"], RoleSessionName="raijin-readiness", DurationSeconds=900)["Credentials"]
+            role = boto3.Session(aws_access_key_id=assumed["AccessKeyId"], aws_secret_access_key=assumed["SecretAccessKey"], aws_session_token=assumed["SessionToken"], region_name=payload["default_region"])
+            account_id = role.client("sts").get_caller_identity()["Account"]
+            if account_id != connection.aws_account_id:
+                raise RuntimeError("Assumed account differs from registered connection")
+            role.client("s3").head_bucket(Bucket=payload["control_bucket"])
+            checks.append({"name": f"AWS connection {connection.label}", "status": "VALIDATED", "detail": f"account {account_id}; control bucket validated"})
         except Exception as error:
-            checks.append({"name": "Credenciais AWS e role de migração", "status": "CONFIGURED", "detail": f"preenchidas, mas teste falhou: {type(error).__name__}"})
-    else:
-        checks.append({"name": "Credenciais AWS e role de migração", "status": "NOT_CONFIGURED", "detail": "preencha as duas Secrets AWS e o ARN da role de migração"})
+            checks.append({"name": f"AWS connection {connection.label}", "status": "FAILED", "detail": safe_aws_error_summary(error)})
 
     try:
         if not object_storage_namespace:
@@ -1224,7 +1201,7 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
              "aws_connection_id": s.aws_connection_id,
-             "aws_connection_label": s.aws_connection.label if s.aws_connection else "Legacy global AWS configuration",
+             "aws_connection_label": s.aws_connection.label if s.aws_connection else "Unassigned AWS connection",
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
              "discovery_error": s.discovery_error, "archived_at": s.archived_at,
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
@@ -1278,6 +1255,73 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
+
+
+@app.post("/api/sources/{source_id}/migrate-aws-connection")
+def migrate_legacy_source_connection(source_id: int, payload: LegacySourceConnectionMigration, session: Session = Depends(get_session)) -> dict:
+    """Adopt a legacy source into an equivalent immutable AWS connection."""
+    source = active_source_or_409(session, source_id)
+    if source.aws_connection_id is not None:
+        raise HTTPException(status_code=409, detail="This source already uses an AWS connection")
+    running = session.scalar(
+        select(func.count(Task.id)).join(Wave).where(Wave.source_id == source.id, Task.state == TaskState.RUNNING)
+    ) or 0
+    if running:
+        raise HTTPException(status_code=409, detail="Pause or wait for running tasks before migrating this source")
+    connection = connection_or_404(session, payload.aws_connection_id)
+    if connection.archived_at:
+        raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by sources")
+    if source.aws_region != connection.default_region:
+        raise HTTPException(status_code=422, detail="Source AWS region must match the AWS connection")
+    settings = runtime_settings(session)
+    try:
+        values = aws_secret_payload(connection.secret_ocid)
+    except Exception as error:
+        raise HTTPException(status_code=422, detail=f"AWS connection Secret is no longer compatible: {type(error).__name__}") from error
+    if not (
+        values["migration_role_arn"] == settings.aws_migration_role_arn.strip()
+        and values["batch_operations_role_arn"] == settings.aws_batch_role_arn.strip()
+        and values["control_bucket"] == settings.aws_control_bucket.strip()
+    ):
+        raise HTTPException(status_code=422, detail="AWS connection must match the legacy roles and control bucket for audited source migration")
+    source.aws_connection_id = connection.id
+    record_event(session, "SOURCE_AWS_CONNECTION_MIGRATED", f"Source '{source.name}' adopted AWS connection '{connection.label}' without changing inventory or waves", source_id=source.id)
+    # Archived test/history sources never execute again and must not keep a
+    # retired credential path alive for active operations.
+    remaining_legacy = session.scalar(select(func.count(Source.id)).where(
+        Source.id != source.id, Source.aws_connection_id.is_(None), Source.archived_at.is_(None)
+    )) or 0
+    legacy_cleared = False
+    if not remaining_legacy:
+        settings.aws_migration_role_arn = ""
+        settings.aws_batch_role_arn = ""
+        settings.aws_control_bucket = ""
+        settings.aws_control_prefix = ""
+        legacy_cleared = True
+        record_event(session, "LEGACY_AWS_CONFIGURATION_CLEARED", "All sources use immutable AWS connections; legacy runtime AWS configuration cleared")
+    session.commit()
+    return {"id": source.id, "name": source.name, "aws_connection_id": connection.id, "aws_connection_label": connection.label, "legacy_configuration_cleared": legacy_cleared}
+
+
+@app.post("/api/legacy-aws/retire")
+def retire_legacy_aws_configuration(session: Session = Depends(get_session)) -> dict:
+    """Erase retired global AWS settings after every active source is connected."""
+    legacy_sources = session.scalar(select(func.count(Source.id)).where(
+        Source.aws_connection_id.is_(None), Source.archived_at.is_(None)
+    )) or 0
+    if legacy_sources:
+        raise HTTPException(status_code=409, detail="Migrate or archive every active legacy source before retiring global AWS configuration")
+    running = session.scalar(select(func.count(Task.id)).where(Task.state == TaskState.RUNNING)) or 0
+    if running:
+        raise HTTPException(status_code=409, detail="Pause or wait for running tasks before retiring global AWS configuration")
+    settings = runtime_settings(session)
+    settings.aws_migration_role_arn = ""
+    settings.aws_batch_role_arn = ""
+    settings.aws_control_bucket = ""
+    settings.aws_control_prefix = ""
+    record_event(session, "LEGACY_AWS_CONFIGURATION_CLEARED", "Global AWS roles, control bucket and prefix cleared after connection migration")
+    session.commit()
+    return {"retired": True}
 
 
 def source_has_executed_wave(session: Session, source_id: int) -> bool:
