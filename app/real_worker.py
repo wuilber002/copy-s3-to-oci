@@ -380,7 +380,11 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
                 create = oci_client.create_multipart_upload(
                     namespace, destination_bucket,
                     oci.object_storage.models.CreateMultipartUploadDetails(
-                        object=obj.object_key, content_type=response.get("ContentType"), metadata=metadata,
+                        object=obj.object_key, content_type=response.get("ContentType"),
+                        # PutObject receives opc_meta without the wire prefix,
+                        # while CreateMultipartUploadDetails expects the exact
+                        # OCI metadata header names.
+                        metadata={f"opc-meta-{key}": value for key, value in metadata.items()},
                     ),
                     opc_checksum_algorithm="SHA256",
                 )
