@@ -1375,12 +1375,49 @@ def sync_source_aws_region(source_id: int, session: Session = Depends(get_sessio
         raise HTTPException(status_code=422, detail=f"Source AWS region lookup failed: {safe_aws_error_summary(error)}") from error
     previous = source.aws_region
     source.aws_bucket_region, source.aws_region = actual, actual
-    superseded = session.query(Task).join(Wave).filter(
-        Wave.source_id == source.id, Task.kind.in_(["SUBMIT_BATCH_RESTORE", "POLL_RESTORE"]), Task.state == TaskState.READY
-    ).update({Task.state: TaskState.FAILED, Task.error: "Superseded after source AWS region synchronization"}, synchronize_session=False)
-    record_event(session, "SOURCE_AWS_REGION_SYNCED", f"Source '{source.name}' region synchronized from {previous} to {actual}; {superseded} pending restore task(s) superseded", source_id=source.id)
+    pending_task_ids = select(Task.id).join(Wave).where(
+        Wave.source_id == source.id,
+        Task.kind.in_(["SUBMIT_BATCH_RESTORE", "POLL_RESTORE"]),
+        Task.state == TaskState.READY,
+    )
+    # SQLAlchemy deliberately disallows UPDATE against a joined ORM query.
+    # Select the immutable task ids first, then update the base table.  This is
+    # also safe when a source has several historical waves.
+    superseded = session.query(Task).filter(Task.id.in_(pending_task_ids)).update(
+        {Task.state: TaskState.FAILED, Task.error: "Superseded after source AWS region synchronization"},
+        synchronize_session=False,
+    )
+
+    invalidated_waves = 0
+    active_restore_states = ["RESTORE_REQUESTED", "RESTORING", "RESTORE_REQUEST_ACCEPTED"]
+    for wave in session.scalars(select(Wave).where(Wave.source_id == source.id, Wave.status.in_(active_restore_states))):
+        # Retain an immutable local record of the old Batch job before it is
+        # invalidated.  It may never be treated as proof that a restore request
+        # was accepted; the operator must explicitly reprocess the wave.
+        if wave.batch_job_id and not session.scalar(select(RestoreAttempt.id).where(RestoreAttempt.job_id == wave.batch_job_id)):
+            session.add(RestoreAttempt(
+                wave_id=wave.id,
+                aws_region=previous,
+                job_id=wave.batch_job_id,
+                job_status=wave.batch_job_status or "INVALIDATED_REGION_MISMATCH",
+                manifest_key=wave.manifest_key,
+                manifest_etag=wave.manifest_etag,
+                expected_objects=session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id)) or 0,
+                failure_summary="Invalidated after AWS source-region synchronization; operator must reprocess this wave.",
+                completed_at=utcnow(),
+            ))
+        for obj in session.scalars(select(ObjectRecord).where(
+            ObjectRecord.wave_id == wave.id,
+            ObjectRecord.state.in_([ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING]),
+        )):
+            obj.state, obj.restored_at = ObjectState.WAVE_ASSIGNED, None
+        wave.status = "RESTORE_REQUEST_FAILED"
+        wave.batch_job_status = "INVALIDATED_REGION_MISMATCH"
+        invalidated_waves += 1
+        record_event(session, "RESTORE_INVALIDATED_BY_REGION_SYNC", f"Wave '{wave.name}' restore state invalidated after AWS region changed from {previous} to {actual}; reprocess is required", source_id=source.id, wave_id=wave.id)
+    record_event(session, "SOURCE_AWS_REGION_SYNCED", f"Source '{source.name}' region synchronized from {previous} to {actual}; {superseded} pending restore task(s) and {invalidated_waves} active restore wave(s) invalidated", source_id=source.id)
     session.commit()
-    return {"source_id": source.id, "previous_region": previous, "aws_region": actual, "superseded_tasks": superseded}
+    return {"source_id": source.id, "previous_region": previous, "aws_region": actual, "superseded_tasks": superseded, "invalidated_waves": invalidated_waves}
 
 
 @app.post("/api/sources/{source_id}/migrate-aws-connection")

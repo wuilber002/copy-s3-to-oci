@@ -39,6 +39,16 @@ def test_restore_preflight_blocks_source_region_mismatch_before_batch_submission
         validate_restore_preflight(None, source, Client(), {"control_bucket": "control"})
 
 
+def test_source_region_sync_uses_base_task_update_and_invalidates_old_restore_state():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index("def sync_source_aws_region")
+    end = source.index("\n\n@app.post(\"/api/sources/{source_id}/migrate-aws-connection\")", start)
+    handler = source[start:end]
+    assert "Task.id.in_(pending_task_ids)" in handler
+    assert "RESTORE_INVALIDATED_BY_REGION_SYNC" in handler
+    assert "INVALIDATED_REGION_MISMATCH" in handler
+
+
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):
     class Data:
         def __getitem__(self, key):
