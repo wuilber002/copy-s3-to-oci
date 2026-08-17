@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import os
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -13,11 +14,14 @@ os.environ.setdefault("POSTGRES_PASSWORD_FILE", str(_password))
 os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.json")
 
 from app.real_worker import (
+    WORKER_ID,
     effective_multipart_part_size,
     expected_part_size,
     multipart_audit_matches,
     multipart_parts_on_oci,
     reusable_multipart_part,
+    utcnow,
+    worker_can_reclaim_lease,
 )
 
 
@@ -94,3 +98,11 @@ def test_multipart_part_size_is_increased_only_when_needed_for_oci_part_limit():
     assert effective_multipart_part_size(128 * mib, 64 * mib) == 64 * mib
     total_size = 10_001 * 64 * mib
     assert effective_multipart_part_size(total_size, 64 * mib) == (total_size + 9_999) // 10_000
+
+
+def test_worker_identity_is_stable_for_restart_reclaim():
+    assert WORKER_ID.startswith("aws-oci-worker-")
+    now = utcnow()
+    assert worker_can_reclaim_lease(WORKER_ID, now + timedelta(minutes=5), now)
+    assert not worker_can_reclaim_lease("another-worker", now + timedelta(minutes=5), now)
+    assert worker_can_reclaim_lease("another-worker", now - timedelta(seconds=1), now)

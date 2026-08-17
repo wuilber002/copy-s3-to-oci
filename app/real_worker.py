@@ -67,9 +67,23 @@ def aws_clients(settings, region: str):
     return session.client("s3"), session.client("s3control"), session.client("sts").get_caller_identity()["Account"]
 
 
+def worker_can_reclaim_lease(task_worker_id: str | None, lease_expires_at, now) -> bool:
+    """Whether this single-VM worker may recover an interrupted task now."""
+    return task_worker_id == WORKER_ID or not lease_expires_at or lease_expires_at < now
+
+
 def claim_task(session, lease_seconds: int) -> Task | None:
     now = utcnow()
-    available = (Task.state == TaskState.READY) | ((Task.state == TaskState.RUNNING) & (Task.lease_expires_at < now))
+    # The worker id is stable for this single-VM architecture.  After a
+    # controlled service/VM restart, the replacement process can therefore
+    # reclaim *its own* in-flight lease immediately and resume a multipart
+    # checkpoint instead of idling until the previous lease timeout. A task
+    # owned by another worker remains protected until that lease expires.
+    available = (Task.state == TaskState.READY) | (
+        (Task.state == TaskState.RUNNING) & (
+            (Task.lease_expires_at < now) | (Task.worker_id == WORKER_ID)
+        )
+    )
     # A wave owns one durable transfer task, but a process restart can leave a
     # still-valid lease behind. Never claim another transfer task while one is
     # live, even if other task kinds remain eligible in the queue.
