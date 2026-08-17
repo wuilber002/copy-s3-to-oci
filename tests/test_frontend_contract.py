@@ -50,3 +50,9 @@ def test_source_summary_identifies_its_aws_connection_with_an_orange_tag():
     assert "aws_connection_label" in page
     assert "AWS Connections:" in page
     assert "#fb923c" in page
+
+
+def test_transfer_queue_uses_compact_style_for_batch_job_id():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert ".queue-restore code" in page
+    assert "padding:.18rem .35rem" in page
