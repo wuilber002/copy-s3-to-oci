@@ -216,6 +216,7 @@ class RuntimeSettings(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     transfer_workers: Mapped[int] = mapped_column(Integer, default=4)
     max_throughput_mbps: Mapped[int] = mapped_column(Integer, default=1100)
+    multipart_part_size_mib: Mapped[int] = mapped_column(Integer, default=64)
     default_wave_size_bytes: Mapped[int] = mapped_column(BigInteger, default=10 * 1024**4)
     default_restore_days: Mapped[int] = mapped_column(Integer, default=7)
     default_restore_tier: Mapped[str] = mapped_column(String(16), default="BULK")
@@ -289,6 +290,7 @@ class TaskUpdate(BaseModel):
 class RuntimeSettingsUpdate(BaseModel):
     transfer_workers: int = Field(ge=1, le=64)
     max_throughput_mbps: int = Field(ge=1, le=1200)
+    multipart_part_size_mib: int = Field(ge=16, le=512)
     default_wave_size_bytes: int = Field(gt=0, le=10 * 1024**4)
     default_restore_days: int = Field(ge=1, le=30)
     default_restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
@@ -367,6 +369,7 @@ def create_schema() -> None:
         "aws_control_prefix": "VARCHAR(1024) NOT NULL DEFAULT 's3-oci-control/'",
         "preserve_s3_tags": "BOOLEAN NOT NULL DEFAULT TRUE",
         "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "multipart_part_size_mib": "INTEGER NOT NULL DEFAULT 64",
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
     }
@@ -436,6 +439,7 @@ def runtime_settings(session: Session) -> RuntimeSettings:
 
 def settings_dict(settings: RuntimeSettings) -> dict:
     return {"transfer_workers": settings.transfer_workers, "max_throughput_mbps": settings.max_throughput_mbps,
+            "multipart_part_size_mib": settings.multipart_part_size_mib,
             "default_wave_size_bytes": settings.default_wave_size_bytes, "default_restore_days": settings.default_restore_days,
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
             "simulation_enabled": settings.simulation_enabled, "aws_migration_role_arn": settings.aws_migration_role_arn,

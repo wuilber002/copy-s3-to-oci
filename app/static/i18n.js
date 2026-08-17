@@ -30,6 +30,8 @@
     'Confiança': 'Trust', 'Integridade comprovada': 'Proven integrity',
     'A cópia registra evidências SHA-256; auditoria profunda fica disponível sob demanda.': 'Transfers record SHA-256 evidence; deep audit is available on demand.',
     'Configuração operacional': 'Operational configuration',
+    'Interface': 'Interface', 'Idioma da interface': 'Interface language',
+    'Parte do upload': 'Multipart upload', 'multipart (MiB)': 'part (MiB)',
     'Workers de': 'Workers', 'transferência': 'transfer',
     'Limite de throughput': 'Throughput limit', 'Tamanho padrão da': 'Default wave', 'onda (TB)': 'size (TB)',
     'Retenção padrão': 'Default retention', 'do restore (dias)': 'for restore (days)',
@@ -94,7 +96,9 @@
     'Usa a identidade dinâmica da VM para OCI e, quando configurada, valida AWS por STS/AssumeRole. Não revela Secrets, lista objetos nem grava no bucket.': 'Uses the VM dynamic identity for OCI and, when configured, validates AWS through STS/AssumeRole. It does not reveal Secrets, list objects, or write to a bucket.',
     'RAIJIN conduz migrações controladas de AWS S3 para OCI Object Storage, com inventário persistente, ondas operacionais, retomada segura, rastreabilidade e verificação criptográfica de integridade.': 'RAIJIN performs controlled migrations from AWS S3 to OCI Object Storage with persistent inventory, operational waves, safe resumption, traceability, and cryptographic integrity verification.',
     'Inspirado em Raijin, a divindade japonesa do trovão, o emblema representa força, movimento e condução precisa: cada objeto sai da origem com evidências de transferência e chega ao destino preservando sua integridade operacional.': 'Inspired by Raijin, the Japanese deity of thunder, the emblem represents strength, movement, and precise guidance: every object leaves the source with transfer evidence and reaches the destination while preserving its operational integrity.',
-    'Ver projeto no GitHub ↗': 'View project on GitHub ↗'
+    'Ver projeto no GitHub ↗': 'View project on GitHub ↗',
+    'Tamanho base de cada parte enviada ao OCI para arquivos grandes. 64 MiB reduz memória e custo de reenvio após falha; 128 MiB reduz chamadas. A plataforma aumenta automaticamente o valor quando necessário para respeitar o máximo OCI de 10.000 partes. A alteração vale para novos uploads; um upload já iniciado preserva seu tamanho para poder retomar com segurança.': 'Base size of each part uploaded to OCI for large files. 64 MiB reduces memory use and retry cost after failure; 128 MiB reduces calls. The platform automatically increases it when needed to respect OCI’s 10,000-part maximum. The change applies to new uploads; an upload already started keeps its size so it can resume safely.',
+    'Define o idioma da interface neste navegador. A escolha é armazenada localmente e não altera a configuração operacional da plataforma.': 'Sets the interface language in this browser. The choice is stored locally and does not alter the platform operational configuration.'
   };
   let language = localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'pt';
   let translating = false;

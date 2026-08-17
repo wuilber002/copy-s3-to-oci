@@ -212,7 +212,8 @@ def poll_restore(session, task: Task, settings) -> None:
 
 
 DIRECT_SHA_LIMIT = 16 * 1024 * 1024
-MULTIPART_PART_SIZE = 64 * 1024 * 1024
+DEFAULT_MULTIPART_PART_SIZE = 64 * 1024 * 1024
+MAX_MULTIPART_PARTS = 10_000
 COPY_CHUNK_SIZE = 8 * 1024 * 1024
 
 
@@ -250,6 +251,12 @@ def reusable_multipart_part(remote: dict | None, evidence: dict, expected_size: 
     return bool(remote and remote.get("size") == expected_size and evidence.get("sha256"))
 
 
+def effective_multipart_part_size(total_size: int, configured_size: int) -> int:
+    """Honor the configured size while keeping OCI's 10,000-part limit."""
+    required_for_limit = (total_size + MAX_MULTIPART_PARTS - 1) // MAX_MULTIPART_PARTS
+    return max(configured_size, required_for_limit, DIRECT_SHA_LIMIT)
+
+
 def multipart_audit_matches(part_evidence: dict, destination_digests: list[bytes]) -> bool:
     """Compare OCI reread part digests with the durable source-part evidence."""
     if len(part_evidence) != len(destination_digests):
@@ -261,7 +268,8 @@ def multipart_audit_matches(part_evidence: dict, destination_digests: list[bytes
 
 
 def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: str,
-                    object_id: int, rate_bytes_per_second: float, preserve_s3_tags: bool) -> None:
+                    object_id: int, rate_bytes_per_second: float, preserve_s3_tags: bool,
+                    configured_multipart_part_size: int = DEFAULT_MULTIPART_PART_SIZE) -> None:
     """Copy one object using an independent database session.
 
     A SQLAlchemy session is never shared between file workers. AWS credentials
@@ -393,11 +401,11 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
                 )
                 upload_id = create.data.upload_id
                 obj.multipart_upload_id = upload_id
-                obj.multipart_part_size = MULTIPART_PART_SIZE
+                obj.multipart_part_size = effective_multipart_part_size(obj.size_bytes, configured_multipart_part_size)
                 obj.multipart_parts_json, obj.multipart_updated_at = "{}", utcnow()
                 worker_session.commit()
 
-            part_size = int(obj.multipart_part_size or MULTIPART_PART_SIZE)
+            part_size = int(obj.multipart_part_size or effective_multipart_part_size(obj.size_bytes, configured_multipart_part_size))
             total_parts = (obj.size_bytes + part_size - 1) // part_size
             completed_bytes = 0
             parts = []
@@ -497,10 +505,11 @@ def transfer_wave(session, task: Task, settings) -> None:
         task.lease_expires_at = utcnow() + timedelta(seconds=live_settings.task_lease_seconds)
         session.commit()
         rate = live_settings.max_throughput_mbps * 125000 / worker_count
+        multipart_part_size = live_settings.multipart_part_size_mib * 1024 * 1024
         errors: list[str] = []
         with ThreadPoolExecutor(max_workers=len(object_ids), thread_name_prefix="s3-oci-transfer") as executor:
             futures = [executor.submit(transfer_object, s3, namespace, source.s3_bucket,
-                                       source.destination_bucket, object_id, rate, live_settings.preserve_s3_tags)
+                                       source.destination_bucket, object_id, rate, live_settings.preserve_s3_tags, multipart_part_size)
                        for object_id in object_ids]
             for future in as_completed(futures):
                 try:
@@ -554,7 +563,7 @@ def verify_wave(session, task: Task) -> None:
             session.commit()
             progress, baseline, baseline_at, last_persist, persisted_once = 0, 0, time.monotonic(), time.monotonic(), False
             part_digests: list[bytes] = []
-            part_size = int(obj.multipart_part_size or MULTIPART_PART_SIZE)
+            part_size = int(obj.multipart_part_size or DEFAULT_MULTIPART_PART_SIZE)
             parts_total = (obj.size_bytes + part_size - 1) // part_size if has_multipart_evidence else 1
             for part_number in range(1, parts_total + 1):
                 digest = hashlib.sha256()

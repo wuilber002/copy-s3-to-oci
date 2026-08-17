@@ -12,7 +12,13 @@ os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 os.environ.setdefault("POSTGRES_PASSWORD_FILE", str(_password))
 os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.json")
 
-from app.real_worker import expected_part_size, multipart_audit_matches, multipart_parts_on_oci, reusable_multipart_part
+from app.real_worker import (
+    effective_multipart_part_size,
+    expected_part_size,
+    multipart_audit_matches,
+    multipart_parts_on_oci,
+    reusable_multipart_part,
+)
 
 
 class Part:
@@ -81,3 +87,10 @@ def test_resumed_multipart_deep_audit_uses_part_evidence_without_source_reread()
     evidence = {str(index): {"sha256": base64.b64encode(digest).decode()} for index, digest in enumerate(digests, 1)}
     assert multipart_audit_matches(evidence, digests)
     assert not multipart_audit_matches(evidence, [digests[1], digests[0]])
+
+
+def test_multipart_part_size_is_increased_only_when_needed_for_oci_part_limit():
+    mib = 1024 * 1024
+    assert effective_multipart_part_size(128 * mib, 64 * mib) == 64 * mib
+    total_size = 10_001 * 64 * mib
+    assert effective_multipart_part_size(total_size, 64 * mib) == (total_size + 9_999) // 10_000
