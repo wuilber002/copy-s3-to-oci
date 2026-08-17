@@ -48,4 +48,5 @@ def test_source_summary_identifies_its_aws_connection_with_an_orange_tag():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "aws-connection-tag" in page
     assert "aws_connection_label" in page
+    assert "AWS Connections:" in page
     assert "#fb923c" in page
