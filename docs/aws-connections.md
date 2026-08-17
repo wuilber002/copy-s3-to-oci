@@ -59,8 +59,11 @@ RAIJIN checks the region returned by `HeadBucket` for both the source and the
 control bucket. A restore is blocked unless the configured source region, the
 actual source-bucket region and the control-bucket region are identical. The
 operator can use **Sync AWS region** on a source to correct its local region
-from AWS without repeating discovery; any pending restore task is superseded
-so that the operator explicitly creates a new safe attempt.
+from AWS without repeating discovery. Any pending restore task is superseded;
+an active restore is explicitly marked `RESTORE_REQUEST_FAILED`, its prior
+Batch Job is retained as historical evidence, and the object returns to the
+wave assignment state. The operator must explicitly reprocess the wave to
+create a new safe attempt.
 
 ## Restore evidence and failure handling
 
