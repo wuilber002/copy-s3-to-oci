@@ -28,6 +28,12 @@ class Response:
         self.headers = {"opc-next-page": page} if page else {}
 
 
+class ListResponse:
+    def __init__(self, parts, page=None):
+        self.data = parts
+        self.headers = {"opc-next-page": page} if page else {}
+
+
 class MultipartClient:
     def __init__(self):
         self.calls = []
@@ -51,6 +57,14 @@ def test_multipart_parts_listing_paginates_and_keeps_evidence():
     parts = multipart_parts_on_oci(client, "ns", "bucket", "key", "upload")
     assert parts == {1: {"etag": "etag-1", "size": 64}, 2: {"etag": "etag-2", "size": 11}}
     assert client.calls == [{"limit": 1000}, {"limit": 1000, "page": "next"}]
+
+
+def test_multipart_parts_listing_accepts_the_oci_sdk_bare_list_shape():
+    class Client:
+        def list_multipart_upload_parts(self, *_args, **_kwargs):
+            return ListResponse([Part(1, "etag-1", 64)])
+
+    assert multipart_parts_on_oci(Client(), "ns", "bucket", "key", "upload") == {1: {"etag": "etag-1", "size": 64}}
 
 
 def test_resume_skips_only_a_remote_part_with_persisted_sha_evidence():
