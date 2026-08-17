@@ -34,3 +34,11 @@ def test_aws_connection_template_is_formatted_and_copyable():
     assert "navigator.clipboard.writeText" in page
     assert ".json-key" in page and ".json-string" in page
     assert "Nenhuma conexão AWS cadastrada" in page
+
+
+def test_registered_aws_connection_secrets_are_disabled_in_the_registration_form():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "registeredBySecret" in page
+    assert "Secret já cadastrado na conexão" in page
+    assert "id=\"aws-connection-register\"" in page
+    assert "updateAwsConnectionRegistrationState" in page
