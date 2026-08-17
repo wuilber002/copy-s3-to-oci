@@ -444,7 +444,6 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
             oci_client.commit_multipart_upload(
                 namespace, destination_bucket, obj.object_key, upload_id,
                 oci.object_storage.models.CommitMultipartUploadDetails(parts_to_commit=parts),
-                opc_checksum_algorithm="SHA256",
             )
             obj.multipart_upload_id, obj.multipart_updated_at = None, utcnow()
             delivery_algorithm = "SHA256_MULTIPART"
