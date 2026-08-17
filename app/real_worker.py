@@ -12,6 +12,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,7 +28,9 @@ from app.main import (
     Wave, read_oci_runtime_config, runtime_settings, utcnow,
 )
 
-WORKER_ID = f"aws-oci-worker-{socket.gethostname()}"
+# The bootstrap supplies a stable identity for the one real worker on the VM.
+# Keep the hostname fallback for local development/tests that do not use it.
+WORKER_ID = os.getenv("RAIJIN_WORKER_ID", f"aws-oci-worker-{socket.gethostname()}")
 ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS", "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS"}
 
 

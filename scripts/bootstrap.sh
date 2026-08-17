@@ -93,6 +93,7 @@ fi
 # It remains idle until the operator explicitly enables it in the web console.
 podman run -d --name s3-oci-real-worker --replace --restart unless-stopped \
   --network s3-oci-migration \
+  -e RAIJIN_WORKER_ID=raijin-real-worker-vm \
   -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
