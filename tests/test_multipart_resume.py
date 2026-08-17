@@ -1,3 +1,5 @@
+import base64
+import hashlib
 import os
 from pathlib import Path
 
@@ -10,7 +12,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
 os.environ.setdefault("POSTGRES_PASSWORD_FILE", str(_password))
 os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.json")
 
-from app.real_worker import expected_part_size, multipart_parts_on_oci, reusable_multipart_part
+from app.real_worker import expected_part_size, multipart_audit_matches, multipart_parts_on_oci, reusable_multipart_part
 
 
 class Part:
@@ -55,3 +57,10 @@ def test_resume_skips_only_a_remote_part_with_persisted_sha_evidence():
     assert reusable_multipart_part({"etag": "etag", "size": 64}, {"sha256": "digest"}, 64)
     assert not reusable_multipart_part({"etag": "etag", "size": 63}, {"sha256": "digest"}, 64)
     assert not reusable_multipart_part({"etag": "etag", "size": 64}, {}, 64)
+
+
+def test_resumed_multipart_deep_audit_uses_part_evidence_without_source_reread():
+    digests = [hashlib.sha256(b"first").digest(), hashlib.sha256(b"second").digest()]
+    evidence = {str(index): {"sha256": base64.b64encode(digest).decode()} for index, digest in enumerate(digests, 1)}
+    assert multipart_audit_matches(evidence, digests)
+    assert not multipart_audit_matches(evidence, [digests[1], digests[0]])

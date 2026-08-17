@@ -247,6 +247,16 @@ def reusable_multipart_part(remote: dict | None, evidence: dict, expected_size: 
     return bool(remote and remote.get("size") == expected_size and evidence.get("sha256"))
 
 
+def multipart_audit_matches(part_evidence: dict, destination_digests: list[bytes]) -> bool:
+    """Compare OCI reread part digests with the durable source-part evidence."""
+    if len(part_evidence) != len(destination_digests):
+        return False
+    for number, digest in enumerate(destination_digests, start=1):
+        if part_evidence.get(str(number), {}).get("sha256") != base64.b64encode(digest).decode("ascii"):
+            return False
+    return True
+
+
 def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: str,
                     object_id: int, rate_bytes_per_second: float, preserve_s3_tags: bool) -> None:
     """Copy one object using an independent database session.
@@ -519,7 +529,9 @@ def verify_wave(session, task: Task) -> None:
     ).order_by(ObjectRecord.id)))
     failed = 0
     for obj in objects:
-        if not obj.source_checksum:
+        multipart_evidence = json.loads(obj.multipart_parts_json or "{}")
+        has_multipart_evidence = obj.checksum_algorithm == "SHA256_MULTIPART_PARTS" and bool(multipart_evidence)
+        if not obj.source_checksum and not has_multipart_evidence:
             obj.integrity_error, obj.state = "SHA-256 source evidence is missing after transfer", ObjectState.FAILED
             obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
             session.commit()
@@ -532,25 +544,38 @@ def verify_wave(session, task: Task) -> None:
             obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
             session.commit()
             progress, baseline, baseline_at, last_persist, persisted_once = 0, 0, time.monotonic(), time.monotonic(), False
-            for chunk in iter(lambda: destination_body.read(COPY_CHUNK_SIZE), b""):
-                destination_digest.update(chunk)
-                progress += len(chunk)
-                now = time.monotonic()
-                if not persisted_once or now - last_persist >= 2:
-                    obj.audit_progress_bytes, obj.audit_progress_at = progress, utcnow()
-                    if persisted_once:
-                        elapsed = max(now - baseline_at, 0.001)
-                        obj.audit_rate_mbps = round(((progress - baseline) * 8) / elapsed / 1_000_000, 2)
-                    session.commit()
-                    baseline, baseline_at, last_persist, persisted_once = progress, now, now, True
-            obj.destination_checksum = destination_digest.hexdigest()
+            part_digests: list[bytes] = []
+            part_size = int(obj.multipart_part_size or MULTIPART_PART_SIZE)
+            parts_total = (obj.size_bytes + part_size - 1) // part_size if has_multipart_evidence else 1
+            for part_number in range(1, parts_total + 1):
+                digest = hashlib.sha256()
+                remaining = expected_part_size(obj.size_bytes, part_number, part_size) if has_multipart_evidence else obj.size_bytes
+                while remaining:
+                    chunk = destination_body.read(min(COPY_CHUNK_SIZE, remaining))
+                    if not chunk:
+                        raise RuntimeError("OCI object ended early during audit")
+                    destination_digest.update(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                    progress += len(chunk)
+                    now = time.monotonic()
+                    if not persisted_once or now - last_persist >= 2:
+                        obj.audit_progress_bytes, obj.audit_progress_at = progress, utcnow()
+                        if persisted_once:
+                            elapsed = max(now - baseline_at, 0.001)
+                            obj.audit_rate_mbps = round(((progress - baseline) * 8) / elapsed / 1_000_000, 2)
+                        session.commit()
+                        baseline, baseline_at, last_persist, persisted_once = progress, now, now, True
+                if has_multipart_evidence:
+                    part_digests.append(digest.digest())
+            obj.destination_checksum = destination_digest.hexdigest() if obj.source_checksum else base64.b64encode(hashlib.sha256(b"".join(part_digests)).digest()).decode("ascii")
         except Exception as error:
             obj.integrity_error, obj.state = f"Unable to read OCI destination: {type(error).__name__}: {error}", ObjectState.FAILED
             obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
             session.commit()
             failed += 1
             continue
-        if obj.source_checksum != obj.destination_checksum:
+        if (has_multipart_evidence and not multipart_audit_matches(multipart_evidence, part_digests)) or (obj.source_checksum and obj.source_checksum != obj.destination_checksum):
             obj.integrity_error, obj.state = "SHA-256 source/destination mismatch", ObjectState.FAILED
             failed += 1
         else:
