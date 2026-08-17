@@ -1,6 +1,9 @@
 import os
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 
 _password = Path("/tmp/raijin-test-password-contract")
 _password.write_text("test-password", encoding="utf-8")
@@ -10,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import ObjectRecord, Source, destination_provenance_matches, observability, prometheus_metrics
+from app.main import ObjectRecord, RuntimeSettingsUpdate, Source, destination_provenance_matches, observability, prometheus_metrics
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -40,3 +43,16 @@ def test_destination_provenance_requires_s3_etag_and_last_modified_when_known():
     assert destination_provenance_matches(obj, headers)
     headers["opc-meta-s3-oci-source-last-modified"] = "2026-08-17T12:01:00+00:00"
     assert not destination_provenance_matches(obj, headers)
+
+
+def test_multipart_size_runtime_setting_has_safe_bounds():
+    payload = {
+        "transfer_workers": 4, "max_throughput_mbps": 1000, "multipart_part_size_mib": 64,
+        "default_wave_size_bytes": 1024, "default_restore_days": 7, "default_restore_tier": "BULK",
+        "task_lease_seconds": 300,
+    }
+    assert RuntimeSettingsUpdate(**payload).multipart_part_size_mib == 64
+    with pytest.raises(ValidationError):
+        RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 15}))
+    with pytest.raises(ValidationError):
+        RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 513}))
