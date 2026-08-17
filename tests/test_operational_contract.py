@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import ObjectRecord, RuntimeSettingsUpdate, Source, destination_provenance_matches, observability, prometheus_metrics
+from app.main import ObjectRecord, RuntimeSettingsUpdate, Source, destination_provenance_matches, observability, prometheus_metrics, safe_aws_error_summary
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -56,3 +56,8 @@ def test_multipart_size_runtime_setting_has_safe_bounds():
         RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 15}))
     with pytest.raises(ValidationError):
         RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 513}))
+
+
+def test_aws_error_summary_exposes_only_status_and_code():
+    error = type("ClientError", (Exception,), {"response": {"ResponseMetadata": {"HTTPStatusCode": 403}, "Error": {"Code": "AccessDenied", "Message": "sensitive detail"}}})()
+    assert safe_aws_error_summary(error) == "ClientError (403 AccessDenied)"

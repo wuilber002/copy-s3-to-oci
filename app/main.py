@@ -450,6 +450,17 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "activity_refresh_seconds": settings.activity_refresh_seconds, "updated_at": settings.updated_at}
 
 
+def safe_aws_error_summary(error: Exception) -> str:
+    """Return diagnostic context without exposing credentials or request data."""
+    response = getattr(error, "response", {}) or {}
+    metadata = response.get("ResponseMetadata", {}) if isinstance(response, dict) else {}
+    detail = response.get("Error", {}) if isinstance(response, dict) else {}
+    status = metadata.get("HTTPStatusCode")
+    code = detail.get("Code")
+    context = " ".join(str(value) for value in (status, code) if value)
+    return f"{type(error).__name__}{f' ({context})' if context else ''}"
+
+
 def read_oci_runtime_config() -> dict:
     with open(oci_runtime_config_file, encoding="utf-8") as config_file:
         return json.load(config_file)
@@ -632,7 +643,7 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
                 except Exception as error:
                     for check in checks:
                         if check["name"] == "Bucket AWS de controle":
-                            check["status"], check["detail"] = "CONFIGURED", f"configurado, mas HeadBucket falhou: {type(error).__name__}"
+                            check["status"], check["detail"] = "CONFIGURED", f"configurado, mas HeadBucket falhou: {safe_aws_error_summary(error)}"
         except Exception as error:
             checks.append({"name": "Credenciais AWS e role de migração", "status": "CONFIGURED", "detail": f"preenchidas, mas teste falhou: {type(error).__name__}"})
     else:
