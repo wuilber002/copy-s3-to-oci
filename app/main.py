@@ -488,12 +488,14 @@ def observability(session: Session = Depends(get_session)) -> dict:
     """Local, non-sensitive operational signals for operators and monitors."""
     now = utcnow()
     stale_cutoff = now - timedelta(minutes=10)
-    failed_tasks = session.scalar(select(func.count(Task.id)).where(Task.state == TaskState.FAILED)) or 0
-    retrying_tasks = session.scalar(select(func.count(Task.id)).where(Task.state == TaskState.READY, Task.attempts > 1)) or 0
-    stale_leases = session.scalar(select(func.count(Task.id)).where(Task.state == TaskState.RUNNING, Task.lease_expires_at < now)) or 0
+    active_task = select(func.count(Task.id)).join(Wave, Task.wave_id == Wave.id).join(Source, Wave.source_id == Source.id).where(Source.archived_at.is_(None))
+    failed_tasks = session.scalar(active_task.where(Task.state == TaskState.FAILED)) or 0
+    retrying_tasks = session.scalar(active_task.where(Task.state == TaskState.READY, Task.attempts > 1)) or 0
+    stale_leases = session.scalar(active_task.where(Task.state == TaskState.RUNNING, Task.lease_expires_at < now)) or 0
     recent_failures = session.scalar(select(func.count(Event.id)).where(Event.kind.like("%FAILED%"), Event.created_at >= now - timedelta(hours=24))) or 0
-    active_multipart = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.multipart_upload_id.is_not(None))) or 0
-    stalled_transfers = session.scalar(select(func.count(ObjectRecord.id)).where(
+    active_object = select(func.count(ObjectRecord.id)).join(Source, ObjectRecord.source_id == Source.id).where(Source.archived_at.is_(None))
+    active_multipart = session.scalar(active_object.where(ObjectRecord.multipart_upload_id.is_not(None))) or 0
+    stalled_transfers = session.scalar(active_object.where(
         ObjectRecord.state == ObjectState.TRANSFERRING,
         ObjectRecord.transfer_progress_at.is_not(None), ObjectRecord.transfer_progress_at < stale_cutoff,
     )) or 0
