@@ -27,6 +27,7 @@ O PostgreSQL é a fonte de verdade e a fila durável. As tarefas usam reserva tr
 - Se a validação explícita do destino OCI detectar objeto ausente ou tamanho divergente, os objetos afetados voltam para `WAVE_ASSIGNED`, suas ondas para `READY_FOR_RESTORE` e a origem deixa de ser concluída. Nenhum restore ou retransferência é iniciado automaticamente; o operador usa **Reprocessar** quando decidir corrigir a divergência.
 - Discovery usa somente listagem e campos retornados pelo S3; não faz restore nem leitura de conteúdo.
 - Chamadas AWS são minimizadas. Restore usa S3 Batch Operations por onda; polling usa estado da Batch job e listagem paginada com `RestoreStatus`.
+- Os clientes AWS têm timeout explícito de conexão (10 segundos), leitura (120 segundos) e até quatro tentativas padrão do SDK. Depois disso, a tarefa durável entra em retry e preserva o checkpoint multipart OCI; uma conexão de rede travada não deve ocupar indefinidamente o único worker real.
 - A chave do S3 é preservada no OCI. Metadados e tags são preservados no destino quando compatíveis e sempre no manifesto imutável da migração.
 
 ## Dimensionamento inicial

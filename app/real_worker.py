@@ -21,6 +21,7 @@ from urllib.parse import quote
 
 import boto3
 import oci
+from botocore.config import Config
 from sqlalchemy import func, or_, select
 
 from app.main import (
@@ -32,6 +33,10 @@ from app.main import (
 # Keep the hostname fallback for local development/tests that do not use it.
 WORKER_ID = os.getenv("RAIJIN_WORKER_ID", f"aws-oci-worker-{socket.gethostname()}")
 ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS", "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS"}
+# Explicit network bounds prevent an interrupted TCP stream from holding the
+# only real worker forever. A task-level retry preserves its multipart
+# checkpoint and lets the worker resume the accepted OCI parts safely.
+AWS_CLIENT_CONFIG = Config(connect_timeout=10, read_timeout=120, retries={"max_attempts": 4, "mode": "standard"})
 
 
 def event(session, kind: str, message: str, source_id: int | None = None, wave_id: int | None = None) -> None:
@@ -56,7 +61,7 @@ def aws_clients(settings, region: str):
         aws_secret_access_key=values["aws_secret_access_key"],
         region_name=region,
     )
-    assumed = bootstrap.client("sts").assume_role(
+    assumed = bootstrap.client("sts", config=AWS_CLIENT_CONFIG).assume_role(
         RoleArn=settings.aws_migration_role_arn,
         RoleSessionName="s3-oci-migration-worker",
         DurationSeconds=3600,
@@ -67,7 +72,11 @@ def aws_clients(settings, region: str):
         aws_session_token=assumed["SessionToken"],
         region_name=region,
     )
-    return session.client("s3"), session.client("s3control"), session.client("sts").get_caller_identity()["Account"]
+    return (
+        session.client("s3", config=AWS_CLIENT_CONFIG),
+        session.client("s3control", config=AWS_CLIENT_CONFIG),
+        session.client("sts", config=AWS_CLIENT_CONFIG).get_caller_identity()["Account"],
+    )
 
 
 def worker_can_reclaim_lease(task_worker_id: str | None, lease_expires_at, now) -> bool:

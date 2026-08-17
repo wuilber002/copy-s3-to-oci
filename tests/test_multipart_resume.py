@@ -14,6 +14,7 @@ os.environ.setdefault("POSTGRES_PASSWORD_FILE", str(_password))
 os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.json")
 
 from app.real_worker import (
+    AWS_CLIENT_CONFIG,
     WORKER_ID,
     effective_multipart_part_size,
     expected_part_size,
@@ -106,3 +107,9 @@ def test_worker_identity_is_stable_for_restart_reclaim():
     assert worker_can_reclaim_lease(WORKER_ID, now + timedelta(minutes=5), now)
     assert not worker_can_reclaim_lease("another-worker", now + timedelta(minutes=5), now)
     assert worker_can_reclaim_lease("another-worker", now - timedelta(seconds=1), now)
+
+
+def test_aws_clients_have_bounded_network_retries():
+    assert AWS_CLIENT_CONFIG.connect_timeout == 10
+    assert AWS_CLIENT_CONFIG.read_timeout == 120
+    assert AWS_CLIENT_CONFIG.retries["max_attempts"] == 4
