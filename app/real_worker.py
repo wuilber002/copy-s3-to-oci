@@ -419,14 +419,17 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
                     namespace, destination_bucket, obj.object_key, upload_id, part_number, payload,
                     content_length=len(payload), opc_checksum_algorithm="SHA256", opc_content_sha256=digest_b64,
                 )
-                throttle_uploaded(len(payload), upload_started)
                 completed_bytes += len(payload)
-                progress_bytes = completed_bytes
-                record_progress(0)
                 persisted_parts[str(part_number)] = {"etag": uploaded.headers["etag"], "size": len(payload), "sha256": digest_b64}
                 obj.multipart_parts_json = json.dumps(persisted_parts, separators=(",", ":"))
                 obj.multipart_updated_at = utcnow()
                 worker_session.commit()
+                # Persist acceptance before applying the optional throughput
+                # delay. A power loss during that delay must still resume this
+                # exact OCI part rather than upload it again.
+                throttle_uploaded(len(payload), upload_started)
+                progress_bytes = completed_bytes
+                record_progress(0)
                 parts.append(oci.object_storage.models.CommitMultipartUploadPartDetails(part_num=part_number, etag=uploaded.headers["etag"]))
                 part_digests.append(base64.b64decode(digest_b64))
             if len(parts) != total_parts:
