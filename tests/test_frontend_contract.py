@@ -77,3 +77,19 @@ def test_aws_connection_configuration_opens_in_a_dismissible_modal():
     handler = page[page.index("async function viewAwsConnectionConfiguration"):page.index("async function syncAwsConnection")]
     assert "modal-actions" not in handler
     assert "ACTIONABLE_FAILED" in page
+
+
+def test_object_detail_is_below_inventory_and_wave_report_is_scrollable_modal():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert page.index('id="inventory"') < page.index('id="object-detail"') < page.index('id="waves"')
+    assert 'id="wave-report-modal"' in page
+    assert 'id="wave-report-content" class="report-content"' in page
+    assert "openModal('#wave-report-modal')" in page
+    assert ".report-content{max-height:72vh;overflow:auto" in page
+
+
+def test_inline_code_uses_compact_chip_styling_instead_of_large_code_blocks():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "code,pre{" not in page
+    assert "code{display:inline-block;max-width:100%;padding:.12rem .36rem" in page
+    assert "pre code{display:block;max-width:none;padding:0" in page
