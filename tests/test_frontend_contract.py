@@ -30,6 +30,8 @@ def test_aws_connection_interface_never_places_secret_content_in_javascript():
 def test_aws_connection_template_is_formatted_and_copyable():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="aws-secret-json-template"' in page
+    assert 'id="aws-secret-template-modal"' in page
+    assert "openAwsSecretTemplateModal()" in page
     assert "copyAwsSecretTemplate()" in page
     assert "navigator.clipboard.writeText" in page
     assert ".json-key" in page and ".json-string" in page
@@ -65,3 +67,10 @@ def test_aws_connection_sync_and_safe_configuration_controls_are_available():
     assert "syncSourceAwsRegion" in page
     assert "Campos ocultos" in page
     assert "Tentativas de restore" in page
+
+
+def test_aws_connection_configuration_opens_in_a_dismissible_modal():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="aws-connection-configuration-modal"' in page
+    assert "closeAwsConnectionConfigurationModal()" in page
+    assert "openModal('#aws-connection-configuration-modal')" in page
