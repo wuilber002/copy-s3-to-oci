@@ -81,11 +81,19 @@ def test_aws_connection_configuration_opens_in_a_dismissible_modal():
 
 def test_object_detail_is_below_inventory_and_wave_report_is_scrollable_modal():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
-    assert page.index('id="inventory"') < page.index('id="object-detail"') < page.index('id="waves"')
     assert 'id="wave-report-modal"' in page
     assert 'id="wave-report-content" class="report-content"' in page
     assert "openModal('#wave-report-modal')" in page
     assert ".report-content{max-height:72vh;overflow:auto" in page
+
+
+def test_object_detail_opens_in_a_scrollable_modal():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="object-detail-modal"' in page
+    assert 'id="object-detail-content" class="report-content"' in page
+    assert "closeObjectDetailModal()" in page
+    handler = page[page.index("async function showObject"):page.index("async function loadWaves")]
+    assert "openModal('#object-detail-modal')" in handler
 
 
 def test_inline_code_uses_compact_chip_styling_instead_of_large_code_blocks():
