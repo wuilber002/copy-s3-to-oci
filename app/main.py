@@ -339,6 +339,7 @@ class RuntimeSettings(Base):
     aws_control_prefix: Mapped[str] = mapped_column(String(1024), default="s3-oci-control/")
     preserve_s3_tags: Mapped[bool] = mapped_column(default=True)
     real_worker_enabled: Mapped[bool] = mapped_column(default=False)
+    cost_estimation_enabled: Mapped[bool] = mapped_column(default=False)
     activity_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
     activity_refresh_seconds: Mapped[int] = mapped_column(Integer, default=15)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -439,6 +440,7 @@ class RuntimeSettingsUpdate(BaseModel):
     simulation_enabled: bool = False
     preserve_s3_tags: bool = True
     real_worker_enabled: bool = False
+    cost_estimation_enabled: bool = False
 
 
 class ActivityRefreshSettingsUpdate(BaseModel):
@@ -507,6 +509,7 @@ def create_schema() -> None:
         "aws_control_prefix": "VARCHAR(1024) NOT NULL DEFAULT 's3-oci-control/'",
         "preserve_s3_tags": "BOOLEAN NOT NULL DEFAULT TRUE",
         "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "cost_estimation_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "multipart_part_size_mib": "INTEGER NOT NULL DEFAULT 64",
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
@@ -581,7 +584,7 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "default_wave_size_bytes": settings.default_wave_size_bytes, "default_restore_days": settings.default_restore_days,
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
             "simulation_enabled": settings.simulation_enabled, "real_worker_enabled": settings.real_worker_enabled,
-            "preserve_s3_tags": settings.preserve_s3_tags,
+            "preserve_s3_tags": settings.preserve_s3_tags, "cost_estimation_enabled": settings.cost_estimation_enabled,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
             "activity_refresh_seconds": settings.activity_refresh_seconds, "updated_at": settings.updated_at}
 
@@ -2197,6 +2200,8 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
 
 @app.get("/api/waves/{wave_id}/cost-estimate")
 def get_wave_cost_estimate(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    if not runtime_settings(session).cost_estimation_enabled:
+        raise HTTPException(status_code=409, detail="Cost estimation is disabled in operational settings")
     return wave_cost_estimate(session, wave_or_404(session, wave_id))
 
 

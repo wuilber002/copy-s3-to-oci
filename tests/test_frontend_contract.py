@@ -125,3 +125,10 @@ def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     assert "editCostPricing" in page
     assert "showWaveCost" in page
     assert "Custo estimado" in page
+
+
+def test_cost_estimation_has_a_global_operational_toggle():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="set-cost-estimation"' in page
+    assert "costEstimationEnabled" in page
+    assert "estimativa de custo está desabilitada" in page

@@ -7,6 +7,11 @@ cobrança AWS/OCI do cliente.
 
 ## Configuração das tarifas
 
+Primeiro habilite **Configurações → Configuração operacional → Estimativa de
+custo por wave**. A chave é global e começa desligada por segurança. Enquanto
+estiver desligada, RAIJIN não executa cálculos nem permite abrir estimativas;
+as tabelas de tarifas já cadastradas permanecem guardadas.
+
 Em **Configurações → Conexões AWS → Tarifas**, cadastre valores aplicáveis à
 conta, região e contrato daquela conexão. A tabela é por conexão porque contas
 podem estar em regiões diferentes ou ter preços negociados distintos.

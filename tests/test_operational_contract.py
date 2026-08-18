@@ -110,6 +110,7 @@ def test_multipart_size_runtime_setting_has_safe_bounds():
         "task_lease_seconds": 300,
     }
     assert RuntimeSettingsUpdate(**payload).multipart_part_size_mib == 64
+    assert RuntimeSettingsUpdate(**payload).cost_estimation_enabled is False
     with pytest.raises(ValidationError):
         RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 15}))
     with pytest.raises(ValidationError):
@@ -183,3 +184,11 @@ def test_wave_cost_estimator_documents_transparent_unit_assumptions():
         assert component in estimator
     assert "pricing.expected_restore_poll_cycles" in estimator
     assert "never a promise" in estimator
+
+
+def test_cost_estimate_endpoint_is_explicitly_gated_by_operational_setting():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index('def get_wave_cost_estimate')
+    handler = source[start:source.index('\n\n@app.get("/api/waves/{wave_id}/deep-audit-preview")', start)]
+    assert "cost_estimation_enabled" in handler
+    assert "Cost estimation is disabled in operational settings" in handler
