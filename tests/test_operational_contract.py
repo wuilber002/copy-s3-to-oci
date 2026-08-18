@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import validate_restore_preflight
 
 
@@ -161,3 +161,25 @@ def test_legacy_source_adoption_requires_a_concrete_connection_id():
     assert LegacySourceConnectionMigration(aws_connection_id=1).aws_connection_id == 1
     with pytest.raises(ValidationError):
         LegacySourceConnectionMigration(aws_connection_id=0)
+
+
+def test_cost_pricing_keeps_rates_optional_but_non_negative():
+    pricing = CostPricingUpdate()
+    assert pricing.currency == "USD"
+    assert pricing.aws_deep_archive_bulk_retrieval_usd_per_gib is None
+    with pytest.raises(ValidationError):
+        CostPricingUpdate(aws_transfer_out_usd_per_gib=-0.01)
+    assert CostPricing.__tablename__ == "cost_pricing"
+
+
+def test_wave_cost_estimator_documents_transparent_unit_assumptions():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index("def wave_cost_estimate")
+    end = source.index("\n\ndef aws_connection_configuration", 0)
+    if end < start:
+        end = len(source)
+    estimator = source[start:end]
+    for component in ("S3 Batch Operations job", "AWS data transfer out to OCI", "Optional deep SHA-256 audit OCI reads"):
+        assert component in estimator
+    assert "pricing.expected_restore_poll_cycles" in estimator
+    assert "never a promise" in estimator

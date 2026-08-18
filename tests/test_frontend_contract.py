@@ -116,3 +116,12 @@ def test_source_region_is_derived_and_read_only_from_the_aws_connection():
     assert 'id="region" required readonly' in page
     assert "applyAwsConnectionRegion(){const c=" in page
     assert "$('#region').value=c?c.default_region:''" in page
+
+
+def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="cost-pricing-modal"' in page
+    assert 'id="wave-cost-modal"' in page
+    assert "editCostPricing" in page
+    assert "showWaveCost" in page
+    assert "Custo estimado" in page

@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import base64
+import math
 import re
 import shutil
 
@@ -126,6 +127,36 @@ class AwsConnection(Base):
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     sources: Mapped[list["Source"]] = relationship(back_populates="aws_connection")
+
+
+class CostPricing(Base):
+    """Customer-maintained unit prices for one AWS connection/region.
+
+    Public AWS and OCI prices are regional and contractual discounts are common,
+    so the control plane never hard-codes a price as if it were an invoice.
+    ``None`` means the operator has not supplied that unit price yet.
+    """
+    __tablename__ = "cost_pricing"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    aws_connection_id: Mapped[int] = mapped_column(ForeignKey("aws_connections.id"), unique=True, index=True)
+    currency: Mapped[str] = mapped_column(String(8), default="USD")
+    reference: Mapped[str] = mapped_column(String(1024), default="")
+    expected_restore_poll_cycles: Mapped[int] = mapped_column(Integer, default=24)
+    aws_batch_job_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_batch_object_usd_per_1000: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_s3_put_list_usd_per_1000: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_s3_get_usd_per_1000: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_glacier_bulk_retrieval_usd_per_gib: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_glacier_standard_retrieval_usd_per_gib: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_deep_archive_bulk_retrieval_usd_per_gib: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_deep_archive_standard_retrieval_usd_per_gib: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_transfer_out_usd_per_gib: Mapped[float | None] = mapped_column(Float, nullable=True)
+    aws_restore_temp_standard_usd_per_gib_month: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oci_put_usd_per_10000: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oci_get_usd_per_10000: Mapped[float | None] = mapped_column(Float, nullable=True)
+    oci_storage_usd_per_gib_month: Mapped[float | None] = mapped_column(Float, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
 class AwsSecretCache(Base):
@@ -334,6 +365,25 @@ class LegacySourceConnectionMigration(BaseModel):
 class AwsConnectionCreate(BaseModel):
     secret_ocid: str = Field(min_length=20, max_length=255)
     label: str = Field(min_length=1, max_length=255)
+
+
+class CostPricingUpdate(BaseModel):
+    currency: str = Field(default="USD", min_length=3, max_length=8, pattern=r"^[A-Za-z]{3,8}$")
+    reference: str = Field(default="", max_length=1024)
+    expected_restore_poll_cycles: int = Field(default=24, ge=1, le=1000)
+    aws_batch_job_usd: float | None = Field(default=None, ge=0)
+    aws_batch_object_usd_per_1000: float | None = Field(default=None, ge=0)
+    aws_s3_put_list_usd_per_1000: float | None = Field(default=None, ge=0)
+    aws_s3_get_usd_per_1000: float | None = Field(default=None, ge=0)
+    aws_glacier_bulk_retrieval_usd_per_gib: float | None = Field(default=None, ge=0)
+    aws_glacier_standard_retrieval_usd_per_gib: float | None = Field(default=None, ge=0)
+    aws_deep_archive_bulk_retrieval_usd_per_gib: float | None = Field(default=None, ge=0)
+    aws_deep_archive_standard_retrieval_usd_per_gib: float | None = Field(default=None, ge=0)
+    aws_transfer_out_usd_per_gib: float | None = Field(default=None, ge=0)
+    aws_restore_temp_standard_usd_per_gib_month: float | None = Field(default=None, ge=0)
+    oci_put_usd_per_10000: float | None = Field(default=None, ge=0)
+    oci_get_usd_per_10000: float | None = Field(default=None, ge=0)
+    oci_storage_usd_per_gib_month: float | None = Field(default=None, ge=0)
 
 
 class InventoryItem(BaseModel):
@@ -611,6 +661,110 @@ def connection_summary(session: Session, connection: AwsConnection) -> dict:
             "aws_account_id": connection.aws_account_id, "default_region": connection.default_region,
             "control_bucket": connection.control_bucket, "archived_at": connection.archived_at,
             "created_at": connection.created_at, "sources": int(sources)}
+
+
+PRICING_RATE_FIELDS = (
+    "aws_batch_job_usd", "aws_batch_object_usd_per_1000", "aws_s3_put_list_usd_per_1000",
+    "aws_s3_get_usd_per_1000", "aws_glacier_bulk_retrieval_usd_per_gib",
+    "aws_glacier_standard_retrieval_usd_per_gib", "aws_deep_archive_bulk_retrieval_usd_per_gib",
+    "aws_deep_archive_standard_retrieval_usd_per_gib", "aws_transfer_out_usd_per_gib",
+    "aws_restore_temp_standard_usd_per_gib_month", "oci_put_usd_per_10000",
+    "oci_get_usd_per_10000", "oci_storage_usd_per_gib_month",
+)
+
+
+def pricing_or_create(session: Session, connection_id: int) -> CostPricing:
+    pricing = session.scalar(select(CostPricing).where(CostPricing.aws_connection_id == connection_id))
+    if not pricing:
+        pricing = CostPricing(aws_connection_id=connection_id)
+        session.add(pricing)
+        session.flush()
+    return pricing
+
+
+def pricing_dict(pricing: CostPricing) -> dict:
+    return {"aws_connection_id": pricing.aws_connection_id, "currency": pricing.currency,
+            "reference": pricing.reference, "expected_restore_poll_cycles": pricing.expected_restore_poll_cycles,
+            **{field: getattr(pricing, field) for field in PRICING_RATE_FIELDS}, "updated_at": pricing.updated_at}
+
+
+def wave_cost_estimate(session: Session, wave: Wave) -> dict:
+    """Build a transparent, deliberately conservative cost estimate.
+
+    It is an estimate of billable units generated by Raijin, never a promise of
+    the customer's AWS/OCI invoice. Rates remain blank until the customer
+    supplies their regional/contractual prices for the connection.
+    """
+    source = wave.source
+    if not source.aws_connection_id:
+        raise HTTPException(status_code=409, detail="Wave source has no AWS connection pricing profile")
+    pricing = pricing_or_create(session, source.aws_connection_id)
+    settings = runtime_settings(session)
+    objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
+    source_objects = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source.id)) or 0
+    total_bytes = sum(int(obj.size_bytes or 0) for obj in objects)
+    total_gib = total_bytes / 1024**3
+    archived = [obj for obj in objects if (obj.storage_class or "").upper() in ARCHIVE_STORAGE_CLASSES]
+    glacier_gib = sum(obj.size_bytes for obj in archived if (obj.storage_class or "").upper() == "GLACIER") / 1024**3
+    deep_gib = sum(obj.size_bytes for obj in archived if (obj.storage_class or "").upper() == "DEEP_ARCHIVE") / 1024**3
+    unpriced_archive_gib = sum(obj.size_bytes for obj in archived if (obj.storage_class or "").upper() not in {"GLACIER", "DEEP_ARCHIVE"}) / 1024**3
+    part_bytes = max(16 * 1024**2, int(settings.multipart_part_size_mib) * 1024**2)
+    oci_put_operations = 0
+    for obj in objects:
+        effective_part = max(part_bytes, math.ceil(int(obj.size_bytes or 0) / 10000))
+        oci_put_operations += 1 if obj.size_bytes <= 16 * 1024**2 else math.ceil(obj.size_bytes / effective_part) + 2
+    source_pages = math.ceil(source_objects / 1000) if source_objects else 0
+    wave_pages = math.ceil(len(objects) / 1000) if objects else 0
+    components: list[dict] = []
+    missing: list[str] = []
+    missing_by_category: dict[str, list[str]] = {"one_time": [], "recurring": [], "optional": []}
+
+    def add(key: str, label: str, quantity: float, unit: str, rate_field: str, divisor: float = 1, category: str = "one_time") -> None:
+        if not quantity:
+            return
+        rate = getattr(pricing, rate_field)
+        entry = {"key": key, "label": label, "quantity": quantity, "unit": unit,
+                 "rate_field": rate_field, "rate": rate, "category": category}
+        if rate is None:
+            entry["cost"] = None
+            missing.append(rate_field)
+            missing_by_category[category].append(rate_field)
+        else:
+            entry["cost"] = round((quantity / divisor) * float(rate), 6)
+        components.append(entry)
+
+    if archived:
+        add("batch_job", "S3 Batch Operations job", 1, "job", "aws_batch_job_usd")
+        add("batch_objects", "S3 Batch Operations object tasks", len(archived), "objects", "aws_batch_object_usd_per_1000", 1000)
+        add("manifest_put", "S3 manifest write", 1, "requests", "aws_s3_put_list_usd_per_1000", 1000)
+        add("restore_polling", "S3 restore polling ListObjectsV2 pages", source_pages * pricing.expected_restore_poll_cycles, "requests", "aws_s3_put_list_usd_per_1000", 1000)
+        add("restore_temp", "Temporary S3 Standard restored copy", (glacier_gib + deep_gib) * wave.restore_days / 30, "GiB-month", "aws_restore_temp_standard_usd_per_gib_month")
+        retrieval_field = "aws_glacier_bulk_retrieval_usd_per_gib" if wave.restore_tier == "BULK" else "aws_glacier_standard_retrieval_usd_per_gib"
+        add("glacier_retrieval", f"S3 Glacier {wave.restore_tier} retrieval", glacier_gib, "GiB", retrieval_field)
+        retrieval_field = "aws_deep_archive_bulk_retrieval_usd_per_gib" if wave.restore_tier == "BULK" else "aws_deep_archive_standard_retrieval_usd_per_gib"
+        add("deep_archive_retrieval", f"S3 Deep Archive {wave.restore_tier} retrieval", deep_gib, "GiB", retrieval_field)
+    add("discovery", "Allocated S3 discovery ListObjectsV2 pages", wave_pages, "requests", "aws_s3_put_list_usd_per_1000", 1000)
+    add("source_reads", "S3 object reads during transfer", len(objects), "requests", "aws_s3_get_usd_per_1000", 1000)
+    if settings.preserve_s3_tags:
+        add("tag_reads", "S3 object-tag reads", len(objects), "requests", "aws_s3_get_usd_per_1000", 1000)
+    add("aws_transfer_out", "AWS data transfer out to OCI", total_gib, "GiB", "aws_transfer_out_usd_per_gib")
+    add("oci_writes", "OCI Object Storage write operations", oci_put_operations, "operations", "oci_put_usd_per_10000", 10000)
+    add("oci_storage", "OCI destination storage (one month)", total_gib, "GiB-month", "oci_storage_usd_per_gib_month", category="recurring")
+    add("deep_audit", "Optional deep SHA-256 audit OCI reads", len(objects), "operations", "oci_get_usd_per_10000", 10000, category="optional")
+    one_time = [item["cost"] for item in components if item["category"] == "one_time"]
+    recurring = [item["cost"] for item in components if item["category"] == "recurring"]
+    optional = [item["cost"] for item in components if item["category"] == "optional"]
+    return {"wave_id": wave.id, "connection_id": source.aws_connection_id, "connection_label": source.aws_connection.label,
+            "currency": pricing.currency.upper(), "pricing_reference": pricing.reference, "pricing_updated_at": pricing.updated_at,
+            "complete": not missing_by_category["one_time"] and not unpriced_archive_gib,
+            "missing_rates": sorted(set(missing)), "unpriced_archive_gib": round(unpriced_archive_gib, 6),
+            "totals": {"one_time": round(sum(one_time), 6) if not any(value is None for value in one_time) and not missing_by_category["one_time"] and not unpriced_archive_gib else None,
+                       "recurring_monthly": round(sum(recurring), 6) if not any(value is None for value in recurring) else None,
+                       "optional_deep_audit": round(sum(optional), 6) if not any(value is None for value in optional) else None},
+            "quantities": {"objects": len(objects), "archive_objects": len(archived), "bytes": total_bytes,
+                           "source_inventory_objects": int(source_objects), "multipart_part_mib": settings.multipart_part_size_mib,
+                           "estimated_poll_cycles": pricing.expected_restore_poll_cycles, "oci_write_operations": oci_put_operations},
+            "components": components}
 
 
 def aws_connection_configuration(connection: AwsConnection, secret: dict) -> dict:
@@ -1244,6 +1398,25 @@ def get_aws_connection_configuration(connection_id: int, session: Session = Depe
         return aws_connection_configuration(connection, aws_secret_payload(connection.secret_ocid))
     except Exception as error:
         raise HTTPException(status_code=422, detail=f"AWS connection Secret is no longer compatible: {type(error).__name__}") from error
+
+
+@app.get("/api/aws-connections/{connection_id}/cost-pricing")
+def get_cost_pricing(connection_id: int, session: Session = Depends(get_session)) -> dict:
+    connection_or_404(session, connection_id)
+    pricing = pricing_or_create(session, connection_id)
+    session.commit()
+    return pricing_dict(pricing)
+
+
+@app.put("/api/aws-connections/{connection_id}/cost-pricing")
+def update_cost_pricing(connection_id: int, payload: CostPricingUpdate, session: Session = Depends(get_session)) -> dict:
+    connection = connection_or_404(session, connection_id)
+    pricing = pricing_or_create(session, connection_id)
+    for field, value in payload.model_dump().items():
+        setattr(pricing, field, value)
+    record_event(session, "COST_PRICING_UPDATED", f"Cost pricing updated for AWS connection '{connection.label}'", source_id=None)
+    session.commit()
+    return pricing_dict(pricing)
 
 
 @app.post("/api/aws-connections/{connection_id}/sync")
@@ -2020,6 +2193,11 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
             "polling": {"state": latest_poll.state if latest_poll else None, "error": latest_poll.error if latest_poll else None},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
+
+
+@app.get("/api/waves/{wave_id}/cost-estimate")
+def get_wave_cost_estimate(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    return wave_cost_estimate(session, wave_or_404(session, wave_id))
 
 
 @app.get("/api/waves/{wave_id}/deep-audit-preview")
