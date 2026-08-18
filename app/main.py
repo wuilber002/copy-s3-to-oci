@@ -818,6 +818,22 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     task_counts = dict(session.execute(
         select(Task.state, func.count(Task.id)).group_by(Task.state)
     ).all())
+    # A restore task superseded by an explicit source-region correction stays
+    # FAILED in the immutable task history, but stops being an operational
+    # alert once the wave is reprocessed.  Keep the total FAILED count for
+    # audit/export; expose this separate count for the dashboard banner.
+    superseded_region_error = "Superseded after source AWS region synchronization"
+    actionable_failed_tasks = session.scalar(
+        select(func.count(Task.id)).join(Wave).where(
+            Task.state == TaskState.FAILED,
+            or_(
+                Task.error.is_(None),
+                Task.error != superseded_region_error,
+                Wave.status == "RESTORE_REQUEST_FAILED",
+            ),
+        )
+    ) or 0
+    task_counts["ACTIONABLE_FAILED"] = int(actionable_failed_tasks)
     window_seconds = 300
     since = utcnow() - timedelta(seconds=window_seconds)
     transferred_bytes, transferred_files, first_transfer = session.execute(

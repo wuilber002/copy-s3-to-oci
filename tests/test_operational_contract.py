@@ -49,6 +49,15 @@ def test_source_region_sync_uses_base_task_update_and_invalidates_old_restore_st
     assert "INVALIDATED_REGION_MISMATCH" in handler
 
 
+def test_dashboard_keeps_superseded_region_tasks_in_audit_but_not_as_active_alerts():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index("def operations_overview")
+    end = source.index("\n\ndef restore_queue_details", start)
+    handler = source[start:end]
+    assert 'task_counts["ACTIONABLE_FAILED"]' in handler
+    assert "Superseded after source AWS region synchronization" in handler
+
+
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):
     class Data:
         def __getitem__(self, key):

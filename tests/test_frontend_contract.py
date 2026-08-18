@@ -74,3 +74,6 @@ def test_aws_connection_configuration_opens_in_a_dismissible_modal():
     assert 'id="aws-connection-configuration-modal"' in page
     assert "closeAwsConnectionConfigurationModal()" in page
     assert "openModal('#aws-connection-configuration-modal')" in page
+    handler = page[page.index("async function viewAwsConnectionConfiguration"):page.index("async function syncAwsConnection")]
+    assert "modal-actions" not in handler
+    assert "ACTIONABLE_FAILED" in page
