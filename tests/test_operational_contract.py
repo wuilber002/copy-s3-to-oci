@@ -65,6 +65,12 @@ def test_restore_submission_reports_the_failed_aws_stage_without_exposing_detail
     assert "S3 Batch Operations job creation failed:" in worker
 
 
+def test_source_creation_and_region_sync_require_the_connection_region():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    assert source.count("Source AWS region is defined by the selected AWS connection") == 2
+    assert "Source bucket region differs from its AWS connection" in source
+
+
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):
     class Data:
         def __getitem__(self, key):

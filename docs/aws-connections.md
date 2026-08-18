@@ -53,17 +53,15 @@ to the browser. Use **Sync Secret** after rotating or correcting a Secret
 version: it updates the connection's displayed region and control bucket while
 preserving the immutable local label and AWS account identity.
 
-Sources can belong to different AWS regions within the same account
-connection. Before discovery and before every paid Batch restore submission,
-RAIJIN checks the region returned by `HeadBucket` for both the source and the
-control bucket. A restore is blocked unless the configured source region, the
-actual source-bucket region and the control-bucket region are identical. The
-operator can use **Sync AWS region** on a source to correct its local region
-from AWS without repeating discovery. Any pending restore task is superseded;
-an active restore is explicitly marked `RESTORE_REQUEST_FAILED`, its prior
-Batch Job is retained as historical evidence, and the object returns to the
-wave assignment state. The operator must explicitly reprocess the wave to
-create a new safe attempt.
+An AWS connection represents one AWS account, one control bucket and one AWS
+region. Sources created with that connection inherit its region and the field
+is read-only in the console. To migrate a bucket in another region, create a
+separate connection with a control bucket in that region. Before discovery and
+before every paid Batch restore submission, RAIJIN checks the region returned
+by `HeadBucket` for both the source and the control bucket. A restore is
+blocked unless the connection, actual source bucket and control bucket regions
+are identical. **Sync AWS region** is retained only to diagnose legacy data;
+it refuses a mismatch rather than changing a source away from its connection.
 
 ## Restore evidence and failure handling
 

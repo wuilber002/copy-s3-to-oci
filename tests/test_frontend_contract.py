@@ -93,3 +93,10 @@ def test_inline_code_uses_compact_chip_styling_instead_of_large_code_blocks():
     assert "code,pre{" not in page
     assert "code{display:inline-block;max-width:100%;padding:.12rem .36rem" in page
     assert "pre code{display:block;max-width:none;padding:0" in page
+
+
+def test_source_region_is_derived_and_read_only_from_the_aws_connection():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="region" required readonly' in page
+    assert "applyAwsConnectionRegion(){const c=" in page
+    assert "$('#region').value=c?c.default_region:''" in page

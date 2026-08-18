@@ -1325,6 +1325,8 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
         connection = connection_or_404(session, payload.aws_connection_id)
         if connection.archived_at:
             raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by new sources")
+        if payload.aws_region != connection.default_region:
+            raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
     source = Source(**payload.model_dump())
     session.add(source)
     session.flush()
@@ -1349,6 +1351,8 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
         connection = connection_or_404(session, payload.aws_connection_id)
         if connection.archived_at:
             raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by sources")
+        if payload.aws_region != connection.default_region:
+            raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
     for field, value in payload.model_dump().items():
         setattr(source, field, value)
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
@@ -1385,6 +1389,8 @@ def sync_source_aws_region(source_id: int, session: Session = Depends(get_sessio
         actual = aws_bucket_region_from_connection(source.aws_connection, source.s3_bucket)
     except Exception as error:
         raise HTTPException(status_code=422, detail=f"Source AWS region lookup failed: {safe_aws_error_summary(error)}") from error
+    if actual != source.aws_connection.default_region:
+        raise HTTPException(status_code=422, detail="Source bucket region differs from its AWS connection. Create a connection with a control bucket in the source region instead of changing this source")
     previous = source.aws_region
     source.aws_bucket_region, source.aws_region = actual, actual
     pending_task_ids = select(Task.id).join(Wave).where(
