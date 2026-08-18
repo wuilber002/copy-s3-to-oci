@@ -55,7 +55,14 @@ def test_dashboard_keeps_superseded_region_tasks_in_audit_but_not_as_active_aler
     end = source.index("\n\ndef restore_queue_details", start)
     handler = source[start:end]
     assert 'task_counts["ACTIONABLE_FAILED"]' in handler
-    assert "Superseded after source AWS region synchronization" in handler
+    assert "latest_task_id" in handler
+
+
+def test_restore_submission_reports_the_failed_aws_stage_without_exposing_details():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "Restore preflight failed:" in worker
+    assert "Control-bucket manifest upload failed:" in worker
+    assert "S3 Batch Operations job creation failed:" in worker
 
 
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):

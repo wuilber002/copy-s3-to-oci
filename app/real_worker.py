@@ -327,8 +327,12 @@ def submit_restore(session, task: Task, settings) -> None:
     operation = aws_operation_config(source, settings)
     if not operation["control_bucket"] or not operation["batch_role_arn"]:
         raise RuntimeError("AWS control bucket and Batch Operations role ARN must be configured")
-    s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
-    validate_restore_preflight(session, source, s3, operation)
+    try:
+        s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
+        validate_restore_preflight(session, source, s3, operation)
+    except Exception as error:
+        _, summary = classify_task_error(error)
+        raise RuntimeError(f"Restore preflight failed: {summary}") from error
     attempt = RestoreAttempt(wave_id=wave.id, aws_region=source.aws_region, expected_objects=len(archives))
     session.add(attempt)
     session.flush()
@@ -341,16 +345,24 @@ def submit_restore(session, task: Task, settings) -> None:
             row.append(obj.version_id or "")
         writer.writerow(row)
     manifest_key = f"{operation['control_prefix'].rstrip('/')}/manifests/wave-{wave.id}/attempt-{attempt.id}.csv"
-    response = s3.put_object(Bucket=operation["control_bucket"], Key=manifest_key, Body=output.getvalue().encode("utf-8"), ContentType="text/csv")
+    try:
+        response = s3.put_object(Bucket=operation["control_bucket"], Key=manifest_key, Body=output.getvalue().encode("utf-8"), ContentType="text/csv")
+    except Exception as error:
+        _, summary = classify_task_error(error)
+        raise RuntimeError(f"Control-bucket manifest upload failed: {summary}") from error
     fields = batch_manifest_fields(has_versions)
-    job = s3control.create_job(
-        AccountId=account_id, ConfirmationRequired=False, Priority=10, RoleArn=operation["batch_role_arn"],
-        Operation={"S3InitiateRestoreObject": {"ExpirationInDays": wave.restore_days, "GlacierJobTier": wave.restore_tier}},
-        Manifest={"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": fields}, "Location": {"ObjectArn": f"arn:aws:s3:::{operation['control_bucket']}/{manifest_key}", "ETag": response["ETag"].strip('"')}},
-        Report={"Bucket": f"arn:aws:s3:::{operation['control_bucket']}", "Prefix": f"{operation['control_prefix'].rstrip('/')}/reports/wave-{wave.id}/attempt-{attempt.id}/", "Format": "Report_CSV_20180820", "Enabled": True, "ReportScope": "AllTasks"},
-        Description=f"S3 to OCI restore wave {wave.id}",
-        ClientRequestToken=f"s3-oci-wave-{wave.id}",
-    )
+    try:
+        job = s3control.create_job(
+            AccountId=account_id, ConfirmationRequired=False, Priority=10, RoleArn=operation["batch_role_arn"],
+            Operation={"S3InitiateRestoreObject": {"ExpirationInDays": wave.restore_days, "GlacierJobTier": wave.restore_tier}},
+            Manifest={"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": fields}, "Location": {"ObjectArn": f"arn:aws:s3:::{operation['control_bucket']}/{manifest_key}", "ETag": response["ETag"].strip('"')}},
+            Report={"Bucket": f"arn:aws:s3:::{operation['control_bucket']}", "Prefix": f"{operation['control_prefix'].rstrip('/')}/reports/wave-{wave.id}/attempt-{attempt.id}/", "Format": "Report_CSV_20180820", "Enabled": True, "ReportScope": "AllTasks"},
+            Description=f"S3 to OCI restore wave {wave.id}",
+            ClientRequestToken=f"s3-oci-wave-{wave.id}",
+        )
+    except Exception as error:
+        _, summary = classify_task_error(error)
+        raise RuntimeError(f"S3 Batch Operations job creation failed: {summary}") from error
     attempt.job_id, attempt.job_status, attempt.manifest_key, attempt.manifest_etag = job["JobId"], "Preparing", manifest_key, response["ETag"].strip('"')
     wave.batch_job_id, wave.batch_job_status, wave.manifest_key, wave.manifest_etag, wave.status = job["JobId"], "Preparing", manifest_key, response["ETag"].strip('"'), "RESTORE_REQUESTED"
     for obj in archives:
