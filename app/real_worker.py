@@ -197,6 +197,21 @@ def fail_permanently(session, task: Task, error: str) -> None:
     """End a task that cannot succeed without an operator correction."""
     task.state, task.lease_expires_at, task.error = TaskState.FAILED, None, error[:8000]
     wave = session.get(Wave, task.wave_id)
+    # A Batch job may have been accepted by AWS even when a later, local
+    # polling/report-processing step fails. Persist that distinction on the
+    # attempt itself so the operator can see that re-submitting a paid restore
+    # is not necessarily required.
+    if wave and task.kind == "POLL_RESTORE":
+        attempt = session.scalar(
+            select(RestoreAttempt)
+            .where(RestoreAttempt.wave_id == wave.id)
+            .order_by(RestoreAttempt.id.desc())
+        )
+        if attempt and attempt.job_id:
+            attempt.failure_summary = (
+                "Raijin polling/report processing failed after AWS accepted "
+                f"Batch job {attempt.job_id}: {task.error}"
+            )[:8000]
     if wave and wave.status not in {"PAUSED", "VERIFIED", "RESTORE_REQUEST_FAILED"}:
         wave.status = "FAILED"
     event(session, "TASK_FAILED_PERMANENTLY", f"{task.kind} requires operator action: {task.error}", wave_id=task.wave_id)
@@ -374,6 +389,10 @@ def submit_restore(session, task: Task, settings) -> None:
 
 def poll_restore(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
+    # Keep the control-bucket layout in sync with submission.  The completion
+    # report lives under the source-specific Raijin prefix, not the legacy
+    # s3-oci-control prefix.
+    operation = aws_operation_config(source, settings)
     s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
     if wave.batch_job_id:
         attempt = restore_attempt_for_job(session, wave, source)
@@ -400,7 +419,12 @@ def poll_restore(session, task: Task, settings) -> None:
             fail_restore_attempt(session, task, wave, attempt, message)
             return
         objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
-        if not import_completion_report(session, s3, operation, attempt, objects):
+        try:
+            report_available = import_completion_report(session, s3, operation, attempt, objects)
+        except Exception as error:
+            _, summary = classify_task_error(error)
+            raise RuntimeError(f"S3 Batch completion-report processing failed: {summary}") from error
+        if not report_available:
             wave.status = "RESTORE_REQUESTED"
             session.commit()
             retry(session, task, "Batch job accepted all objects; waiting for completion report evidence", 60)

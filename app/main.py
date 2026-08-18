@@ -2004,13 +2004,20 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
         ).where(ObjectRecord.wave_id == wave_id)
     ).one()
     attempts = list(session.scalars(select(RestoreAttempt).where(RestoreAttempt.wave_id == wave_id).order_by(RestoreAttempt.id.desc())))
+    latest_poll = session.scalar(
+        select(Task).where(Task.wave_id == wave_id, Task.kind == "POLL_RESTORE").order_by(Task.id.desc())
+    )
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
             "batch": {"job_id": wave.batch_job_id, "status": wave.batch_job_status, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
             "restore_attempts": [{"id": attempt.id, "job_id": attempt.job_id, "region": attempt.aws_region, "status": attempt.job_status,
                                   "expected": attempt.expected_objects, "succeeded": attempt.succeeded_objects, "failed": attempt.failed_objects,
-                                  "report_manifest_key": attempt.report_manifest_key, "failure_summary": attempt.failure_summary,
+                                  "manifest_key": attempt.manifest_key, "report_manifest_key": attempt.report_manifest_key,
+                                  "submission": "AWS_ACCEPTED" if attempt.job_id else "NOT_SUBMITTED",
+                                  "completion_evidence": "PUBLISHED" if attempt.report_manifest_key else "PENDING",
+                                  "failure_summary": attempt.failure_summary,
                                   "created_at": attempt.created_at, "completed_at": attempt.completed_at}
                                  for attempt in attempts],
+            "polling": {"state": latest_poll.state if latest_poll else None, "error": latest_poll.error if latest_poll else None},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
 

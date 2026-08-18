@@ -87,6 +87,14 @@ def test_object_detail_is_below_inventory_and_wave_report_is_scrollable_modal():
     assert ".report-content{max-height:72vh;overflow:auto" in page
 
 
+def test_wave_report_distinguishes_aws_batch_evidence_from_raijin_polling():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "AWS submission:" in page
+    assert "Batch execution:" in page
+    assert "Completion evidence:" in page
+    assert "Raijin polling:" in page
+
+
 def test_object_detail_opens_in_a_scrollable_modal():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="object-detail-modal"' in page

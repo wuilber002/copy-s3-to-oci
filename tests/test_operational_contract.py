@@ -65,6 +65,14 @@ def test_restore_submission_reports_the_failed_aws_stage_without_exposing_detail
     assert "S3 Batch Operations job creation failed:" in worker
 
 
+def test_restore_polling_uses_the_same_control_prefix_as_submission_and_labels_report_errors():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    poll = worker[worker.index("def poll_restore"):worker.index("\n\ndef sha256_b64")]
+    assert "operation = aws_operation_config(source, settings)" in poll
+    assert "S3 Batch completion-report processing failed:" in poll
+    assert "Raijin polling/report processing failed after AWS accepted" in worker
+
+
 def test_source_creation_and_region_sync_require_the_connection_region():
     source = Path("app/main.py").read_text(encoding="utf-8")
     assert source.count("Source AWS region is defined by the selected AWS connection") == 2
