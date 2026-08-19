@@ -127,14 +127,19 @@ def build_summary(wb):
         ws.cell(r, 1).font = Font(bold=True, color=WHITE); ws.cell(r, 6).font = Font(size=14, bold=True, color=WHITE); ws.cell(r, 6).fill = PatternFill("solid", fgColor=TOTAL); money(ws.cell(r, 6))
         ws.row_dimensions[r].height = 30
     ws.cell(19, 1, "Tempo estimado para transferir todos os dados")
-    ws.cell(19, 2, localized_formula("='Transfer data'!B6*8000000/'Transfer data'!B17/86400"))
-    ws.cell(19, 3, "duração")
-    ws.cell(19, 7, "Baseado no volume total e na vazão efetiva configurada. Não inclui restore, filas, pausas, retries ou validações.")
+    total_hours = "ROUND('Transfer data'!B6*8000000/'Transfer data'!B17/3600,0)"
+    duration_formula = (
+        f'=INT({total_hours}/(24*30))&" meses, "&'
+        f'INT(MOD({total_hours},24*30)/24)&" dias e "&'
+        f'MOD({total_hours},24)&" horas"'
+    )
+    ws.cell(19, 2, localized_formula(duration_formula))
+    ws.cell(19, 3, "meses, dias e horas")
+    ws.cell(19, 7, "Baseado no volume total e na vazão efetiva configurada. Mês operacional = 30 dias. Não inclui restore, filas, pausas, retries ou validações.")
     for c in range(1, 9): style(ws.cell(19, c))
     ws.cell(19, 1).font = Font(bold=True, color=WHITE)
     ws.cell(19, 2).font = Font(size=14, bold=True, color=WHITE)
     ws.cell(19, 2).fill = PatternFill("solid", fgColor=GREEN)
-    ws.cell(19, 2).number_format = '[h]" h "mm" min"'
     ws.row_dimensions[19].height = 34
     ws.freeze_panes = "A5"
     outbound_toggle = DataValidation(type="list", formula1='"TRUE,FALSE"')
