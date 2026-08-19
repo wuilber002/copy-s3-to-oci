@@ -66,11 +66,12 @@ def build_transfer_data(wb):
         ("Preservar tags S3", True, "Use TRUE quando as tags S3 devem ser copiadas. Isso adiciona uma leitura GET/TAG por arquivo. Use FALSE quando tags não são necessárias."),
         ("Dados Deep Archive a excluir antecipadamente (TB)", 0, "Informe apenas o volume que será excluído ou movido de Deep Archive antes de completar 180 dias. Use zero se os dados permanecerem no S3."),
         ("Idade média no Deep Archive (dias)", 180, "Informe a idade média ponderada desde a entrada no Deep Archive — não use LastModified se a transição foi por lifecycle. Com 180 ou mais, não há cobrança antecipada."),
+        ("Vazão efetiva estimada (Mbps)", 1200, "Informe a vazão média efetiva esperada para a cópia, em Mbps. Use uma taxa sustentável medida ou conservadora — não necessariamente a capacidade nominal do link. É usada somente na estimativa de tempo."),
     ]
     for r, data in enumerate(rows, 5):
         for c, value in enumerate(data, 1): ws.cell(r, c, value); style(ws.cell(r, c), editable=c == 2 and r != 9)
         ws.row_dimensions[r].height = 29
-    for cell, decimals in (("B6", 2), ("B7", 0), ("B8", 2), ("B9", 0), ("B12", 0), ("B13", 0), ("B15", 2), ("B16", 0)): number(ws[cell], decimals)
+    for cell, decimals in (("B6", 2), ("B7", 0), ("B8", 2), ("B9", 0), ("B12", 0), ("B13", 0), ("B15", 2), ("B16", 0), ("B17", 0)): number(ws[cell], decimals)
     ws["B10"].number_format = "0.0%"
     yes_no = DataValidation(type="list", formula1='"TRUE,FALSE"'); tier = DataValidation(type="list", formula1='"BULK,STANDARD"')
     ws.add_data_validation(yes_no); yes_no.add("B14")
@@ -125,6 +126,16 @@ def build_summary(wb):
         for c in range(1, 9): style(ws.cell(r, c))
         ws.cell(r, 1).font = Font(bold=True, color=WHITE); ws.cell(r, 6).font = Font(size=14, bold=True, color=WHITE); ws.cell(r, 6).fill = PatternFill("solid", fgColor=TOTAL); money(ws.cell(r, 6))
         ws.row_dimensions[r].height = 30
+    ws.cell(19, 1, "Tempo estimado para transferir todos os dados")
+    ws.cell(19, 2, localized_formula("='Transfer data'!B6*8000000/'Transfer data'!B17/86400"))
+    ws.cell(19, 3, "duração")
+    ws.cell(19, 7, "Baseado no volume total e na vazão efetiva configurada. Não inclui restore, filas, pausas, retries ou validações.")
+    for c in range(1, 9): style(ws.cell(19, c))
+    ws.cell(19, 1).font = Font(bold=True, color=WHITE)
+    ws.cell(19, 2).font = Font(size=14, bold=True, color=WHITE)
+    ws.cell(19, 2).fill = PatternFill("solid", fgColor=GREEN)
+    ws.cell(19, 2).number_format = '[h]" h "mm" min"'
+    ws.row_dimensions[19].height = 34
     ws.freeze_panes = "A5"
     outbound_toggle = DataValidation(type="list", formula1='"TRUE,FALSE"')
     ws.add_data_validation(outbound_toggle); outbound_toggle.add("H13")
