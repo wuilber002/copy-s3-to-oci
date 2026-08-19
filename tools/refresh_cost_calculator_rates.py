@@ -96,7 +96,7 @@ def transfer_rate(catalog: dict) -> float | None:
 
 def update_workbook(workbook: Path, regions: list[str]) -> None:
     wb = load_workbook(workbook)
-    ws = wb["Tariffs by region"]
+    ws = wb["Tarifas por região"]
     rows = {str(ws.cell(row, 1).value): row for row in range(5, ws.max_row + 1) if ws.cell(row, 1).value}
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     for region in regions:
@@ -121,7 +121,7 @@ def update_workbook(workbook: Path, regions: list[str]) -> None:
         for column, (key, multiplier) in mapping.items():
             if key in rates:
                 ws.cell(row, column, rates[key] * multiplier)
-        ws.cell(row, 12, f"AWS public catalogs refreshed {now}. Deep Archive storage remains a separate public-price input.")
+        ws.cell(row, 12, f"Catálogos públicos AWS atualizados em {now}. Armazenamento Deep Archive continua como tarifa pública preenchida separadamente.")
         print(f"{region}: refreshed {len(rates)} AWS rate(s) into row {row}")
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
