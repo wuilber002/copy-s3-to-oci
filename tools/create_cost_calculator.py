@@ -9,7 +9,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.worksheet.datavalidation import DataValidation
 
 OUTPUT = Path(__file__).resolve().parents[1] / "docs" / "raijin-cost-calculator.xlsx"
-NAVY, PANEL, BLUE, GREEN, WHITE, MUTED, INPUT = "101A2D", "19263E", "3B82F6", "166534", "F8FAFC", "C5D2E8", "FFF2CC"
+NAVY, PANEL, BLUE, GREEN, WHITE, MUTED, INPUT, TOTAL = "101A2D", "19263E", "3B82F6", "166534", "F8FAFC", "C5D2E8", "FFF2CC", "0F5132"
 THIN = Side(style="thin", color="4B5E7A")
 
 
@@ -38,7 +38,8 @@ def style(cell, editable=False):
     cell.border = Border(top=THIN, bottom=THIN, left=THIN, right=THIN)
 
 
-def money(cell): cell.number_format = 'US$ #,##0.00;[Red]-US$ #,##0.00;—'
+def money(cell): cell.number_format = '$ #,##0.00;[Red]-$ #,##0.00;$ 0.00'
+def rate(cell): cell.number_format = '$ #,##0.000000;[Red]-$ #,##0.000000;$ 0.000000'
 def number(cell, decimals=2): cell.number_format = f'#,##0.{"0" * decimals};[Red]-#,##0.{"0" * decimals};—'
 def localized_formula(value):
     return value.replace("'Transfer data'", "'Dados da transferência'").replace("'Tariffs by region'", "'Tarifas por região'") if isinstance(value, str) else value
@@ -88,7 +89,8 @@ def build_tariffs(wb):
     ]
     for r in range(5, 55):
         values = starter[r - 5] if r <= 6 else [None] * 12
-        for c, value in enumerate(values, 1): ws.cell(r, c, value); style(ws.cell(r, c), editable=True); money(ws.cell(r, c)) if 3 <= c <= 11 else None
+        for c, value in enumerate(values, 1): ws.cell(r, c, value); style(ws.cell(r, c), editable=True); rate(ws.cell(r, c)) if 3 <= c <= 11 else None
+        ws.row_dimensions[r].height = 27
     ws.auto_filter.ref = "A4:L54"; ws.freeze_panes = "A5"
 
 
@@ -113,12 +115,14 @@ def build_summary(wb):
     for r, values in enumerate(rows, 5):
         for c, value in enumerate(values, 1): ws.cell(r, c, localized_formula(value)); style(ws.cell(r, c))
         ws.cell(r, 8, True if r == 13 else "—"); style(ws.cell(r, 8), editable=r == 13)
-        number(ws.cell(r, 2), 4); money(ws.cell(r, 4)); money(ws.cell(r, 6))
+        number(ws.cell(r, 2), 4); rate(ws.cell(r, 4)); money(ws.cell(r, 6))
+        ws.row_dimensions[r].height = 27
     totals = [("Custo único por wave", "=SUM(F5:F13)"), ("Custo único do projeto", "=F16*'Transfer data'!B9+F14")]
     for r, (label, formula) in enumerate(totals, 16):
         ws.cell(r, 1, label); ws.cell(r, 6, localized_formula(formula))
         for c in range(1, 9): style(ws.cell(r, c))
-        ws.cell(r, 1).font = Font(bold=True, color=WHITE); ws.cell(r, 6).font = Font(size=14, bold=True, color=WHITE); ws.cell(r, 6).fill = PatternFill("solid", fgColor=GREEN); money(ws.cell(r, 6))
+        ws.cell(r, 1).font = Font(bold=True, color=WHITE); ws.cell(r, 6).font = Font(size=14, bold=True, color=WHITE); ws.cell(r, 6).fill = PatternFill("solid", fgColor=TOTAL); money(ws.cell(r, 6))
+        ws.row_dimensions[r].height = 30
     ws.freeze_panes = "A5"
     outbound_toggle = DataValidation(type="list", formula1='"TRUE,FALSE"')
     ws.add_data_validation(outbound_toggle); outbound_toggle.add("H13")
