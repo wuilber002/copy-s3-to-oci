@@ -161,7 +161,10 @@ def test_collected_public_pricing_handler_keeps_modal_open_inside_its_try_block(
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     start = page.index("async function showCollectedPublicPricing")
     handler = page[start:page.index("\nasync function saveCostPricing", start)]
-    assert "}).join('')};openModal('#public-pricing-modal')}catch" in handler
+    assert "openModal('#public-pricing-modal')}catch" in handler
+    assert "renderCollectedPublicPricing(select.value)" in handler
+    assert 'id="public-pricing-region"' in page
+    assert "unitRateMoney" in page
 
 
 def test_cost_symbols_show_hover_summary_and_keep_clickable_detail():

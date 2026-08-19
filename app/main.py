@@ -760,7 +760,8 @@ def public_s3_rates_from_catalog(catalog: dict) -> dict[str, float]:
     for product in (catalog.get("products") or {}).values():
         attributes = product.get("attributes") or {}
         blob = " ".join(str(attributes.get(key, "")).lower() for key in (
-            "group", "groupDescription", "usagetype", "operation", "storageClass", "volumeType", "productFamily"
+            "group", "groupDescription", "feeCode", "feeDescription", "usagetype", "operation",
+            "storageClass", "volumeType", "productFamily"
         )).replace("-", " ").replace("_", " ").replace("/", " ")
         sku = product.get("sku")
         price = first_on_demand_usd({"OnDemand": (catalog.get("terms") or {}).get("OnDemand", {}).get(sku, {})}) if sku else None

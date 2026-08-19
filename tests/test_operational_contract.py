@@ -193,6 +193,27 @@ def test_public_aws_price_list_maps_only_supported_s3_rates():
     assert GlobalAwsPricing.__tablename__ == "global_aws_pricing"
 
 
+def test_public_aws_price_list_preserves_sub_cent_request_rates():
+    def product(sku, attributes, price):
+        return ({"sku": sku, "attributes": attributes}, {sku: {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": str(price)}}}}}})
+
+    products, terms = {}, {}
+    for sku, attributes, price in (
+        ("batch-job", {"feeCode": "S3-BatchOperations-Jobs"}, 0.25),
+        ("batch-object", {"feeCode": "S3-BatchOperations-Objects"}, 0.000001),
+        ("tier1", {"group": "S3-API-Tier1"}, 0.000007),
+        ("tier2", {"group": "S3-API-Tier2"}, 0.00000056),
+    ):
+        item, item_terms = product(sku, attributes, price)
+        products[sku] = item
+        terms.update(item_terms)
+    rates = public_s3_rates_from_catalog({"products": products, "terms": {"OnDemand": terms}})
+    assert rates["aws_batch_job_usd"] == pytest.approx(0.25)
+    assert rates["aws_batch_object_usd_per_1000"] == pytest.approx(0.001)
+    assert rates["aws_s3_put_list_usd_per_1000"] == pytest.approx(0.007)
+    assert rates["aws_s3_get_usd_per_1000"] == pytest.approx(0.00056)
+
+
 def test_public_aws_transfer_catalog_uses_only_external_egress_rate():
     catalog = {"products": {
         "mrap": {"sku": "mrap", "attributes": {"toLocation": "External", "transferType": "InterRegion Outbound"}},
