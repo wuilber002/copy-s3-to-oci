@@ -40,7 +40,9 @@ def style(cell, editable=False):
 
 def money(cell): cell.number_format = '$ #,##0.00;[Red]-$ #,##0.00;$ 0.00'
 def rate(cell): cell.number_format = '$ #,##0.000000;[Red]-$ #,##0.000000;$ 0.000000'
-def number(cell, decimals=2): cell.number_format = f'#,##0.{"0" * decimals};[Red]-#,##0.{"0" * decimals};—'
+def number(cell, decimals=2):
+    decimal_part = f'.{"0" * decimals}' if decimals else ''
+    cell.number_format = f'#,##0{decimal_part};[Red]-#,##0{decimal_part};0'
 def localized_formula(value):
     return value.replace("'Transfer data'", "'Dados da transferência'").replace("'Tariffs by region'", "'Tarifas por região'") if isinstance(value, str) else value
 
@@ -59,7 +61,7 @@ def build_transfer_data(wb):
         ("Quantidade calculada de waves", "=ROUNDUP(B6/B8,0)", "Campo calculado automaticamente a partir dos dados totais e do tamanho máximo da wave. Não editar."),
         ("Percentual em Deep Archive", 1, "Informe uma fração entre 0 e 1. Use 1 para 100% dos dados em DEEP_ARCHIVE, 0,5 para 50%. Apenas essa parcela recebe custos de restore."),
         ("Tier de restore", "BULK", "Selecione BULK para menor custo e maior prazo, ou STANDARD para maior velocidade e custo. Aplica-se à parcela Deep Archive."),
-        ("Retenção do restore (dias)", 2, "Informe por quantos dias a cópia temporária S3 Standard ficará disponível após o restore terminar. Para Deep Archive BULK, 2 dias é a opção mais segura."),
+        ("Retenção do restore (horas)", 48, "Informe por quantas horas a cópia temporária S3 Standard ficará disponível após o restore terminar. Para Deep Archive BULK, 48 horas é a opção mais segura."),
         ("Ciclos esperados de polling por wave", 24, "Informe quantas verificações de disponibilidade a plataforma deve fazer, em média, até o restore ficar pronto. É uma estimativa conservadora de requests."),
         ("Preservar tags S3", True, "Use TRUE quando as tags S3 devem ser copiadas. Isso adiciona uma leitura GET/TAG por arquivo. Use FALSE quando tags não são necessárias."),
         ("Dados Deep Archive a excluir antecipadamente (TB)", 0, "Informe apenas o volume que será excluído ou movido de Deep Archive antes de completar 180 dias. Use zero se os dados permanecerem no S3."),
@@ -103,7 +105,7 @@ def build_summary(wb):
     rows = [
         ("Recuperação Deep Archive BULK", "='Transfer data'!B8*1000*'Transfer data'!B10", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,5,FALSE)", "AWS pública", "=IF('Transfer data'!B11=\"BULK\",IFERROR(B5*D5,\"Não precificado\"),0)", "Somente a parcela em Deep Archive."),
         ("Recuperação Deep Archive STANDARD", "='Transfer data'!B8*1000*'Transfer data'!B10", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,6,FALSE)", "AWS pública", "=IF('Transfer data'!B11=\"STANDARD\",IFERROR(B6*D6,\"Não precificado\"),0)", "Somente a parcela em Deep Archive."),
-        ("Cópia temporária restaurada", "='Transfer data'!B8*1000*'Transfer data'!B10*'Transfer data'!B12/30", "GB-mês / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,7,FALSE)", "AWS pública", "=IFERROR(B7*D7,\"Não precificado\")", "Cópia S3 Standard temporária após o restore."),
+        ("Cópia temporária restaurada", "='Transfer data'!B8*1000*'Transfer data'!B10*'Transfer data'!B12/(24*30)", "GB-mês / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,7,FALSE)", "AWS pública", "=IFERROR(B7*D7,\"Não precificado\")", "Cópia S3 Standard temporária após o restore; a retenção em horas é convertida para mês."),
         ("S3 Batch Operations", "=1", "job / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,10,FALSE)", "AWS pública", "=IFERROR(B8*D8,\"Não precificado\")", "Um job de restore por onda arquivada."),
         ("Tarefas de objeto S3 Batch", "=ROUNDUP('Transfer data'!B7/'Transfer data'!B9,0)", "objetos / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,11,FALSE)/1000", "AWS pública", "=IFERROR(B9*D9,\"Não precificado\")", "Tarifa de objeto normalizada para uma unidade."),
         ("Discovery e polling de restore", "=(ROUNDUP('Transfer data'!B7/1000,0)*'Transfer data'!B13)+ROUNDUP('Transfer data'!B7/'Transfer data'!B9/1000,0)", "solicitações / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,8,FALSE)/1000", "AWS pública", "=IFERROR(B10*D10,\"Não precificado\")", "Estimativa conservadora baseada em ListObjectsV2."),
