@@ -8,6 +8,7 @@ crash.log
 *.pem
 *.key
 releases/
+operational/
 .s3-data-bucket/
 __pycache__/
 *:Zone.Identifier
