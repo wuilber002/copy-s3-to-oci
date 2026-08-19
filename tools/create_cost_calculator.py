@@ -80,6 +80,7 @@ def build_readme(wb):
     ws.column_dimensions["B"].width = 110
     items = [
         ("1. Tariffs", "Maintain public or contracted rates by region in ‘Tariffs by region’. The sa-east-1 starter values were collected by Raijin on 2026-08-19; validate them before approving spend."),
+        ("Refresh AWS public rates", "Run: python3 tools/refresh_cost_calculator_rates.py --regions sa-east-1,us-east-1. It calls the same public Amazon S3 and AWS Data Transfer catalog endpoints used by Raijin. It updates AWS public rate columns only; FastConnect/Direct Connect, Deep Archive storage and OCI fields remain under customer control."),
         ("2. Main inputs", "Select the AWS region and enter data volume, object count, wave size, archive mix, restore tier, retention and FastConnect/Direct Connect assumptions."),
         ("3. AWS estimate", "Shows charged AWS-side components. Outbound is optional and can use a specific FastConnect/Direct Connect rate when entered."),
         ("4. OCI estimate", "Separates one-time write requests, storage accrued while data arrives, and the recurring final Object Storage cost."),
