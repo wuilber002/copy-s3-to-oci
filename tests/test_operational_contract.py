@@ -38,6 +38,12 @@ def test_discovery_worker_recovers_an_interrupted_checkpoint_without_counting_do
     assert "exact end unknowable" in worker
 
 
+def test_startup_backfills_discovery_duration_for_historical_sources():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    assert "EXTRACT(EPOCH FROM (discovery_completed_at - discovery_requested_at))" in source
+    assert "julianday(discovery_completed_at)" in source
+
+
 def test_postgres_recovery_tool_requires_an_explicit_backup_and_confirmation():
     script = Path("scripts/restore-postgres.sh").read_text(encoding="utf-8")
     assert "--confirm-restore" in script

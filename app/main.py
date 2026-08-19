@@ -568,6 +568,25 @@ def create_schema() -> None:
         for column, sql_type in source_columns.items():
             if column not in existing_source_columns:
                 connection.execute(text(f"ALTER TABLE sources ADD COLUMN {column} {sql_type}"))
+        # Preserve visibility for discoveries completed before elapsed-time was
+        # introduced.  New/retried discoveries use precise accumulated work
+        # time; this one-time backfill is the best durable historical value.
+        if engine.dialect.name == "postgresql":
+            connection.execute(text("""
+                UPDATE sources
+                SET discovery_elapsed_seconds = EXTRACT(EPOCH FROM (discovery_completed_at - discovery_requested_at))
+                WHERE discovery_elapsed_seconds = 0
+                  AND discovery_completed_at IS NOT NULL
+                  AND discovery_requested_at IS NOT NULL
+            """))
+        elif engine.dialect.name == "sqlite":
+            connection.execute(text("""
+                UPDATE sources
+                SET discovery_elapsed_seconds = (julianday(discovery_completed_at) - julianday(discovery_requested_at)) * 86400.0
+                WHERE discovery_elapsed_seconds = 0
+                  AND discovery_completed_at IS NOT NULL
+                  AND discovery_requested_at IS NOT NULL
+            """))
         for column, sql_type in wave_columns.items():
             if column not in existing_wave_columns:
                 connection.execute(text(f"ALTER TABLE waves ADD COLUMN {column} {sql_type}"))
