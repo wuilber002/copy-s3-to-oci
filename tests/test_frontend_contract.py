@@ -153,3 +153,12 @@ def test_cost_pricing_can_show_collected_public_rates_and_modals_lock_background
     assert "Ver valores coletados" in page
     assert "body.modal-open{overflow:hidden}" in page
     assert "syncModalScrollLock" in page
+
+
+def test_cost_symbols_show_hover_summary_and_keep_clickable_detail():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "loadWaveCostTooltip" in page
+    assert "loadSourceCostTooltip" in page
+    assert "costTooltip(data)" in page
+    assert ".cost-action[data-cost-help]:hover::after" in page
+    assert "Custo único ${complete?'estimado':'parcial'}" in page

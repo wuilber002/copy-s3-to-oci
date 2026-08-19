@@ -229,6 +229,7 @@ def test_wave_cost_estimator_documents_transparent_unit_assumptions():
         assert component in estimator
     assert "pricing.expected_restore_poll_cycles" in estimator
     assert "if pricing.include_aws_transfer_out:" in estimator
+    assert '"total_completeness"' in estimator
     assert "never a promise" in estimator
 
 
@@ -247,3 +248,12 @@ def test_source_cost_endpoint_uses_created_waves_and_reports_unassigned_inventor
     assert "wave_cost_estimate" in handler
     assert "unassigned_objects" in handler
     assert '"currency"' in handler
+    assert '"total_completeness"' in handler
+
+
+def test_public_price_refresh_covers_active_source_regions_including_legacy_sources():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index("def active_pricing_regions")
+    handler = source[start:source.index("\n\ndef refresh_due_global_aws_pricing", start)]
+    assert "Source.aws_region" in handler
+    assert "AwsConnection.default_region" in handler

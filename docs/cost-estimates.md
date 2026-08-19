@@ -28,6 +28,10 @@ A precedência é aplicada por campo, para cada conexão:
 2. tarifa pública AWS da região da conexão;
 3. não estimado, quando nenhuma das duas fontes contém uma tarifa aplicável.
 
+RAIJIN coleta preços para as regiões das conexões e também para regiões ainda
+registradas em sources legadas. Isso preserva estimativas corretas quando uma
+origem histórica foi criada antes da região da conexão ser sincronizada.
+
 Em **Configurações → Conexões AWS → Tarifas**, preencha somente os valores que
 devem substituir a lista pública. A tabela é por conexão porque contas podem
 estar em regiões diferentes ou ter preços negociados distintos. Deixar um
@@ -44,8 +48,8 @@ AWS S3 Pricing, sa-east-1, contrato cliente, revisado em 2026-08-18
 A tabela pública AWS não cobre preços OCI. Para que o custo fim a fim inclua
 operações e armazenamento OCI, preencha esses campos na conexão com a tabela
 OCI aplicável ao tenancy. Uma tarifa ausente não é assumida como zero: o
-componente aparece como **não estimado** e o custo único total da wave também
-fica indisponível se aquele componente for necessário. O valor `0` é aceito
+componente aparece como **não estimado**, mas os componentes conhecidos passam
+a compor um **subtotal parcial** claramente identificado. O valor `0` é aceito
 somente quando o operador confirmou que aquela operação é gratuita no
 contrato/tier escolhido.
 

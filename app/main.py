@@ -843,13 +843,25 @@ def global_pricing_summary(session: Session, aws_region: str) -> dict:
             "error": row.error if row else None}
 
 
+def active_pricing_regions(session: Session) -> list[str]:
+    """Include legacy source regions as well as current connection defaults.
+
+    New sources inherit their connection region, but existing migration history
+    can legitimately retain an older source region. Its wave must use the same
+    public price list as the S3 operations it records.
+    """
+    connection_regions = session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))
+    source_regions = session.scalars(select(Source.aws_region).where(Source.archived_at.is_(None), Source.aws_connection_id.is_not(None)))
+    return sorted({region for region in [*connection_regions, *source_regions] if region})
+
+
 def refresh_due_global_aws_pricing(session: Session) -> None:
     """Best-effort periodic public catalog refresh; never blocks migration work."""
     settings = runtime_settings(session)
     if not settings.cost_estimation_enabled or not settings.cost_pricing_auto_refresh_enabled:
         return
     cutoff = utcnow() - timedelta(days=settings.cost_pricing_refresh_days)
-    regions = sorted(set(session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))))
+    regions = active_pricing_regions(session)
     for region in regions:
         cached = session.scalar(select(GlobalAwsPricing).where(GlobalAwsPricing.aws_region == region))
         if cached and cached.fetched_at and cached.fetched_at >= cutoff:
@@ -932,14 +944,17 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     one_time = [item["cost"] for item in components if item["category"] == "one_time"]
     recurring = [item["cost"] for item in components if item["category"] == "recurring"]
     optional = [item["cost"] for item in components if item["category"] == "optional"]
+    def estimated(values: list[float | None]) -> float:
+        return round(sum(value for value in values if value is not None), 6)
     return {"wave_id": wave.id, "connection_id": source.aws_connection_id, "connection_label": source.aws_connection.label,
             "currency": pricing.currency.upper(), "pricing_reference": pricing.reference, "pricing_updated_at": pricing.updated_at,
             "global_pricing": public,
             "complete": not missing_by_category["one_time"] and not unpriced_archive_gib,
             "missing_rates": sorted(set(missing)), "unpriced_archive_gib": round(unpriced_archive_gib, 6),
-            "totals": {"one_time": round(sum(one_time), 6) if not any(value is None for value in one_time) and not missing_by_category["one_time"] and not unpriced_archive_gib else None,
-                       "recurring_monthly": round(sum(recurring), 6) if not any(value is None for value in recurring) else None,
-                       "optional_deep_audit": round(sum(optional), 6) if not any(value is None for value in optional) else None},
+            "totals": {"one_time": estimated(one_time), "recurring_monthly": estimated(recurring), "optional_deep_audit": estimated(optional)},
+            "total_completeness": {"one_time": not missing_by_category["one_time"] and not unpriced_archive_gib,
+                                   "recurring_monthly": not missing_by_category["recurring"],
+                                   "optional_deep_audit": not missing_by_category["optional"]},
             "quantities": {"objects": len(objects), "archive_objects": len(archived), "bytes": total_bytes,
                            "source_inventory_objects": int(source_objects), "multipart_part_mib": settings.multipart_part_size_mib,
                            "estimated_poll_cycles": pricing.expected_restore_poll_cycles, "oci_write_operations": oci_put_operations},
@@ -1600,13 +1615,13 @@ def update_cost_pricing(connection_id: int, payload: CostPricingUpdate, session:
 
 @app.get("/api/global-aws-pricing")
 def get_global_aws_pricing(session: Session = Depends(get_session)) -> list[dict]:
-    regions = sorted(set(session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))))
+    regions = active_pricing_regions(session)
     return [global_pricing_summary(session, region) for region in regions]
 
 
 @app.post("/api/global-aws-pricing/refresh")
 def refresh_global_aws_pricing_now(session: Session = Depends(get_session)) -> dict:
-    regions = sorted(set(session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))))
+    regions = active_pricing_regions(session)
     if not regions:
         raise HTTPException(status_code=409, detail="No active AWS connections are available for public pricing refresh")
     updated = []
@@ -2420,6 +2435,8 @@ def get_source_cost_estimate(source_id: int, session: Session = Depends(get_sess
             "unassigned_objects": unassigned_objects, "unassigned_bytes": unassigned_bytes,
             "complete": bool(estimates) and not unassigned_objects and all(item["complete"] for item in estimates),
             "totals": {"one_time": total("one_time"), "recurring_monthly": total("recurring_monthly"), "optional_deep_audit": total("optional_deep_audit")},
+            "total_completeness": {key: bool(estimates) and all(item["total_completeness"][key] for item in estimates)
+                                   for key in ("one_time", "recurring_monthly", "optional_deep_audit")},
             "wave_estimates": [{"wave_id": item["wave_id"], "one_time": item["totals"]["one_time"], "complete": item["complete"]} for item in estimates]}
 
 
