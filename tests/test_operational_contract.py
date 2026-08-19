@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import validate_restore_preflight
 
 
@@ -173,6 +173,50 @@ def test_cost_pricing_keeps_rates_optional_but_non_negative():
     assert CostPricing.__tablename__ == "cost_pricing"
 
 
+def test_public_aws_price_list_maps_only_supported_s3_rates():
+    def product(sku, group, price):
+        return ({"sku": sku, "attributes": {"group": group}}, {sku: {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": str(price)}}}}}})
+
+    products, terms = {}, {}
+    for sku, group, price in (
+        ("tier1", "S3-API-Tier1", 0.005),
+        ("deep", "S3-GlacierDeepArchive-Retrieval-Bulk", 0.0025),
+    ):
+        item, item_terms = product(sku, group, price)
+        products[sku] = item
+        terms.update(item_terms)
+    rates = public_s3_rates_from_catalog({"products": products, "terms": {"OnDemand": terms}})
+    assert rates["aws_s3_put_list_usd_per_1000"] == pytest.approx(5)
+    assert rates["aws_deep_archive_bulk_retrieval_usd_per_gib"] == pytest.approx(0.00268435456)
+    assert GlobalAwsPricing.__tablename__ == "global_aws_pricing"
+
+
+def test_public_aws_transfer_catalog_uses_only_external_egress_rate():
+    catalog = {"products": {
+        "mrap": {"sku": "mrap", "attributes": {"toLocation": "External", "transferType": "InterRegion Outbound"}},
+        "global": {"sku": "global", "attributes": {"fromLocation": "Global", "toLocation": "External", "transferType": "AWS Outbound"}},
+        "egress": {"sku": "egress", "attributes": {"fromLocation": "South America (Sao Paulo)", "toLocation": "External", "transferType": "AWS Outbound"}},
+    }, "terms": {"OnDemand": {
+        "mrap": {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": "0.0033"}}}}},
+        "global": {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": "0"}}}}},
+        "egress": {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": "0.15"}}}}},
+    }}}
+    rates = public_transfer_rates_from_catalog(catalog)
+    assert rates["aws_transfer_out_usd_per_gib"] == pytest.approx(0.1610612736)
+
+
+def test_cost_pricing_refresh_settings_have_safe_defaults_and_bounds():
+    payload = {
+        "transfer_workers": 4, "max_throughput_mbps": 1000, "multipart_part_size_mib": 64,
+        "default_wave_size_bytes": 1024, "default_restore_days": 7, "default_restore_tier": "BULK",
+        "task_lease_seconds": 300,
+    }
+    assert RuntimeSettingsUpdate(**payload).cost_pricing_auto_refresh_enabled is True
+    assert RuntimeSettingsUpdate(**payload).cost_pricing_refresh_days == 7
+    with pytest.raises(ValidationError):
+        RuntimeSettingsUpdate(**(payload | {"cost_pricing_refresh_days": 0}))
+
+
 def test_wave_cost_estimator_documents_transparent_unit_assumptions():
     source = Path("app/main.py").read_text(encoding="utf-8")
     start = source.index("def wave_cost_estimate")
@@ -192,3 +236,12 @@ def test_cost_estimate_endpoint_is_explicitly_gated_by_operational_setting():
     handler = source[start:source.index('\n\n@app.get("/api/waves/{wave_id}/deep-audit-preview")', start)]
     assert "cost_estimation_enabled" in handler
     assert "Cost estimation is disabled in operational settings" in handler
+
+
+def test_source_cost_endpoint_uses_created_waves_and_reports_unassigned_inventory():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index('def get_source_cost_estimate')
+    handler = source[start:source.index('\n\n@app.get("/api/waves/{wave_id}/deep-audit-preview")', start)]
+    assert "wave_cost_estimate" in handler
+    assert "unassigned_objects" in handler
+    assert '"currency"' in handler

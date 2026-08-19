@@ -23,6 +23,7 @@ import base64
 import math
 import re
 import shutil
+from urllib.request import Request, urlopen
 
 from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -157,6 +158,19 @@ class CostPricing(Base):
     oci_get_usd_per_10000: Mapped[float | None] = mapped_column(Float, nullable=True)
     oci_storage_usd_per_gib_month: Mapped[float | None] = mapped_column(Float, nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class GlobalAwsPricing(Base):
+    """Cached public AWS Price List values, one row per source region/currency."""
+    __tablename__ = "global_aws_pricing"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    aws_region: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    currency: Mapped[str] = mapped_column(String(8), default="USD")
+    rates_json: Mapped[str] = mapped_column(Text, default="{}")
+    source_url: Mapped[str | None] = mapped_column(String(2048), nullable=True)
+    fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class AwsSecretCache(Base):
@@ -340,6 +354,8 @@ class RuntimeSettings(Base):
     preserve_s3_tags: Mapped[bool] = mapped_column(default=True)
     real_worker_enabled: Mapped[bool] = mapped_column(default=False)
     cost_estimation_enabled: Mapped[bool] = mapped_column(default=False)
+    cost_pricing_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
+    cost_pricing_refresh_days: Mapped[int] = mapped_column(Integer, default=7)
     activity_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
     activity_refresh_seconds: Mapped[int] = mapped_column(Integer, default=15)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
@@ -441,6 +457,8 @@ class RuntimeSettingsUpdate(BaseModel):
     preserve_s3_tags: bool = True
     real_worker_enabled: bool = False
     cost_estimation_enabled: bool = False
+    cost_pricing_auto_refresh_enabled: bool = True
+    cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
 
 
 class ActivityRefreshSettingsUpdate(BaseModel):
@@ -510,6 +528,8 @@ def create_schema() -> None:
         "preserve_s3_tags": "BOOLEAN NOT NULL DEFAULT TRUE",
         "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "cost_estimation_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "cost_pricing_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
+        "cost_pricing_refresh_days": "INTEGER NOT NULL DEFAULT 7",
         "multipart_part_size_mib": "INTEGER NOT NULL DEFAULT 64",
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
@@ -585,6 +605,8 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
             "simulation_enabled": settings.simulation_enabled, "real_worker_enabled": settings.real_worker_enabled,
             "preserve_s3_tags": settings.preserve_s3_tags, "cost_estimation_enabled": settings.cost_estimation_enabled,
+            "cost_pricing_auto_refresh_enabled": settings.cost_pricing_auto_refresh_enabled,
+            "cost_pricing_refresh_days": settings.cost_pricing_refresh_days,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
             "activity_refresh_seconds": settings.activity_refresh_seconds, "updated_at": settings.updated_at}
 
@@ -691,6 +713,148 @@ def pricing_dict(pricing: CostPricing) -> dict:
             **{field: getattr(pricing, field) for field in PRICING_RATE_FIELDS}, "updated_at": pricing.updated_at}
 
 
+AWS_PUBLIC_S3_REGION_URL = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/{region}/index.json"
+AWS_PUBLIC_TRANSFER_REGION_URL = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AWSDataTransfer/current/{region}/index.json"
+
+
+def first_on_demand_usd(terms: dict) -> float | None:
+    def visit(value) -> float | None:
+        if not isinstance(value, dict):
+            return None
+        price = (value.get("pricePerUnit") or {}).get("USD")
+        if price is not None:
+            try:
+                return float(price)
+            except (TypeError, ValueError):
+                return None
+        for child in value.values():
+            found = visit(child)
+            if found is not None:
+                return found
+        return None
+    found = visit(terms.get("OnDemand") or {})
+    if found is not None:
+        return found
+    return None
+
+
+def public_s3_rates_from_catalog(catalog: dict) -> dict[str, float]:
+    """Map stable S3 Price List attributes to Raijin's narrow cost model.
+
+    AWS changes SKUs over time, so matching intentionally uses multiple public
+    attributes rather than any SKU. Unmapped entries remain absent and are
+    displayed as not estimated instead of silently using an unrelated rate.
+    """
+    rates: dict[str, float] = {}
+    for product in (catalog.get("products") or {}).values():
+        attributes = product.get("attributes") or {}
+        blob = " ".join(str(attributes.get(key, "")).lower() for key in (
+            "group", "groupDescription", "usagetype", "operation", "storageClass", "volumeType", "productFamily"
+        )).replace("-", " ").replace("_", " ").replace("/", " ")
+        sku = product.get("sku")
+        price = first_on_demand_usd({"OnDemand": (catalog.get("terms") or {}).get("OnDemand", {}).get(sku, {})}) if sku else None
+        if price is None:
+            continue
+        # AWS publishes byte/GB prices in decimal GB. Raijin presents binary
+        # GiB, so normalize all data-sized rates here once.
+        data_price = price * (1024**3 / 1_000_000_000)
+        if "batch" in blob and "job" in blob:
+            rates.setdefault("aws_batch_job_usd", price)
+        elif "batch" in blob and ("object" in blob or "operation" in blob):
+            rates.setdefault("aws_batch_object_usd_per_1000", price * 1000)
+        elif "tier1" in blob or "put/copy/post/list" in blob:
+            rates.setdefault("aws_s3_put_list_usd_per_1000", price * 1000)
+        elif "tier2" in blob or "get and all other" in blob:
+            rates.setdefault("aws_s3_get_usd_per_1000", price * 1000)
+        elif "deep" in blob and "retrieval" in blob and "bulk" in blob:
+            rates.setdefault("aws_deep_archive_bulk_retrieval_usd_per_gib", data_price)
+        elif "deep" in blob and "retrieval" in blob and "standard" in blob:
+            rates.setdefault("aws_deep_archive_standard_retrieval_usd_per_gib", data_price)
+        elif "glacier" in blob and "retrieval" in blob and "bulk" in blob and "deep" not in blob:
+            rates.setdefault("aws_glacier_bulk_retrieval_usd_per_gib", data_price)
+        elif "glacier" in blob and "retrieval" in blob and "standard" in blob and "deep" not in blob:
+            rates.setdefault("aws_glacier_standard_retrieval_usd_per_gib", data_price)
+        elif "timedstorage" in blob and "standard" in blob and "archive" not in blob:
+            rates.setdefault("aws_restore_temp_standard_usd_per_gib_month", data_price)
+    return rates
+
+
+def public_transfer_rates_from_catalog(catalog: dict) -> dict[str, float]:
+    """Return the regional AWS-to-external transfer price only.
+
+    S3's own catalog includes MRAP and intra-AWS transfer entries that look
+    similar but are not the Internet/OCI egress charge.  AWSDataTransfer has a
+    precise regional product: ``AWS Outbound`` to ``External``.
+    """
+    terms = (catalog.get("terms") or {}).get("OnDemand") or {}
+    for product in (catalog.get("products") or {}).values():
+        attributes = product.get("attributes") or {}
+        if (attributes.get("toLocation") != "External" or attributes.get("transferType") != "AWS Outbound"
+                or attributes.get("fromLocation") in {None, "", "Global"}):
+            continue
+        price = first_on_demand_usd({"OnDemand": terms.get(product.get("sku"), {})})
+        if price is not None:
+            return {"aws_transfer_out_usd_per_gib": price * (1024**3 / 1_000_000_000)}
+    return {}
+
+
+def refresh_global_aws_pricing(session: Session, aws_region: str) -> GlobalAwsPricing:
+    """Fetch the public regional Amazon S3 catalog with bounded network IO."""
+    row = session.scalar(select(GlobalAwsPricing).where(GlobalAwsPricing.aws_region == aws_region))
+    if not row:
+        row = GlobalAwsPricing(aws_region=aws_region)
+        session.add(row)
+        session.flush()
+    s3_url = AWS_PUBLIC_S3_REGION_URL.format(region=aws_region)
+    transfer_url = AWS_PUBLIC_TRANSFER_REGION_URL.format(region=aws_region)
+    try:
+        def read_catalog(url: str) -> dict:
+            request = Request(url, headers={"User-Agent": "raijin-data-migration/0.4"})
+            with urlopen(request, timeout=60) as response:
+                payload = response.read(64 * 1024 * 1024 + 1)
+            if len(payload) > 64 * 1024 * 1024:
+                raise RuntimeError("Public AWS Price List regional catalog exceeds 64 MiB safety limit")
+            return json.loads(payload.decode("utf-8"))
+
+        rates = public_s3_rates_from_catalog(read_catalog(s3_url))
+        rates.update(public_transfer_rates_from_catalog(read_catalog(transfer_url)))
+        if not rates:
+            raise RuntimeError("No supported AWS rates were found in the public regional catalogs")
+        row.rates_json, row.source_url, row.fetched_at, row.error = json.dumps(rates, sort_keys=True), f"{s3_url}; {transfer_url}", utcnow(), None
+        record_event(session, "GLOBAL_AWS_PRICING_REFRESHED", f"Public AWS S3 pricing refreshed for {aws_region}; {len(rates)} rate(s) mapped")
+    except Exception as error:
+        row.error = f"{type(error).__name__}: {error}"[:8000]
+        record_event(session, "GLOBAL_AWS_PRICING_REFRESH_FAILED", f"Public AWS S3 pricing refresh failed for {aws_region}: {type(error).__name__}")
+        raise
+    return row
+
+
+def global_pricing_summary(session: Session, aws_region: str) -> dict:
+    row = session.scalar(select(GlobalAwsPricing).where(GlobalAwsPricing.aws_region == aws_region))
+    rates = json.loads(row.rates_json or "{}") if row else {}
+    return {"aws_region": aws_region, "currency": row.currency if row else "USD", "rates": rates,
+            "source_url": row.source_url if row else None, "fetched_at": row.fetched_at if row else None,
+            "error": row.error if row else None}
+
+
+def refresh_due_global_aws_pricing(session: Session) -> None:
+    """Best-effort periodic public catalog refresh; never blocks migration work."""
+    settings = runtime_settings(session)
+    if not settings.cost_estimation_enabled or not settings.cost_pricing_auto_refresh_enabled:
+        return
+    cutoff = utcnow() - timedelta(days=settings.cost_pricing_refresh_days)
+    regions = sorted(set(session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))))
+    for region in regions:
+        cached = session.scalar(select(GlobalAwsPricing).where(GlobalAwsPricing.aws_region == region))
+        if cached and cached.fetched_at and cached.fetched_at >= cutoff:
+            continue
+        try:
+            refresh_global_aws_pricing(session, region)
+            session.commit()
+        except Exception:
+            session.commit()
+
+
 def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     """Build a transparent, deliberately conservative cost estimate.
 
@@ -702,6 +866,8 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     if not source.aws_connection_id:
         raise HTTPException(status_code=409, detail="Wave source has no AWS connection pricing profile")
     pricing = pricing_or_create(session, source.aws_connection_id)
+    public = global_pricing_summary(session, source.aws_region)
+    public_rates = public["rates"]
     settings = runtime_settings(session)
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
     source_objects = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source.id)) or 0
@@ -725,9 +891,11 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     def add(key: str, label: str, quantity: float, unit: str, rate_field: str, divisor: float = 1, category: str = "one_time") -> None:
         if not quantity:
             return
-        rate = getattr(pricing, rate_field)
+        custom_rate = getattr(pricing, rate_field)
+        rate = custom_rate if custom_rate is not None else public_rates.get(rate_field)
         entry = {"key": key, "label": label, "quantity": quantity, "unit": unit,
-                 "rate_field": rate_field, "rate": rate, "category": category}
+                 "rate_field": rate_field, "rate": rate, "category": category,
+                 "rate_source": "connection" if custom_rate is not None else ("aws_public" if rate is not None else "missing")}
         if rate is None:
             entry["cost"] = None
             missing.append(rate_field)
@@ -759,6 +927,7 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     optional = [item["cost"] for item in components if item["category"] == "optional"]
     return {"wave_id": wave.id, "connection_id": source.aws_connection_id, "connection_label": source.aws_connection.label,
             "currency": pricing.currency.upper(), "pricing_reference": pricing.reference, "pricing_updated_at": pricing.updated_at,
+            "global_pricing": public,
             "complete": not missing_by_category["one_time"] and not unpriced_archive_gib,
             "missing_rates": sorted(set(missing)), "unpriced_archive_gib": round(unpriced_archive_gib, 6),
             "totals": {"one_time": round(sum(one_time), 6) if not any(value is None for value in one_time) and not missing_by_category["one_time"] and not unpriced_archive_gib else None,
@@ -1420,6 +1589,28 @@ def update_cost_pricing(connection_id: int, payload: CostPricingUpdate, session:
     record_event(session, "COST_PRICING_UPDATED", f"Cost pricing updated for AWS connection '{connection.label}'", source_id=None)
     session.commit()
     return pricing_dict(pricing)
+
+
+@app.get("/api/global-aws-pricing")
+def get_global_aws_pricing(session: Session = Depends(get_session)) -> list[dict]:
+    regions = sorted(set(session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))))
+    return [global_pricing_summary(session, region) for region in regions]
+
+
+@app.post("/api/global-aws-pricing/refresh")
+def refresh_global_aws_pricing_now(session: Session = Depends(get_session)) -> dict:
+    regions = sorted(set(session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))))
+    if not regions:
+        raise HTTPException(status_code=409, detail="No active AWS connections are available for public pricing refresh")
+    updated = []
+    for region in regions:
+        try:
+            updated.append(refresh_global_aws_pricing(session, region))
+            session.commit()
+        except Exception as error:
+            session.commit()
+            raise HTTPException(status_code=502, detail=f"Public AWS pricing refresh failed for {region}: {type(error).__name__}") from error
+    return {"regions": [row.aws_region for row in updated], "refreshed": len(updated)}
 
 
 @app.post("/api/aws-connections/{connection_id}/sync")
@@ -2203,6 +2394,26 @@ def get_wave_cost_estimate(wave_id: int, session: Session = Depends(get_session)
     if not runtime_settings(session).cost_estimation_enabled:
         raise HTTPException(status_code=409, detail="Cost estimation is disabled in operational settings")
     return wave_cost_estimate(session, wave_or_404(session, wave_id))
+
+
+@app.get("/api/sources/{source_id}/cost-estimate")
+def get_source_cost_estimate(source_id: int, session: Session = Depends(get_session)) -> dict:
+    if not runtime_settings(session).cost_estimation_enabled:
+        raise HTTPException(status_code=409, detail="Cost estimation is disabled in operational settings")
+    source = source_or_404(session, source_id)
+    waves = list(session.scalars(select(Wave).where(Wave.source_id == source.id).order_by(Wave.id)))
+    estimates = [wave_cost_estimate(session, wave) for wave in waves]
+    unassigned_objects, unassigned_bytes = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.source_id == source.id, ObjectRecord.wave_id.is_(None))).one()
+    def total(key: str):
+        values = [item["totals"][key] for item in estimates]
+        return round(sum(values), 6) if values and all(value is not None for value in values) else None
+    return {"source_id": source.id, "source_name": source.name, "connection_label": source.aws_connection.label if source.aws_connection else None,
+            "currency": estimates[0]["currency"] if estimates else "USD",
+            "waves": len(estimates), "estimated_objects": sum(item["quantities"]["objects"] for item in estimates),
+            "unassigned_objects": unassigned_objects, "unassigned_bytes": unassigned_bytes,
+            "complete": bool(estimates) and not unassigned_objects and all(item["complete"] for item in estimates),
+            "totals": {"one_time": total("one_time"), "recurring_monthly": total("recurring_monthly"), "optional_deep_audit": total("optional_deep_audit")},
+            "wave_estimates": [{"wave_id": item["wave_id"], "one_time": item["totals"]["one_time"], "complete": item["complete"]} for item in estimates]}
 
 
 @app.get("/api/waves/{wave_id}/deep-audit-preview")

@@ -26,7 +26,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
-    Wave, parse_aws_connection_payload, runtime_settings, utcnow,
+    Wave, parse_aws_connection_payload, refresh_due_global_aws_pricing, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -865,6 +865,7 @@ def verify_wave(session, task: Task) -> None:
 def run_once() -> None:
     with SessionLocal() as session:
         settings = runtime_settings(session)
+        refresh_due_global_aws_pricing(session)
         if not settings.real_worker_enabled:
             return
         source = session.scalar(select(Source).where(Source.status == "DISCOVERY_QUEUED").order_by(Source.discovery_requested_at).with_for_update(skip_locked=True).limit(1))

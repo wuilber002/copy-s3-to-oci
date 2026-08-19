@@ -132,3 +132,14 @@ def test_cost_estimation_has_a_global_operational_toggle():
     assert 'id="set-cost-estimation"' in page
     assert "costEstimationEnabled" in page
     assert "estimativa de custo está desabilitada" in page
+    assert "wave-cost-action" in page
+    assert "source-cost-action" in page
+
+
+def test_cost_estimation_supports_public_aws_prices_and_per_connection_overrides():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="global-pricing-settings"' in page
+    assert 'id="set-cost-pricing-auto-refresh"' in page
+    assert 'id="set-cost-pricing-refresh-days"' in page
+    assert "refreshGlobalAwsPricing" in page
+    assert "lista pública AWS" in page

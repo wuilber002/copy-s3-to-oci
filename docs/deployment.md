@@ -2,7 +2,7 @@
 
 ## Pré-requisitos do cliente
 
-- Subnet existente com saída HTTPS para AWS S3/STS, OCI Vault/Object Storage e GitHub Releases.
+- Subnet existente com saída HTTPS para AWS S3/STS, AWS Price List (`pricing.us-east-1.amazonaws.com`), OCI Vault/Object Storage e GitHub Releases.
 - Acesso SSH à VM pela rede corporativa.
 - Permissões para executar o stack no OCI Resource Manager e criar os recursos selecionados.
 - Policy automática de backup do boot volume existente, ou autorização para criá-la/associá-la.
