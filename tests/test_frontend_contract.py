@@ -149,8 +149,10 @@ def test_cost_estimation_supports_public_aws_prices_and_per_connection_overrides
 def test_cost_pricing_can_show_collected_public_rates_and_modals_lock_background_scroll():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="public-pricing-modal"' in page
-    assert "showPublicPricingForConnection" in page
+    assert "showCollectedPublicPricing" in page
     assert "Ver valores coletados" in page
+    assert 'id="global-pricing-settings"' in page
+    assert 'id="cost-include-oci-costs"' in page
     assert "body.modal-open{overflow:hidden}" in page
     assert "syncModalScrollLock" in page
 

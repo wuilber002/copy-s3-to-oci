@@ -168,6 +168,7 @@ def test_cost_pricing_keeps_rates_optional_but_non_negative():
     pricing = CostPricingUpdate()
     assert pricing.currency == "USD"
     assert pricing.include_aws_transfer_out is True
+    assert pricing.include_oci_costs is True
     assert pricing.aws_deep_archive_bulk_retrieval_usd_per_gib is None
     with pytest.raises(ValidationError):
         CostPricingUpdate(aws_transfer_out_usd_per_gib=-0.01)
@@ -229,6 +230,7 @@ def test_wave_cost_estimator_documents_transparent_unit_assumptions():
         assert component in estimator
     assert "pricing.expected_restore_poll_cycles" in estimator
     assert "if pricing.include_aws_transfer_out:" in estimator
+    assert "if pricing.include_oci_costs:" in estimator
     assert '"total_completeness"' in estimator
     assert "never a promise" in estimator
 

@@ -145,6 +145,7 @@ class CostPricing(Base):
     reference: Mapped[str] = mapped_column(String(1024), default="")
     expected_restore_poll_cycles: Mapped[int] = mapped_column(Integer, default=24)
     include_aws_transfer_out: Mapped[bool] = mapped_column(default=True)
+    include_oci_costs: Mapped[bool] = mapped_column(default=True)
     aws_batch_job_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     aws_batch_object_usd_per_1000: Mapped[float | None] = mapped_column(Float, nullable=True)
     aws_s3_put_list_usd_per_1000: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -390,6 +391,7 @@ class CostPricingUpdate(BaseModel):
     reference: str = Field(default="", max_length=1024)
     expected_restore_poll_cycles: int = Field(default=24, ge=1, le=1000)
     include_aws_transfer_out: bool = True
+    include_oci_costs: bool = True
     aws_batch_job_usd: float | None = Field(default=None, ge=0)
     aws_batch_object_usd_per_1000: float | None = Field(default=None, ge=0)
     aws_s3_put_list_usd_per_1000: float | None = Field(default=None, ge=0)
@@ -560,6 +562,8 @@ def create_schema() -> None:
                 connection.execute(text(f"ALTER TABLE waves ADD COLUMN {column} {sql_type}"))
         if "include_aws_transfer_out" not in existing_cost_pricing_columns:
             connection.execute(text("ALTER TABLE cost_pricing ADD COLUMN include_aws_transfer_out BOOLEAN NOT NULL DEFAULT TRUE"))
+        if "include_oci_costs" not in existing_cost_pricing_columns:
+            connection.execute(text("ALTER TABLE cost_pricing ADD COLUMN include_oci_costs BOOLEAN NOT NULL DEFAULT TRUE"))
         if "compartment_name" not in existing_bucket_columns:
             connection.execute(text("ALTER TABLE oci_bucket_cache ADD COLUMN compartment_name VARCHAR(255)"))
 
@@ -716,6 +720,7 @@ def pricing_dict(pricing: CostPricing) -> dict:
     return {"aws_connection_id": pricing.aws_connection_id, "currency": pricing.currency,
             "reference": pricing.reference, "expected_restore_poll_cycles": pricing.expected_restore_poll_cycles,
             "include_aws_transfer_out": pricing.include_aws_transfer_out,
+            "include_oci_costs": pricing.include_oci_costs,
             **{field: getattr(pricing, field) for field in PRICING_RATE_FIELDS}, "updated_at": pricing.updated_at}
 
 
@@ -938,9 +943,10 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
         add("tag_reads", "S3 object-tag reads", len(objects), "requests", "aws_s3_get_usd_per_1000", 1000)
     if pricing.include_aws_transfer_out:
         add("aws_transfer_out", "AWS data transfer out to OCI", total_gib, "GiB", "aws_transfer_out_usd_per_gib")
-    add("oci_writes", "OCI Object Storage write operations", oci_put_operations, "operations", "oci_put_usd_per_10000", 10000)
-    add("oci_storage", "OCI destination storage (one month)", total_gib, "GiB-month", "oci_storage_usd_per_gib_month", category="recurring")
-    add("deep_audit", "Optional deep SHA-256 audit OCI reads", len(objects), "operations", "oci_get_usd_per_10000", 10000, category="optional")
+    if pricing.include_oci_costs:
+        add("oci_writes", "OCI Object Storage write operations", oci_put_operations, "operations", "oci_put_usd_per_10000", 10000)
+        add("oci_storage", "OCI destination storage (one month)", total_gib, "GiB-month", "oci_storage_usd_per_gib_month", category="recurring")
+        add("deep_audit", "Optional deep SHA-256 audit OCI reads", len(objects), "operations", "oci_get_usd_per_10000", 10000, category="optional")
     one_time = [item["cost"] for item in components if item["category"] == "one_time"]
     recurring = [item["cost"] for item in components if item["category"] == "recurring"]
     optional = [item["cost"] for item in components if item["category"] == "optional"]

@@ -65,6 +65,11 @@ integralmente da estimativa, dos totais e da tabela de componentes. Use essa
 opção apenas se esse custo não se aplica ao contrato, for absorvido por outro
 serviço ou precisar ser tratado fora do Raijin.
 
+**Incluir custos OCI** também começa habilitado em cada conexão. Ao desativá-lo,
+operações de escrita, armazenamento mensal e leituras OCI de auditoria profunda
+são removidos integralmente da estimativa, dos totais e da tabela de
+componentes; eles não são interpretados como custo zero.
+
 - Job e tarefas de S3 Batch Operations para objetos arquivados;
 - escrita do manifesto e páginas `ListObjectsV2` do discovery;
 - polling de restore. O cálculo usa o número de páginas da origem multiplicado
