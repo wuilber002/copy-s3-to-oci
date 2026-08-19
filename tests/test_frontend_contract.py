@@ -157,6 +157,13 @@ def test_cost_pricing_can_show_collected_public_rates_and_modals_lock_background
     assert "syncModalScrollLock" in page
 
 
+def test_collected_public_pricing_handler_keeps_modal_open_inside_its_try_block():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    start = page.index("async function showCollectedPublicPricing")
+    handler = page[start:page.index("\nasync function saveCostPricing", start)]
+    assert "}).join('')};openModal('#public-pricing-modal')}catch" in handler
+
+
 def test_cost_symbols_show_hover_summary_and_keep_clickable_detail():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "loadWaveCostTooltip" in page
