@@ -153,6 +153,12 @@ def test_cost_estimation_supports_public_aws_prices_and_per_connection_overrides
     assert 'id="cost-include-aws-transfer-out"' in page
 
 
+def test_public_aws_pricing_controls_are_visible_when_cost_estimation_is_enabled():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "classList.toggle('hidden',!costEstimationEnabled)" in page
+    assert "if(costEstimationEnabled)await loadGlobalAwsPricing()" in page
+
+
 def test_cost_pricing_can_show_collected_public_rates_and_modals_lock_background_scroll():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="public-pricing-modal"' in page
