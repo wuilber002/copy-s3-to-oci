@@ -68,7 +68,7 @@ def s3_rates(catalog: dict) -> dict[str, float]:
         if "batch" in blob and "job" in blob:
             rates.setdefault("batch_job", price)
         elif "batch" in blob and ("object" in blob or "operation" in blob):
-            rates.setdefault("batch_object_per_1000", price * 1000)
+            rates.setdefault("batch_object_per_object", price)
         elif "tier1" in blob or "put/copy/post/list" in blob:
             rates.setdefault("put_list_per_1000", price * 1000)
         elif "tier2" in blob or "get and all other" in blob:
@@ -113,15 +113,15 @@ def update_workbook(workbook: Path, regions: list[str]) -> None:
         # values to GiB, so convert back here for a familiar spreadsheet unit.
         gib_to_gb = 1_000_000_000 / (1024 ** 3)
         mapping = {
-            3: ("outbound_per_gib", gib_to_gb), 5: ("deep_bulk_per_gib", gib_to_gb),
-            6: ("deep_standard_per_gib", gib_to_gb), 7: ("temporary_standard_per_gib_month", gib_to_gb),
-            8: ("put_list_per_1000", 1), 9: ("get_tag_per_1000", 1),
-            10: ("batch_job", 1), 11: ("batch_object_per_1000", 1),
+            3: ("outbound_per_gib", gib_to_gb), 4: ("deep_bulk_per_gib", gib_to_gb),
+            5: ("deep_standard_per_gib", gib_to_gb), 6: ("temporary_standard_per_gib_month", gib_to_gb),
+            7: ("put_list_per_1000", 1), 8: ("get_tag_per_1000", 1),
+            9: ("batch_job", 1), 10: ("batch_object_per_object", 1),
         }
         for column, (key, multiplier) in mapping.items():
             if key in rates:
                 ws.cell(row, column, rates[key] * multiplier)
-        ws.cell(row, 12, f"Catálogos públicos AWS atualizados em {now}. Armazenamento Deep Archive continua como tarifa pública preenchida separadamente.")
+        ws.cell(row, 11, f"Catálogos públicos AWS atualizados em {now}.")
         print(f"{region}: refreshed {len(rates)} AWS rate(s) into row {row}")
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True

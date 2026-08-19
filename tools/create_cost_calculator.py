@@ -82,19 +82,19 @@ def build_transfer_data(wb):
 
 def build_tariffs(wb):
     ws = wb.create_sheet("Tarifas por região")
-    setup(ws, "Tarifas por região", "Use somente preços públicos AWS. O script de atualização preenche as colunas públicas suportadas para sa-east-1 e us-east-1.", 12)
-    headers = ["Região AWS", "Moeda", "Outbound AWS Internet\nUS$/GB", "Armazenamento Deep Archive\nUS$/GB-mês", "Recuperação Deep Archive BULK\nUS$/GB", "Recuperação Deep Archive STANDARD\nUS$/GB", "Cópia temporária S3 Standard\nUS$/GB-mês", "S3 PUT/LIST\nUS$/1.000", "S3 GET/TAG\nUS$/1.000", "Job Batch\nUS$/job", "Objeto Batch\nUS$/1.000", "Fonte pública / observações"]
-    widths = [16, 11, 15, 20, 23, 27, 26, 17, 17, 15, 20, 58]
+    setup(ws, "Tarifas por região", "Use somente preços públicos AWS. O script de atualização preenche as colunas públicas suportadas para sa-east-1 e us-east-1.", 11)
+    headers = ["Região AWS", "Moeda", "Outbound AWS Internet\nUS$/GB", "Recuperação Deep Archive BULK\nUS$/GB", "Recuperação Deep Archive STANDARD\nUS$/GB", "Cópia temporária S3 Standard\nUS$/GB-mês", "S3 PUT/LIST\nUS$/1.000", "S3 GET/TAG\nUS$/1.000", "Job Batch\nUS$/job", "Objeto Batch\nUS$/objeto", "Fonte pública / observações"]
+    widths = [16, 11, 15, 23, 27, 26, 17, 17, 15, 20, 58]
     for c, (label, width) in enumerate(zip(headers, widths), 1): ws.cell(4, c, label); header(ws.cell(4, c)); ws.column_dimensions[ws.cell(4, c).column_letter].width = width
     starter = [
-        ["sa-east-1", "USD", .15, None, .008, .028, .0405, .007, .00056, .25, .000015, "Valores públicos AWS coletados pelo Raijin em 19/08/2026. Atualize antes de aprovar gastos."],
-        ["us-east-1", "USD", .09, None, .0025, .02, .0125, .055, .0004, .25, .001, "Valores públicos de exemplo. Atualize antes de usar."],
+        ["sa-east-1", "USD", .15, .008, .028, .0405, .007, .00056, .25, .000015, "Valores públicos AWS coletados pelo Raijin em 19/08/2026. Atualize antes de aprovar gastos."],
+        ["us-east-1", "USD", .09, .0025, .02, .0125, .055, .0004, .25, .001, "Valores públicos de exemplo. Atualize antes de usar."],
     ]
     for r in range(5, 55):
-        values = starter[r - 5] if r <= 6 else [None] * 12
-        for c, value in enumerate(values, 1): ws.cell(r, c, value); style(ws.cell(r, c), editable=True); rate(ws.cell(r, c)) if 3 <= c <= 11 else None
+        values = starter[r - 5] if r <= 6 else [None] * 11
+        for c, value in enumerate(values, 1): ws.cell(r, c, value); style(ws.cell(r, c), editable=True); rate(ws.cell(r, c)) if 3 <= c <= 10 else None
         ws.row_dimensions[r].height = 27
-    ws.auto_filter.ref = "A4:L54"; ws.freeze_panes = "A5"
+    ws.auto_filter.ref = "A4:K54"; ws.freeze_panes = "A5"
 
 
 def build_summary(wb):
@@ -104,15 +104,15 @@ def build_summary(wb):
     widths = [41, 19, 18, 18, 18, 21, 48, 18]
     for c, (label, width) in enumerate(zip(headers, widths), 1): ws.cell(4, c, label); header(ws.cell(4, c)); ws.column_dimensions[ws.cell(4, c).column_letter].width = width
     rows = [
-        ("Recuperação Deep Archive BULK", "='Transfer data'!B8*1000*'Transfer data'!B10", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,5,FALSE)", "AWS pública", "=IF('Transfer data'!B11=\"BULK\",IFERROR(B5*D5,\"Não precificado\"),0)", "Somente a parcela em Deep Archive."),
-        ("Recuperação Deep Archive STANDARD", "='Transfer data'!B8*1000*'Transfer data'!B10", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,6,FALSE)", "AWS pública", "=IF('Transfer data'!B11=\"STANDARD\",IFERROR(B6*D6,\"Não precificado\"),0)", "Somente a parcela em Deep Archive."),
-        ("Cópia temporária restaurada", "='Transfer data'!B8*1000*'Transfer data'!B10*'Transfer data'!B12/(24*30)", "GB-mês / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,7,FALSE)", "AWS pública", "=IFERROR(B7*D7,\"Não precificado\")", "Cópia S3 Standard temporária após o restore; a retenção em horas é convertida para mês."),
-        ("S3 Batch Operations", "=1", "job / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,10,FALSE)", "AWS pública", "=IFERROR(B8*D8,\"Não precificado\")", "Um job de restore por onda arquivada."),
-        ("Tarefas de objeto S3 Batch", "=ROUNDUP('Transfer data'!B7/'Transfer data'!B9,0)", "objetos / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,11,FALSE)/1000", "AWS pública", "=IFERROR(B9*D9,\"Não precificado\")", "Tarifa de objeto normalizada para uma unidade."),
-        ("Discovery e polling de restore", "=(ROUNDUP('Transfer data'!B7/1000,0)*'Transfer data'!B13)+ROUNDUP('Transfer data'!B7/'Transfer data'!B9/1000,0)", "solicitações / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,8,FALSE)/1000", "AWS pública", "=IFERROR(B10*D10,\"Não precificado\")", "Estimativa conservadora baseada em ListObjectsV2."),
-        ("Leituras de objetos S3", "=ROUNDUP('Transfer data'!B7/'Transfer data'!B9,0)", "solicitações / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,9,FALSE)/1000", "AWS pública", "=IFERROR(B11*D11,\"Não precificado\")", "Um GetObject em streaming por arquivo."),
-        ("Leituras de tags S3", "=ROUNDUP('Transfer data'!B7/'Transfer data'!B9,0)", "solicitações / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,9,FALSE)/1000", "AWS pública", "=IF('Transfer data'!B14,IFERROR(B12*D12,\"Não precificado\"),0)", "Somente se a preservação de tags estiver habilitada."),
-        ("Outbound AWS", "='Transfer data'!B8*1000", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,3,FALSE)", "AWS pública", "=IF(H13,IFERROR(B13*D13,\"Não precificado\"),0)", "Use a chave para incluir ou excluir outbound."),
+        ("Recuperação Deep Archive BULK", "='Transfer data'!B8*1000*'Transfer data'!B10", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,4,FALSE)", "AWS pública", "=IF('Transfer data'!B11=\"BULK\",IFERROR(B5*D5,\"Não precificado\"),0)", "Somente a parcela em Deep Archive."),
+        ("Recuperação Deep Archive STANDARD", "='Transfer data'!B8*1000*'Transfer data'!B10", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,5,FALSE)", "AWS pública", "=IF('Transfer data'!B11=\"STANDARD\",IFERROR(B6*D6,\"Não precificado\"),0)", "Somente a parcela em Deep Archive."),
+        ("Cópia temporária restaurada", "='Transfer data'!B8*1000*'Transfer data'!B10*'Transfer data'!B12/(24*30)", "GB-mês / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,6,FALSE)", "AWS pública", "=IFERROR(B7*D7,\"Não precificado\")", "Cópia S3 Standard temporária após o restore; a retenção em horas é convertida para mês."),
+        ("S3 Batch Operations", "=1", "job / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,9,FALSE)", "AWS pública", "=IFERROR(B8*D8,\"Não precificado\")", "Um job de restore por onda arquivada."),
+        ("Tarefas de objeto S3 Batch", "=ROUNDUP('Transfer data'!B7/'Transfer data'!B9,0)", "objetos / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,10,FALSE)", "AWS pública", "=IFERROR(B9*D9,\"Não precificado\")", "Tarifa por objeto normalizada para uma unidade."),
+        ("Discovery e polling de restore", "=(ROUNDUP('Transfer data'!B7/1000,0)*'Transfer data'!B13)+ROUNDUP('Transfer data'!B7/'Transfer data'!B9/1000,0)", "solicitações / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,7,FALSE)/1000", "AWS pública", "=IFERROR(B10*D10,\"Não precificado\")", "Estimativa conservadora baseada em ListObjectsV2."),
+        ("Leituras de objetos S3", "=ROUNDUP('Transfer data'!B7/'Transfer data'!B9,0)", "solicitações / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,8,FALSE)/1000", "AWS pública", "=IFERROR(B11*D11,\"Não precificado\")", "Um GetObject em streaming por arquivo."),
+        ("Leituras de tags S3", "=ROUNDUP('Transfer data'!B7/'Transfer data'!B9,0)", "solicitações / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,8,FALSE)/1000", "AWS pública", "=IF('Transfer data'!B14,IFERROR(B12*D12,\"Não precificado\"),0)", "Somente se a preservação de tags estiver habilitada."),
+        ("Outbound AWS", "='Transfer data'!B8*1000", "GB / onda", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:K,3,FALSE)", "AWS pública", "=IF(H13,IFERROR(B13*D13,\"Não precificado\"),0)", "Use a chave para incluir ou excluir outbound."),
         ("Exclusão antecipada Deep Archive", "='Transfer data'!B15*1000*MAX(0,180-'Transfer data'!B16)/30", "GB-mês / projeto", "=VLOOKUP('Transfer data'!B5,'Tariffs by region'!A:L,4,FALSE)", "AWS pública", "=IF('Transfer data'!B15>0,IFERROR(B14*D14,\"Não precificado\"),0)", "Estimativa da exclusão antecipada para todo o projeto."),
     ]
     for r, values in enumerate(rows, 5):
