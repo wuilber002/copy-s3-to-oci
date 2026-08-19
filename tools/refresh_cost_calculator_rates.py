@@ -113,15 +113,15 @@ def update_workbook(workbook: Path, regions: list[str]) -> None:
         # values to GiB, so convert back here for a familiar spreadsheet unit.
         gib_to_gb = 1_000_000_000 / (1024 ** 3)
         mapping = {
-            3: ("outbound_per_gib", gib_to_gb), 6: ("deep_bulk_per_gib", gib_to_gb),
-            7: ("deep_standard_per_gib", gib_to_gb), 8: ("temporary_standard_per_gib_month", gib_to_gb),
-            9: ("put_list_per_1000", 1), 10: ("get_tag_per_1000", 1),
-            11: ("batch_job", 1), 12: ("batch_object_per_1000", 1),
+            3: ("outbound_per_gib", gib_to_gb), 5: ("deep_bulk_per_gib", gib_to_gb),
+            6: ("deep_standard_per_gib", gib_to_gb), 7: ("temporary_standard_per_gib_month", gib_to_gb),
+            8: ("put_list_per_1000", 1), 9: ("get_tag_per_1000", 1),
+            10: ("batch_job", 1), 11: ("batch_object_per_1000", 1),
         }
         for column, (key, multiplier) in mapping.items():
             if key in rates:
                 ws.cell(row, column, rates[key] * multiplier)
-        ws.cell(row, 15, f"AWS public catalogs refreshed {now}. Direct Connect/FastConnect, Deep Archive storage and OCI columns retained for customer input.")
+        ws.cell(row, 12, f"AWS public catalogs refreshed {now}. Deep Archive storage remains a separate public-price input.")
         print(f"{region}: refreshed {len(rates)} AWS rate(s) into row {row}")
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
