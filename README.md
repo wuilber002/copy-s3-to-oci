@@ -1,5 +1,19 @@
 # RAIJIN — S3 Glacier to OCI Object Storage Migration
 
+<p align="center">
+  <img src="images/raijin-oracle-about.png" width="330" alt="RAIJIN — migração de dados AWS S3 para OCI Object Storage">
+</p>
+
+<p align="center">
+  <a href="https://github.com/wuilber002/copy-s3-to-oci/actions/workflows/validate.yml"><img src="https://github.com/wuilber002/copy-s3-to-oci/actions/workflows/validate.yml/badge.svg?branch=main" alt="Validação"></a>
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white" alt="Python 3.12">
+  <img src="https://img.shields.io/badge/FastAPI-0.115-009688?logo=fastapi&logoColor=white" alt="FastAPI">
+  <img src="https://img.shields.io/badge/PostgreSQL-16-4169E1?logo=postgresql&logoColor=white" alt="PostgreSQL">
+  <img src="https://img.shields.io/badge/Terraform-1.14-7B42BC?logo=terraform&logoColor=white" alt="Terraform">
+  <img src="https://img.shields.io/badge/AWS%20S3-Glacier%20%2F%20Deep%20Archive-FF9900?logo=amazons3&logoColor=white" alt="AWS S3 Glacier e Deep Archive">
+  <img src="https://img.shields.io/badge/OCI-Object%20Storage-F80000?logo=oracle&logoColor=white" alt="OCI Object Storage">
+</p>
+
 **RAIJIN** (雷神, o deus japonês do trovão) é uma plataforma de migração controlada de objetos AWS S3, incluindo Glacier Deep Archive, para OCI Object Storage. Ela opera em uma única VM OCI e mantém inventário, ondas, estado de restore, transferências e evidências de integridade em PostgreSQL.
 
 ## Estado atual
