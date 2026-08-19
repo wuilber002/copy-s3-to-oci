@@ -222,6 +222,9 @@ class ObjectRecord(Base):
     restore_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     restore_attempt_id: Mapped[int | None] = mapped_column(ForeignKey("restore_attempts.id"), nullable=True, index=True)
     restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    # S3 exposes this timestamp in the Restore / RestoreStatus response.  It
+    # is the expiry of the temporary Standard copy, not the archived object.
+    restore_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_elapsed_seconds: Mapped[float] = mapped_column(Float, default=0)
@@ -513,6 +516,7 @@ def create_schema() -> None:
         "restore_requested_at": "TIMESTAMP WITH TIME ZONE",
         "restore_attempt_id": "BIGINT",
         "restored_at": "TIMESTAMP WITH TIME ZONE",
+        "restore_expires_at": "TIMESTAMP WITH TIME ZONE",
         "transferred_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_started_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0",
@@ -1299,7 +1303,26 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     }
 
 
-def restore_queue_details(wave: Wave, task: Task, now: datetime) -> dict:
+def restore_timing(session: Session, wave_id: int) -> dict:
+    """Summarize durable per-object S3 restore timestamps for one wave."""
+    requested_at, first_available_at, last_available_at, earliest_expiry_at = session.execute(
+        select(
+            func.min(ObjectRecord.restore_requested_at),
+            func.min(ObjectRecord.restored_at),
+            func.max(ObjectRecord.restored_at),
+            func.min(ObjectRecord.restore_expires_at),
+        ).where(ObjectRecord.wave_id == wave_id, ObjectRecord.restore_requested_at.is_not(None))
+    ).one()
+    return {
+        "requested_at": requested_at,
+        "first_available_at": first_available_at,
+        "last_available_at": last_available_at,
+        "earliest_expiry_at": earliest_expiry_at,
+        "restore_elapsed_seconds": max(0, int((last_available_at - requested_at).total_seconds())) if requested_at and last_available_at else None,
+    }
+
+
+def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Session | None = None) -> dict:
     """Safe, local-only restore diagnostics used by the dashboard queue API."""
     return {
         "batch_job_id": wave.batch_job_id,
@@ -1309,6 +1332,10 @@ def restore_queue_details(wave: Wave, task: Task, now: datetime) -> dict:
         "next_attempt_at": task.available_at if task.state == TaskState.READY else None,
         "waiting_seconds": max(0, int((now - task.created_at).total_seconds())) if task.kind in {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE"} else 0,
         "last_error": task.error,
+        **(restore_timing(session, wave.id) if session is not None else {
+            "requested_at": None, "first_available_at": None, "last_available_at": None,
+            "earliest_expiry_at": None, "restore_elapsed_seconds": None,
+        }),
     }
 
 
@@ -1369,7 +1396,7 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
             # Batch data comes from durable local records only.  It makes the
             # wait explainable without turning dashboard refreshes into AWS API
             # calls (and therefore without adding request cost).
-            "restore": restore_queue_details(wave, task, now),
+            "restore": restore_queue_details(wave, task, now, session=session),
             "transferred_files": len(completed), "total_files": len(objects),
             "transferred_bytes": sum(obj.size_bytes for obj in completed),
             "total_bytes": sum(obj.size_bytes for obj in objects),
@@ -2461,6 +2488,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                                   "failure_summary": attempt.failure_summary,
                                   "created_at": attempt.created_at, "completed_at": attempt.completed_at}
                                  for attempt in attempts],
+            "restore_timing": restore_timing(session, wave_id),
             "polling": {"state": latest_poll.state if latest_poll else None, "error": latest_poll.error if latest_poll else None},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}

@@ -14,10 +14,12 @@ import io
 import json
 import math
 import os
+import re
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
+from datetime import timedelta, timezone
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote, unquote
 
 import boto3
@@ -273,6 +275,16 @@ def restored_from_head_response(response: dict) -> bool:
     return 'ongoing-request="false"' in restore and "expiry-date=" in restore
 
 
+def restore_expiry_from_head_response(response: dict):
+    """Parse S3's documented `x-amz-restore` expiry date without another call."""
+    restore = str(response.get("Restore") or "")
+    match = re.search(r'expiry-date="([^"]+)"', restore, re.IGNORECASE)
+    if not match:
+        return None
+    value = parsedate_to_datetime(match.group(1))
+    return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 def should_poll_restore_with_head(wave_archive_objects: int, source_objects: int) -> bool:
     """Choose the cheaper, lower-request restore readiness strategy."""
     list_pages = max(1, math.ceil(max(0, source_objects) / 1000))
@@ -484,15 +496,18 @@ def poll_restore(session, task: Task, settings) -> None:
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
     archives = [obj for obj in objects if obj.storage_class in ARCHIVE_CLASSES]
     source_object_count = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source.id)) or 0
-    ready_keys: set[str] = set()
+    # The availability/expiry values are collected from the same polling
+    # response already needed to decide readiness.  This adds no AWS requests.
+    ready_expiries: dict[str, object] = {}
     if should_poll_restore_with_head(len(archives), int(source_object_count)):
         poll_method = "HeadObject"
         for obj in archives:
             arguments = {"Bucket": source.s3_bucket, "Key": obj.object_key}
             if obj.version_id:
                 arguments["VersionId"] = obj.version_id
-            if restored_from_head_response(s3.head_object(**arguments)):
-                ready_keys.add(obj.object_key)
+            response = s3.head_object(**arguments)
+            if restored_from_head_response(response):
+                ready_expiries[obj.object_key] = restore_expiry_from_head_response(response)
     else:
         poll_method = "ListObjectsV2"
         for page in s3.get_paginator("list_objects_v2").paginate(
@@ -501,11 +516,14 @@ def poll_restore(session, task: Task, settings) -> None:
             for item in page.get("Contents", []):
                 restore = item.get("RestoreStatus", {})
                 if restore and not restore.get("IsRestoreInProgress") and restore.get("RestoreExpiryDate"):
-                    ready_keys.add(item["Key"])
+                    expiry = restore["RestoreExpiryDate"]
+                    ready_expiries[item["Key"]] = expiry.astimezone(timezone.utc) if getattr(expiry, "tzinfo", None) else expiry.replace(tzinfo=timezone.utc)
     for obj in objects:
-        if obj.storage_class not in ARCHIVE_CLASSES or obj.object_key in ready_keys:
+        if obj.storage_class not in ARCHIVE_CLASSES or obj.object_key in ready_expiries:
             if obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING, ObjectState.WAVE_ASSIGNED}:
                 obj.state, obj.restored_at = ObjectState.RESTORED, obj.restored_at or utcnow()
+                if obj.storage_class in ARCHIVE_CLASSES:
+                    obj.restore_expires_at = ready_expiries.get(obj.object_key)
         elif obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED}:
             obj.state = ObjectState.RESTORING
     pending = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING]))) or 0
@@ -516,7 +534,9 @@ def poll_restore(session, task: Task, settings) -> None:
         retry(session, task, f"{pending} object(s) still unavailable after restore; checked with {poll_method}", min(1800, 300 + wave.poll_count * 60))
         return
     wave.status = "RESTORED"
-    event(session, "RESTORE_AVAILABLE", f"All wave objects are available for transfer; readiness checked with {poll_method}", source_id=source.id, wave_id=wave.id)
+    expiries = [expiry for expiry in ready_expiries.values() if expiry]
+    expiry_text = f"; earliest temporary-copy expiry {min(expiries).isoformat()}" if expiries else ""
+    event(session, "RESTORE_AVAILABLE", f"All wave objects are available for transfer; readiness checked with {poll_method}{expiry_text}", source_id=source.id, wave_id=wave.id)
     succeed(session, task, "TRANSFER_WAVE")
 
 

@@ -14,7 +14,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 from datetime import datetime, timezone
 
 from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
-from app.real_worker import restored_from_head_response, should_poll_restore_with_head, validate_restore_preflight
+from app.real_worker import restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -60,10 +60,11 @@ def test_restore_poll_prefers_targeted_head_only_for_small_wave_subsets():
     assert not should_poll_restore_with_head(10_001, 1_000_000)
     assert restored_from_head_response({"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'})
     assert not restored_from_head_response({"Restore": 'ongoing-request="true"'})
+    assert restore_expiry_from_head_response({"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'}).isoformat() == "2026-08-22T00:00:00+00:00"
 
 
 def test_restore_models_preserve_attempt_and_per_object_evidence():
-    assert {"restore_attempt_id"} <= set(ObjectRecord.__table__.columns.keys())
+    assert {"restore_attempt_id", "restore_requested_at", "restored_at", "restore_expires_at"} <= set(ObjectRecord.__table__.columns.keys())
     assert {"job_id", "expected_objects", "succeeded_objects", "failed_objects", "report_manifest_key"} <= set(RestoreAttempt.__table__.columns.keys())
     assert {"attempt_id", "object_id", "task_status", "http_status", "error_code"} <= set(RestoreObjectResult.__table__.columns.keys())
     assert ObjectState.RESTORE_REQUEST_ACCEPTED == "RESTORE_REQUEST_ACCEPTED"
