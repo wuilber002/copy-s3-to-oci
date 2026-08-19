@@ -14,12 +14,29 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 from datetime import datetime, timezone
 
 from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
-from app.real_worker import validate_restore_preflight
+from app.real_worker import restored_from_head_response, should_poll_restore_with_head, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
     columns = ObjectRecord.__table__.columns
     assert {"multipart_upload_id", "multipart_part_size", "multipart_parts_json", "multipart_updated_at"} <= set(columns.keys())
+
+
+def test_source_model_has_a_durable_discovery_page_checkpoint():
+    columns = Source.__table__.columns
+    assert {"discovery_continuation_token", "discovery_pages_completed", "discovery_objects_inserted"} <= set(columns.keys())
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert 'request["ContinuationToken"] = continuation_token' in worker
+    assert "One set-based lookup per S3 page" in worker
+
+
+def test_restore_poll_prefers_targeted_head_only_for_small_wave_subsets():
+    assert should_poll_restore_with_head(10, 1_000)
+    assert not should_poll_restore_with_head(11, 1_000)
+    assert should_poll_restore_with_head(10_000, 1_000_000)
+    assert not should_poll_restore_with_head(10_001, 1_000_000)
+    assert restored_from_head_response({"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'})
+    assert not restored_from_head_response({"Restore": 'ongoing-request="true"'})
 
 
 def test_restore_models_preserve_attempt_and_per_object_evidence():

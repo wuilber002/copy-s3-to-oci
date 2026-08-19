@@ -102,6 +102,12 @@ class Source(Base):
     discovery_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Checkpoint after each successfully committed ListObjectsV2 page.  This
+    # is deliberately an AWS continuation token, not a key, so S3 remains the
+    # authority on the exact next page after an interrupted discovery.
+    discovery_continuation_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    discovery_pages_completed: Mapped[int] = mapped_column(Integer, default=0)
+    discovery_objects_inserted: Mapped[int] = mapped_column(BigInteger, default=0)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     destination_validation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     destination_validation_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -538,7 +544,7 @@ def create_schema() -> None:
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
@@ -1702,7 +1708,9 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "aws_connection_id": s.aws_connection_id,
              "aws_connection_label": s.aws_connection.label if s.aws_connection else "Unassigned AWS connection",
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
-             "discovery_error": s.discovery_error, "archived_at": s.archived_at,
+             "discovery_error": s.discovery_error, "discovery_pages_completed": s.discovery_pages_completed,
+             "discovery_objects_inserted": s.discovery_objects_inserted,
+             "discovery_can_resume": bool(s.discovery_continuation_token), "archived_at": s.archived_at,
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
                                         "missing": s.destination_missing_count, "size_mismatches": s.destination_size_mismatch_count},
              "migration_status": migration_status(s), "can_delete": not source_has_executed_wave(session, s.id)}
@@ -1980,11 +1988,16 @@ def request_discovery(source_id: int, session: Session = Depends(get_session)) -
         raise HTTPException(status_code=409, detail="Discovery already running for this source")
     if session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)):
         raise HTTPException(status_code=409, detail="Discovery is immutable after waves are created")
+    resume = source.status == "DISCOVERY_FAILED" and bool(source.discovery_continuation_token)
     source.status = "DISCOVERY_QUEUED"
     source.discovery_requested_at = utcnow()
     source.discovery_completed_at = None
     source.discovery_error = None
-    record_event(session, "DISCOVERY_QUEUED", f"AWS discovery queued for source '{source.name}'", source_id=source.id)
+    if not resume:
+        source.discovery_continuation_token = None
+        source.discovery_pages_completed = 0
+        source.discovery_objects_inserted = 0
+    record_event(session, "DISCOVERY_QUEUED", f"AWS discovery {'resumed from its durable checkpoint' if resume else 'queued'} for source '{source.name}'", source_id=source.id)
     session.commit()
     return {"source_id": source.id, "status": source.status}
 

@@ -12,6 +12,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import socket
 import time
@@ -33,6 +34,11 @@ from app.main import (
 # Keep the hostname fallback for local development/tests that do not use it.
 WORKER_ID = os.getenv("RAIJIN_WORKER_ID", f"aws-oci-worker-{socket.gethostname()}")
 ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS", "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS"}
+# A ListObjectsV2 page contains up to 1,000 objects.  A LIST request is
+# usually about 12.5x the unit price of a HEAD/GET request, so use targeted
+# HeadObject checks only when the archive subset is materially smaller than
+# the source scan.  The conservative factor of 10 also minimizes requests.
+RESTORE_POLL_HEAD_TO_LIST_RATIO = 10
 # Explicit network bounds prevent an interrupted TCP stream from holding the
 # only real worker forever. A task-level retry preserves its multipart
 # checkpoint and lets the worker resume the accepted OCI parts safely.
@@ -222,20 +228,50 @@ def discover(session, source: Source, settings) -> None:
     source.status, source.discovery_error = "DISCOVERING", None
     session.commit()
     s3, _, _ = aws_clients(settings, source.aws_region, source)
-    paginator = s3.get_paginator("list_objects_v2")
     inserted = 0
-    for page in paginator.paginate(Bucket=source.s3_bucket, Prefix=source.s3_prefix):
-        for item in page.get("Contents", []):
-            key = item["Key"]
-            exists = session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source.id, ObjectRecord.object_key == key, ObjectRecord.version_id.is_(None)))
-            if exists:
-                continue
-            session.add(ObjectRecord(source_id=source.id, object_key=key, size_bytes=item["Size"], etag=item.get("ETag", "").strip('"') or None, storage_class=item.get("StorageClass"), last_modified=item.get("LastModified")))
-            inserted += 1
+    continuation_token = source.discovery_continuation_token
+    while True:
+        request = {"Bucket": source.s3_bucket, "Prefix": source.s3_prefix, "MaxKeys": 1000}
+        if continuation_token:
+            request["ContinuationToken"] = continuation_token
+        page = s3.list_objects_v2(**request)
+        items = page.get("Contents", [])
+        # Discovery has only one worker per source, but older/manual imports
+        # may already have records.  One set-based lookup per S3 page avoids a
+        # database round-trip for every object while keeping reruns idempotent.
+        keys = [item["Key"] for item in items]
+        existing = set(session.scalars(select(ObjectRecord.object_key).where(
+            ObjectRecord.source_id == source.id, ObjectRecord.version_id.is_(None), ObjectRecord.object_key.in_(keys)
+        ))) if keys else set()
+        rows = [ObjectRecord(
+            source_id=source.id, object_key=item["Key"], size_bytes=item["Size"],
+            etag=item.get("ETag", "").strip('"') or None, storage_class=item.get("StorageClass"),
+            last_modified=item.get("LastModified"),
+        ) for item in items if item["Key"] not in existing]
+        session.add_all(rows)
+        inserted += len(rows)
+        source.discovery_pages_completed += 1
+        source.discovery_objects_inserted += len(rows)
+        continuation_token = page.get("NextContinuationToken")
+        source.discovery_continuation_token = continuation_token
         session.commit()
+        if not continuation_token:
+            break
     source.status, source.discovery_completed_at = "DISCOVERED", utcnow()
-    event(session, "DISCOVERY_COMPLETED", f"Discovery inserted {inserted} object(s) using paginated ListObjectsV2 only", source_id=source.id)
+    event(session, "DISCOVERY_COMPLETED", f"Discovery inserted {inserted} object(s) in this run; {source.discovery_objects_inserted} total object(s) across {source.discovery_pages_completed} ListObjectsV2 page(s)", source_id=source.id)
     session.commit()
+
+
+def restored_from_head_response(response: dict) -> bool:
+    """Whether S3's HeadObject Restore header says an archive is available."""
+    restore = str(response.get("Restore") or "").lower()
+    return 'ongoing-request="false"' in restore and "expiry-date=" in restore
+
+
+def should_poll_restore_with_head(wave_archive_objects: int, source_objects: int) -> bool:
+    """Choose the cheaper, lower-request restore readiness strategy."""
+    list_pages = max(1, math.ceil(max(0, source_objects) / 1000))
+    return wave_archive_objects <= list_pages * RESTORE_POLL_HEAD_TO_LIST_RATIO
 
 
 def archive_objects(session, wave_id: int) -> list[ObjectRecord]:
@@ -440,13 +476,27 @@ def poll_restore(session, task: Task, settings) -> None:
         wave.status = "RESTORE_REQUEST_ACCEPTED"
         event(session, "RESTORE_REQUEST_ACCEPTED", f"Batch job {wave.batch_job_id} accepted all {attempt.expected_objects} archive restore request(s) with per-object evidence", source_id=source.id, wave_id=wave.id)
         session.commit()
-    ready_keys: set[str] = set()
-    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=source.s3_bucket, Prefix=source.s3_prefix, OptionalObjectAttributes=["RestoreStatus"]):
-        for item in page.get("Contents", []):
-            restore = item.get("RestoreStatus", {})
-            if restore and not restore.get("IsRestoreInProgress") and restore.get("RestoreExpiryDate"):
-                ready_keys.add(item["Key"])
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
+    archives = [obj for obj in objects if obj.storage_class in ARCHIVE_CLASSES]
+    source_object_count = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source.id)) or 0
+    ready_keys: set[str] = set()
+    if should_poll_restore_with_head(len(archives), int(source_object_count)):
+        poll_method = "HeadObject"
+        for obj in archives:
+            arguments = {"Bucket": source.s3_bucket, "Key": obj.object_key}
+            if obj.version_id:
+                arguments["VersionId"] = obj.version_id
+            if restored_from_head_response(s3.head_object(**arguments)):
+                ready_keys.add(obj.object_key)
+    else:
+        poll_method = "ListObjectsV2"
+        for page in s3.get_paginator("list_objects_v2").paginate(
+            Bucket=source.s3_bucket, Prefix=source.s3_prefix, OptionalObjectAttributes=["RestoreStatus"]
+        ):
+            for item in page.get("Contents", []):
+                restore = item.get("RestoreStatus", {})
+                if restore and not restore.get("IsRestoreInProgress") and restore.get("RestoreExpiryDate"):
+                    ready_keys.add(item["Key"])
     for obj in objects:
         if obj.storage_class not in ARCHIVE_CLASSES or obj.object_key in ready_keys:
             if obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING, ObjectState.WAVE_ASSIGNED}:
@@ -458,10 +508,10 @@ def poll_restore(session, task: Task, settings) -> None:
     if pending:
         wave.status = "RESTORING"
         session.commit()
-        retry(session, task, f"{pending} object(s) still unavailable after restore", min(1800, 300 + wave.poll_count * 60))
+        retry(session, task, f"{pending} object(s) still unavailable after restore; checked with {poll_method}", min(1800, 300 + wave.poll_count * 60))
         return
     wave.status = "RESTORED"
-    event(session, "RESTORE_AVAILABLE", "All wave objects are available for transfer", source_id=source.id, wave_id=wave.id)
+    event(session, "RESTORE_AVAILABLE", f"All wave objects are available for transfer; readiness checked with {poll_method}", source_id=source.id, wave_id=wave.id)
     succeed(session, task, "TRANSFER_WAVE")
 
 
