@@ -50,13 +50,16 @@ somente quando o operador confirmou que aquela operação é gratuita no
 contrato/tier escolhido.
 
 ## Componentes calculados
-
-de cada componente:
 O símbolo **💲** da wave mostra quantidade, unidade, tarifa, fonte da tarifa
 (contrato da conexão ou lista pública AWS) e valor de cada componente. O mesmo
 símbolo ao lado do resumo de uma source consolida somente as waves já criadas;
 objetos ainda sem wave são destacados e não entram no total:
-de cada componente:
+
+Em cada conexão, **Incluir saída AWS → OCI** começa habilitado. Quando for
+desabilitado, o egress AWS→OCI não é tratado como custo zero: ele é removido
+integralmente da estimativa, dos totais e da tabela de componentes. Use essa
+opção apenas se esse custo não se aplica ao contrato, for absorvido por outro
+serviço ou precisar ser tratado fora do Raijin.
 
 - Job e tarefas de S3 Batch Operations para objetos arquivados;
 - escrita do manifesto e páginas `ListObjectsV2` do discovery;

@@ -143,3 +143,4 @@ def test_cost_estimation_supports_public_aws_prices_and_per_connection_overrides
     assert 'id="set-cost-pricing-refresh-days"' in page
     assert "refreshGlobalAwsPricing" in page
     assert "lista pública AWS" in page
+    assert 'id="cost-include-aws-transfer-out"' in page

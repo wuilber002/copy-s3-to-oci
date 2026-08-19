@@ -167,6 +167,7 @@ def test_legacy_source_adoption_requires_a_concrete_connection_id():
 def test_cost_pricing_keeps_rates_optional_but_non_negative():
     pricing = CostPricingUpdate()
     assert pricing.currency == "USD"
+    assert pricing.include_aws_transfer_out is True
     assert pricing.aws_deep_archive_bulk_retrieval_usd_per_gib is None
     with pytest.raises(ValidationError):
         CostPricingUpdate(aws_transfer_out_usd_per_gib=-0.01)
@@ -227,6 +228,7 @@ def test_wave_cost_estimator_documents_transparent_unit_assumptions():
     for component in ("S3 Batch Operations job", "AWS data transfer out to OCI", "Optional deep SHA-256 audit OCI reads"):
         assert component in estimator
     assert "pricing.expected_restore_poll_cycles" in estimator
+    assert "if pricing.include_aws_transfer_out:" in estimator
     assert "never a promise" in estimator
 
 
