@@ -118,6 +118,13 @@ def test_source_region_is_derived_and_read_only_from_the_aws_connection():
     assert "$('#region').value=c?c.default_region:''" in page
 
 
+def test_source_summary_shows_discovery_duration_and_checkpoint_progress():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "discovery.duration_seconds" in page
+    assert "discovery.pages_completed" in page
+    assert "checkpoint salvo" in page
+
+
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="cost-pricing-modal"' in page

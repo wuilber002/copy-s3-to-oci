@@ -226,6 +226,7 @@ def fail_permanently(session, task: Task, error: str) -> None:
 
 def discover(session, source: Source, settings) -> None:
     source.status, source.discovery_error = "DISCOVERING", None
+    source.discovery_started_at = utcnow()
     session.commit()
     s3, _, _ = aws_clients(settings, source.aws_region, source)
     inserted = 0
@@ -257,7 +258,11 @@ def discover(session, source: Source, settings) -> None:
         session.commit()
         if not continuation_token:
             break
-    source.status, source.discovery_completed_at = "DISCOVERED", utcnow()
+    finished_at = utcnow()
+    if source.discovery_started_at:
+        source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
+    source.discovery_started_at = None
+    source.status, source.discovery_completed_at = "DISCOVERED", finished_at
     event(session, "DISCOVERY_COMPLETED", f"Discovery inserted {inserted} object(s) in this run; {source.discovery_objects_inserted} total object(s) across {source.discovery_pages_completed} ListObjectsV2 page(s)", source_id=source.id)
     session.commit()
 
@@ -918,10 +923,26 @@ def run_once() -> None:
         refresh_due_global_aws_pricing(session)
         if not settings.real_worker_enabled:
             return
+        # There is exactly one real worker per VM.  If it was interrupted while
+        # discovery was running, its page checkpoint is already committed. Make
+        # the source eligible again instead of leaving it permanently stuck in
+        # DISCOVERING.  The unfinished active slice is intentionally not added
+        # to elapsed time because a power loss makes its exact end unknowable.
+        interrupted = list(session.scalars(select(Source).where(Source.status == "DISCOVERING")))
+        for pending_source in interrupted:
+            pending_source.status = "DISCOVERY_QUEUED"
+            pending_source.discovery_started_at = None
+            event(session, "DISCOVERY_RECOVERED", "Discovery worker interruption recovered from durable page checkpoint", source_id=pending_source.id)
+        if interrupted:
+            session.commit()
         source = session.scalar(select(Source).where(Source.status == "DISCOVERY_QUEUED").order_by(Source.discovery_requested_at).with_for_update(skip_locked=True).limit(1))
         if source:
             try: discover(session, source, settings)
             except Exception as error:
+                finished_at = utcnow()
+                if source.discovery_started_at:
+                    source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
+                source.discovery_started_at = None
                 source.status, source.discovery_error = "DISCOVERY_FAILED", str(error)[:8000]; event(session, "DISCOVERY_FAILED", source.discovery_error, source_id=source.id); session.commit()
             return
         task = claim_task(session, settings.task_lease_seconds)

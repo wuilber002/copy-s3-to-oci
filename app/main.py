@@ -100,6 +100,11 @@ class Source(Base):
     destination_bucket: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(32), default="CONFIGURED")
     discovery_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # ``discovery_elapsed_seconds`` is durable work time, rather than wall-clock
+    # time since an operator pressed the button.  This keeps the UI useful when
+    # a discovery is resumed after a worker or VM restart.
+    discovery_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    discovery_elapsed_seconds: Mapped[float] = mapped_column(Float, default=0)
     discovery_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     discovery_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Checkpoint after each successfully committed ListObjectsV2 page.  This
@@ -544,7 +549,7 @@ def create_schema() -> None:
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
@@ -1997,6 +2002,8 @@ def request_discovery(source_id: int, session: Session = Depends(get_session)) -
         source.discovery_continuation_token = None
         source.discovery_pages_completed = 0
         source.discovery_objects_inserted = 0
+        source.discovery_started_at = None
+        source.discovery_elapsed_seconds = 0
     record_event(session, "DISCOVERY_QUEUED", f"AWS discovery {'resumed from its durable checkpoint' if resume else 'queued'} for source '{source.name}'", source_id=source.id)
     session.commit()
     return {"source_id": source.id, "status": source.status}
@@ -2012,6 +2019,11 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
         .group_by(ObjectRecord.state)
     ).all())
     source = source_or_404(session, source_id)
+    # This deliberately excludes time spent waiting in the durable queue.  If a
+    # discovery is currently being processed, include only its active slice.
+    discovery_duration_seconds = float(source.discovery_elapsed_seconds or 0)
+    if source.status == "DISCOVERING" and source.discovery_started_at:
+        discovery_duration_seconds += max(0, (utcnow() - source.discovery_started_at).total_seconds())
     delivery_verified = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id, ObjectRecord.delivery_integrity_status == "OCI_ACCEPTED")) or 0
     all_transferred = (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count
     migration_status = "DESTINATION_DIVERGENT" if source.destination_validation_status == "DIFFERENT" else "COMPLETED" if source.status == "DISCOVERED" and count and (states.get(ObjectState.VERIFIED, 0) == count or (all_transferred and delivery_verified == count)) else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and all_transferred else "IN_PROGRESS" if count else "NOT_STARTED"
@@ -2020,7 +2032,11 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
                                        "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count,
                                        "metadata_mismatches": source.destination_metadata_mismatch_count, "extras": source.destination_extra_count},
             "discovery": {"status": source.status, "requested_at": source.discovery_requested_at,
-                          "completed_at": source.discovery_completed_at, "error": source.discovery_error}}
+                          "completed_at": source.discovery_completed_at, "error": source.discovery_error,
+                          "duration_seconds": int(discovery_duration_seconds),
+                          "pages_completed": source.discovery_pages_completed,
+                          "objects_inserted": source.discovery_objects_inserted,
+                          "can_resume": bool(source.discovery_continuation_token)}}
 
 
 @app.post("/api/sources/{source_id}/validate-destination")

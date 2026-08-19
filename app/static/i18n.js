@@ -121,7 +121,7 @@
     'Falha no pré-check.': 'Pre-check failed.', 'Executando pré-check OCI e AWS…': 'Running OCI and AWS pre-check…',
     'Nenhum objeto. O discovery AWS ainda não foi executado.': 'No objects. AWS discovery has not run yet.',
     'Nenhum objeto encontrado para a busca.': 'No objects found for the search.', 'Anterior': 'Previous', 'Próxima': 'Next',
-    'Descoberta': 'Discovery', 'Discovery:': 'Discovery:', 'em execução.': 'running.', 'tarefa(s) falha(s). Abra Migrações para investigar.': 'failed task(s). Open Migrations to investigate.',
+    'Descoberta': 'Discovery', 'Discovery:': 'Discovery:', 'em execução.': 'running.', 'tempo de execução': 'execution time', 'em execução há': 'running for', 'página(s)': 'page(s)', 'checkpoint salvo': 'checkpoint saved', 'tarefa(s) falha(s). Abra Migrações para investigar.': 'failed task(s). Open Migrations to investigate.',
     'Espaço livre abaixo de 10 GB:': 'Free space below 10 GB:', 'Serviço(s) inativo(s):': 'Inactive service(s):'
     ,'Observabilidade operacional': 'Operational observability', 'Carregando indicadores operacionais…': 'Loading operational indicators…'
     ,'Batch Job:': 'Batch job:', 'Status AWS:': 'AWS status:', 'Último poll:': 'Last poll:', 'Próxima tentativa:': 'Next attempt:', 'Tempo aguardando:': 'Waiting time:', 'Último retorno:': 'Last result:'

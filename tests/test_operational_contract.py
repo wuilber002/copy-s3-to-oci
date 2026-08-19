@@ -24,10 +24,27 @@ def test_object_model_contains_durable_multipart_checkpoint_fields():
 
 def test_source_model_has_a_durable_discovery_page_checkpoint():
     columns = Source.__table__.columns
-    assert {"discovery_continuation_token", "discovery_pages_completed", "discovery_objects_inserted"} <= set(columns.keys())
+    assert {"discovery_continuation_token", "discovery_pages_completed", "discovery_objects_inserted", "discovery_started_at", "discovery_elapsed_seconds"} <= set(columns.keys())
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert 'request["ContinuationToken"] = continuation_token' in worker
     assert "One set-based lookup per S3 page" in worker
+
+
+def test_discovery_worker_recovers_an_interrupted_checkpoint_without_counting_downtime():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert 'Source.status == "DISCOVERING"' in worker
+    assert 'pending_source.status = "DISCOVERY_QUEUED"' in worker
+    assert '"DISCOVERY_RECOVERED"' in worker
+    assert "exact end unknowable" in worker
+
+
+def test_postgres_recovery_tool_requires_an_explicit_backup_and_confirmation():
+    script = Path("scripts/restore-postgres.sh").read_text(encoding="utf-8")
+    assert "--confirm-restore" in script
+    assert "--backup" in script
+    assert '[[ "$backup_file_real" == "$backup_root_real"/* ]]' in script
+    assert "/usr/local/sbin/s3-oci-backup-postgres" in script
+    assert "pg_restore" in script
 
 
 def test_restore_poll_prefers_targeted_head_only_for_small_wave_subsets():

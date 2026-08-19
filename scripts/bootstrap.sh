@@ -121,6 +121,7 @@ systemctl daemon-reload
 systemctl enable s3-oci-migration.service
 
 install -m 0750 "$install_root/scripts/backup-postgres.sh" /usr/local/sbin/s3-oci-backup-postgres
+install -m 0750 "$install_root/scripts/restore-postgres.sh" /usr/local/sbin/s3-oci-restore-postgres
 cat >/etc/systemd/system/s3-oci-backup-postgres.service <<'EOF'
 [Unit]
 Description=Local PostgreSQL backup for S3 to OCI migration platform

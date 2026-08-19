@@ -72,7 +72,7 @@ Como o valor gerado pelo provider `random` fica no state do Terraform, o state d
 
 O discovery produtivo usa somente `ListObjectsV2` paginado: registra chave, tamanho, ETag, classe de armazenamento e última modificação sem restaurar, baixar, fazer `HeadObject` ou listar tags. Metadados e tags são lidos somente no momento da cópia de cada objeto já restaurado. As ações da console apenas registram ou enfileiram trabalho durável; não causam chamadas AWS pelo navegador.
 
-Em caso de desligamento, reinicie `s3-oci-migration.service`. PostgreSQL mantém inventário, fila, leases e evidências; tarefas com lease expirado são reassumidas pelo worker. Para uploads grandes, o `upload_id` multipart OCI e as partes já aceitas ficam no PostgreSQL: após reinício, o worker consulta essas partes e envia somente as faltantes. O backup lógico diário é complementar ao backup de volume OCI e pode ser restaurado conforme o procedimento de recuperação desta documentação.
+Em caso de desligamento, reinicie `s3-oci-migration.service`. PostgreSQL mantém inventário, fila, leases e evidências; tarefas com lease expirado são reassumidas pelo worker. Para uploads grandes, o `upload_id` multipart OCI e as partes já aceitas ficam no PostgreSQL: após reinício, o worker consulta essas partes e envia somente as faltantes. Discovery também persiste o checkpoint de cada página S3 e retoma sem relistar páginas confirmadas. O backup lógico diário é complementar ao backup de volume OCI; siga o [runbook de recuperação](recovery-runbook.md) para testar ou executar uma restauração controlada.
 
 ## Instalação de release
 
