@@ -70,6 +70,18 @@ def test_restore_models_preserve_attempt_and_per_object_evidence():
     assert ObjectState.RESTORE_REQUEST_ACCEPTED == "RESTORE_REQUEST_ACCEPTED"
 
 
+def test_wave_list_exposes_durable_restore_timing_without_per_wave_queries():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index("def list_waves")
+    end = source.index("\n\n@app.delete(\"/api/waves/{wave_id}\")", start)
+    handler = source[start:end]
+    assert "timing_by_wave" in handler
+    assert '"restore_timing": timing_by_wave.get(wave.id, {})' in handler
+    frontend = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "const restoreLabel=x=>" in frontend
+    assert "Restore em andamento" in frontend
+
+
 def test_restore_preflight_blocks_source_region_mismatch_before_batch_submission():
     class Client:
         def head_bucket(self, Bucket):

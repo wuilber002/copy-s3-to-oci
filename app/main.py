@@ -2375,14 +2375,36 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
         select(Task.wave_id).join(Wave).where(Wave.source_id == source_id, Task.kind == "TRANSFER_WAVE",
                                                Task.state == TaskState.READY)
     ))
-    rows = session.execute(
+    rows = list(session.execute(
         select(Wave, func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
                func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at))
         .outerjoin(ObjectRecord, ObjectRecord.wave_id == Wave.id)
         .where(Wave.source_id == source_id)
         .group_by(Wave.id)
         .order_by(Wave.id)
-    )
+    ))
+    wave_ids = [wave.id for wave, *_ in rows]
+    timing_by_wave = {
+        wave_id: {
+            "requested_at": requested_at,
+            "first_available_at": first_available_at,
+            "last_available_at": last_available_at,
+            "earliest_expiry_at": earliest_expiry_at,
+            "restore_elapsed_seconds": max(0, int((last_available_at - requested_at).total_seconds()))
+            if requested_at and last_available_at else None,
+        }
+        for wave_id, requested_at, first_available_at, last_available_at, earliest_expiry_at in session.execute(
+            select(
+                ObjectRecord.wave_id,
+                func.min(ObjectRecord.restore_requested_at),
+                func.min(ObjectRecord.restored_at),
+                func.max(ObjectRecord.restored_at),
+                func.min(ObjectRecord.restore_expires_at),
+            )
+            .where(ObjectRecord.wave_id.in_(wave_ids), ObjectRecord.restore_requested_at.is_not(None))
+            .group_by(ObjectRecord.wave_id)
+        )
+    } if wave_ids else {}
     def displayed_status(wave: Wave) -> str:
         # A task lease is the source of truth while a worker owns the wave.
         # This also heals UI state left behind by a controlled worker restart:
@@ -2397,6 +2419,7 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
              "status": displayed_status(wave),
              "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
+             "restore_timing": timing_by_wave.get(wave.id, {}),
              "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and displayed_status(wave) in {"COMPLETED", "TRANSFERRED", "VERIFIED"} else None,
              "last_poll_at": wave.last_poll_at,
              "can_delete": wave.id not in executed_wave_ids and wave.id not in progressed_wave_ids,
