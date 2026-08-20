@@ -29,7 +29,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
-    Wave, parse_aws_connection_payload, refresh_due_global_aws_pricing, runtime_settings, utcnow,
+    Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_due_global_aws_pricing, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.

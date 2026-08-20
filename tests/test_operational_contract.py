@@ -106,6 +106,11 @@ def test_restore_submission_reports_the_failed_aws_stage_without_exposing_detail
     assert "S3 Batch Operations job creation failed:" in worker
 
 
+def test_real_worker_imports_the_runtime_namespace_reader_used_by_transfer_and_audit():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "read_oci_runtime_config" in worker[worker.index("from app.main import ("):worker.index(")\n\n# The bootstrap")]
+
+
 def test_restore_polling_uses_the_same_control_prefix_as_submission_and_labels_report_errors():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     poll = worker[worker.index("def poll_restore"):worker.index("\n\ndef sha256_b64")]
