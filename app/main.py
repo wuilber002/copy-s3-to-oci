@@ -20,12 +20,13 @@ import csv
 import io
 import json
 import base64
+import gzip
 import math
 import re
 import shutil
 from urllib.request import Request, urlopen
 
-from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -2067,6 +2068,100 @@ def import_inventory(source_id: int, payload: InventoryImport, session: Session 
     record_event(session, "INVENTORY_IMPORTED", f"Imported {inserted} inventory record(s); skipped {len(payload.items) - inserted} duplicate(s)", source_id=source_id)
     session.commit()
     return {"inserted": inserted, "skipped_duplicates": len(payload.items) - inserted}
+
+
+def inventory_file_value(row: dict[str, str], *names: str) -> str | None:
+    """Read an inventory column case-insensitively, including S3 CSV names."""
+    normalized = {str(key).strip().lower().replace("_", ""): value for key, value in row.items() if key}
+    for name in names:
+        value = normalized.get(name.lower().replace("_", ""))
+        if value is not None and str(value).strip() != "":
+            return str(value).strip()
+    return None
+
+
+@app.post("/api/sources/{source_id}/inventory/upload", status_code=201)
+def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...), session: Session = Depends(get_session)) -> dict:
+    """Import a scalable CSV inventory without calling AWS.
+
+    The source must still be pristine.  This avoids a potentially ambiguous
+    merge between a supplied inventory and an AWS discovery, and lets a large
+    file be parsed in bounded batches directly on the VM.
+    """
+    source = active_source_or_409(session, source_id)
+    if session.scalar(select(Wave.id).where(Wave.source_id == source_id)):
+        raise HTTPException(status_code=409, detail="Inventory file import is immutable after waves are created")
+    if session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source_id).limit(1)):
+        raise HTTPException(status_code=409, detail="This source already has inventory records; create a new source or delete the unexecuted discovery first")
+    filename = inventory_file.filename or "inventory.csv"
+    if not filename.lower().endswith((".csv", ".csv.gz", ".gz")):
+        raise HTTPException(status_code=422, detail="Inventory file must be CSV UTF-8 or CSV.GZ")
+    started = utcnow()
+    raw = inventory_file.file
+    binary = gzip.GzipFile(fileobj=raw, mode="rb") if filename.lower().endswith((".csv.gz", ".gz")) else raw
+    try:
+        reader = csv.DictReader(io.TextIOWrapper(binary, encoding="utf-8-sig", newline=""))
+        if not reader.fieldnames:
+            raise HTTPException(status_code=422, detail="Inventory CSV must contain a header row")
+        pending: list[dict] = []
+        inserted = 0
+        for line_number, row in enumerate(reader, start=2):
+            key = inventory_file_value(row, "object_key", "key")
+            size = inventory_file_value(row, "size_bytes", "size")
+            if not key or size is None:
+                raise HTTPException(status_code=422, detail=f"Inventory row {line_number} requires object_key/Key and size_bytes/Size")
+            try:
+                size_bytes = int(size)
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=f"Inventory row {line_number} has invalid size") from error
+            if size_bytes < 0:
+                raise HTTPException(status_code=422, detail=f"Inventory row {line_number} has negative size")
+            last_modified = inventory_file_value(row, "last_modified", "lastmodifieddate")
+            try:
+                parsed_last_modified = datetime.fromisoformat(last_modified.replace("Z", "+00:00")) if last_modified else None
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail=f"Inventory row {line_number} has invalid last_modified") from error
+            pending.append({
+                "source_id": source_id, "object_key": key, "size_bytes": size_bytes,
+                "version_id": inventory_file_value(row, "version_id", "versionid"),
+                "etag": inventory_file_value(row, "etag"),
+                "storage_class": inventory_file_value(row, "storage_class", "storageclass"),
+                "last_modified": parsed_last_modified,
+                "metadata_json": inventory_file_value(row, "metadata_json") or "{}",
+                "tags_json": inventory_file_value(row, "tags_json") or "{}",
+                "source_checksum": inventory_file_value(row, "source_checksum", "checksum"),
+                "checksum_algorithm": inventory_file_value(row, "checksum_algorithm") or None,
+                "state": ObjectState.DISCOVERED,
+            })
+            if len(pending) >= 5000:
+                session.bulk_insert_mappings(ObjectRecord, pending)
+                inserted += len(pending)
+                pending.clear()
+        if pending:
+            session.bulk_insert_mappings(ObjectRecord, pending)
+            inserted += len(pending)
+        if not inserted:
+            raise HTTPException(status_code=422, detail="Inventory CSV has no object records")
+        source.status = "DISCOVERED"
+        source.discovery_requested_at = started
+        source.discovery_started_at = None
+        source.discovery_completed_at = utcnow()
+        source.discovery_elapsed_seconds = max(0, (source.discovery_completed_at - started).total_seconds())
+        source.discovery_error = None
+        source.discovery_continuation_token = None
+        source.discovery_pages_completed = 0
+        source.discovery_objects_inserted = inserted
+        record_event(session, "INVENTORY_FILE_IMPORTED", f"Imported {inserted} record(s) from inventory file '{filename}' without AWS discovery", source_id=source_id)
+        session.commit()
+        return {"source_id": source.id, "status": source.status, "inserted": inserted, "filename": filename}
+    except HTTPException:
+        session.rollback()
+        raise
+    except (OSError, UnicodeDecodeError, csv.Error) as error:
+        session.rollback()
+        raise HTTPException(status_code=422, detail=f"Could not read inventory CSV: {type(error).__name__}") from error
+    finally:
+        inventory_file.file.close()
 
 
 @app.post("/api/sources/{source_id}/discovery")

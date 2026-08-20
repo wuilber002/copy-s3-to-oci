@@ -125,6 +125,18 @@ def test_source_summary_shows_discovery_duration_and_checkpoint_progress():
     assert "checkpoint salvo" in page
 
 
+def test_discovery_is_selected_in_a_minimal_modal_with_remote_and_inventory_file_paths():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="discovery-modal"' in page
+    assert 'onclick="openDiscoveryModal()">Discovery</button>' in page
+    assert 'id="discovery-mode-remote"' in page
+    assert 'id="discovery-mode-file"' in page
+    assert 'id="inventory-file" type="file"' in page
+    assert 'id="discovery-submit" type="submit">OK</button>' in page
+    assert "new FormData()" in page
+    assert "/inventory/upload" in page
+
+
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="cost-pricing-modal"' in page

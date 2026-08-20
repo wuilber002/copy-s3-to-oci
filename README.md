@@ -26,7 +26,7 @@ A console separa o trabalho em **Status** (alertas, fila, transferências e audi
 
 O seletor **Idioma / Language** no cabeçalho alterna a interface entre português e inglês. Estados operacionais e termos técnicos, como `PLANNED`, `READY FOR RESTORE`, `TRANSFERRING`, `COMPLETED`, `Discovery`, `Restore` e `SHA-256`, permanecem em inglês nos dois idiomas para preservar a linguagem de operação e auditoria.
 
-Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker AWS/OCI real** executa discovery, S3 Batch Operations, polling e cópia; por segurança começa instalado, porém ocioso. A operação externa só começa após configurar a AWS, preencher o bucket de controle e habilitá-lo explicitamente em **Configurações**. A auditoria profunda é sempre enfileirada manualmente pelo operador após a transferência e exige confirmação reforçada.
+Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker AWS/OCI real** executa discovery, S3 Batch Operations, polling e cópia; por segurança começa instalado, porém ocioso. A operação externa só começa após configurar a AWS, preencher o bucket de controle e habilitá-lo explicitamente em **Configurações**. No botão **Discovery**, o operador escolhe entre o discovery remoto normal ou a importação local de um CSV de inventário (inclusive `.csv.gz`), que não chama a AWS. A auditoria profunda é sempre enfileirada manualmente pelo operador após a transferência e exige confirmação reforçada.
 
 ## Garantias de desenho
 

@@ -30,6 +30,18 @@ def test_source_model_has_a_durable_discovery_page_checkpoint():
     assert "One set-based lookup per S3 page" in worker
 
 
+def test_inventory_file_import_is_batched_and_never_calls_aws_discovery():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    start = source.index("def upload_inventory_file")
+    end = source.index("\n\n@app.post(\"/api/sources/{source_id}/discovery\")", start)
+    handler = source[start:end]
+    assert "bulk_insert_mappings(ObjectRecord, pending)" in handler
+    assert "gzip.GzipFile" in handler
+    assert "object_key/Key and size_bytes/Size" in handler
+    assert '"INVENTORY_FILE_IMPORTED"' in handler
+    assert "without AWS discovery" in handler
+
+
 def test_discovery_worker_recovers_an_interrupted_checkpoint_without_counting_downtime():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert 'Source.status == "DISCOVERING"' in worker
