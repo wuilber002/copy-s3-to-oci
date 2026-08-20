@@ -135,6 +135,16 @@ def test_discovery_is_selected_in_a_minimal_modal_with_remote_and_inventory_file
     assert 'id="discovery-submit" type="submit">OK</button>' in page
     assert "new FormData()" in page
     assert "/inventory/upload" in page
+    assert "até 1 milhão de objetos" in page
+    assert "input[type=checkbox],input[type=radio]{width:auto}" in page
+
+
+def test_all_application_messages_use_raijin_notification_windows():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="notification-stack"' in page
+    assert "function dismissNotification" in page
+    assert "className=`notification ${bad?'error':'ok'}`" in page
+    assert "stack.append(item)" in page
 
 
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
