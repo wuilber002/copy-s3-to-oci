@@ -30,7 +30,7 @@ from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
+from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Index, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
 
@@ -206,6 +206,13 @@ class AwsSecretCache(Base):
 
 class ObjectRecord(Base):
     __tablename__ = "objects"
+    # Fresh installations receive the indexes required by the high-volume
+    # inventory path. Existing production databases receive them through the
+    # explicit online migration script, never implicitly at application boot.
+    __table_args__ = (
+        Index("ix_objects_source_key_id", "source_id", "object_key", "id"),
+        Index("ix_objects_source_state_key_id", "source_id", "state", "object_key", "id"),
+    )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
@@ -347,6 +354,23 @@ class Task(Base):
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     wave: Mapped[Wave] = relationship(back_populates="tasks")
+
+
+class DiscoveryJob(Base):
+    """Durable, observable queue record for one remote S3 discovery run."""
+    __tablename__ = "discovery_jobs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
+    state: Mapped[str] = mapped_column(String(16), default=TaskState.READY, index=True)
+    available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    source: Mapped[Source] = relationship()
 
 
 class Event(Base):
@@ -2178,6 +2202,12 @@ def request_discovery(source_id: int, session: Session = Depends(get_session)) -
     # checks.  A failed remote discovery is the only valid resume case.
     if not resume and session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source_id).limit(1)):
         raise HTTPException(status_code=409, detail="Remote discovery cannot replace or merge an existing inventory; create a new source or resume the failed remote discovery")
+    existing_job = session.scalar(select(DiscoveryJob).where(
+        DiscoveryJob.source_id == source.id,
+        DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
+    ).order_by(DiscoveryJob.id.desc()).limit(1))
+    if existing_job:
+        raise HTTPException(status_code=409, detail=f"Discovery job {existing_job.id} is already queued or running for this source")
     source.status = "DISCOVERY_QUEUED"
     source.discovery_requested_at = utcnow()
     source.discovery_completed_at = None
@@ -2188,9 +2218,11 @@ def request_discovery(source_id: int, session: Session = Depends(get_session)) -
         source.discovery_objects_inserted = 0
         source.discovery_started_at = None
         source.discovery_elapsed_seconds = 0
-    record_event(session, "DISCOVERY_QUEUED", f"AWS discovery {'resumed from its durable checkpoint' if resume else 'queued'} for source '{source.name}'", source_id=source.id)
+    job = DiscoveryJob(source_id=source.id)
+    session.add(job)
+    record_event(session, "DISCOVERY_QUEUED", f"AWS discovery job queued {'from its durable checkpoint' if resume else ''} for source '{source.name}'", source_id=source.id)
     session.commit()
-    return {"source_id": source.id, "status": source.status}
+    return {"source_id": source.id, "status": source.status, "job_id": job.id}
 
 
 @app.get("/api/sources/{source_id}/summary")
@@ -2220,7 +2252,33 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
                           "duration_seconds": int(discovery_duration_seconds),
                           "pages_completed": source.discovery_pages_completed,
                           "objects_inserted": source.discovery_objects_inserted,
+                          "objects_per_second": round(count / discovery_duration_seconds, 2) if discovery_duration_seconds else 0,
+                          "pages_per_minute": round(source.discovery_pages_completed * 60 / discovery_duration_seconds, 2) if discovery_duration_seconds else 0,
                           "can_resume": bool(source.discovery_continuation_token)}}
+
+
+@app.get("/api/discovery-queue")
+def discovery_queue(limit: int = 100, session: Session = Depends(get_session)) -> list[dict]:
+    """Local-only observability for durable remote-discovery work."""
+    limit = min(max(limit, 1), 500)
+    rows = session.execute(
+        select(DiscoveryJob, Source)
+        .join(Source, DiscoveryJob.source_id == Source.id)
+        .order_by(
+            case((DiscoveryJob.state == TaskState.RUNNING, 0), (DiscoveryJob.state == TaskState.READY, 1), else_=2),
+            DiscoveryJob.available_at, DiscoveryJob.id,
+        ).limit(limit)
+    )
+    now = utcnow()
+    return [{
+        "id": job.id, "source_id": source.id, "source_name": source.name,
+        "state": job.state, "attempts": job.attempts, "available_at": job.available_at,
+        "lease_expires_at": job.lease_expires_at, "worker_id": job.worker_id,
+        "error": job.error, "created_at": job.created_at, "completed_at": job.completed_at,
+        "pages_completed": source.discovery_pages_completed,
+        "objects_inserted": source.discovery_objects_inserted,
+        "elapsed_seconds": int(float(source.discovery_elapsed_seconds or 0) + (max(0, (now - source.discovery_started_at).total_seconds()) if source.status == "DISCOVERING" and source.discovery_started_at else 0)),
+    } for job, source in rows]
 
 
 @app.post("/api/sources/{source_id}/validate-destination")
@@ -2303,20 +2361,44 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
 
 @app.get("/api/sources/{source_id}/inventory")
 def list_inventory(source_id: int, limit: int = 10, offset: int = 0,
+                   after_key: str = Query(default="", max_length=2048),
+                   after_id: int = Query(default=0, ge=0),
                    search: str = Query(default="", max_length=512),
                    session: Session = Depends(get_session)) -> dict:
+    """Read inventory with keyset pagination when a cursor is supplied.
+
+    ``offset`` remains for old clients only. Raijin's UI uses the key/id
+    cursor, so opening page 50,000 does not force PostgreSQL to walk through
+    the preceding 499,990 rows.
+    """
     source_or_404(session, source_id)
     limit = min(max(limit, 1), 1000)
     filters = [ObjectRecord.source_id == source_id]
     if search.strip():
         filters.append(ObjectRecord.object_key.ilike(f"%{search.strip()}%"))
-    query = select(ObjectRecord).where(*filters).order_by(ObjectRecord.object_key).offset(offset).limit(limit)
-    rows = session.scalars(query)
-    total = session.scalar(select(func.count(ObjectRecord.id)).where(*filters)) or 0
+    use_cursor = bool(after_key)
+    if use_cursor:
+        filters.append(or_(
+            ObjectRecord.object_key > after_key,
+            and_(ObjectRecord.object_key == after_key, ObjectRecord.id > after_id),
+        ))
+    query = select(ObjectRecord).where(*filters).order_by(ObjectRecord.object_key, ObjectRecord.id)
+    if not use_cursor:
+        query = query.offset(max(offset, 0))
+    rows = list(session.scalars(query.limit(limit + 1)))
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    next_cursor = {"object_key": rows[-1].object_key, "id": rows[-1].id} if rows and has_more else None
+    # Counting every row on each navigation becomes an avoidable expensive
+    # aggregate for a 100-million-object source. Total is intentionally
+    # omitted for cursor calls; source summary already exposes its durable
+    # inventory total.
+    total = None if use_cursor else session.scalar(select(func.count(ObjectRecord.id)).where(*filters)) or 0
     return {"items": [{"id": obj.id, "key": obj.object_key, "version_id": obj.version_id,
                        "size_bytes": obj.size_bytes, "storage_class": obj.storage_class, "state": obj.state,
                        "last_modified": obj.last_modified, "etag": obj.etag, "wave_id": obj.wave_id} for obj in rows],
-            "limit": limit, "offset": offset, "total": total, "search": search.strip()}
+            "limit": limit, "offset": offset, "total": total, "next_cursor": next_cursor,
+            "search": search.strip()}
 
 
 @app.get("/api/objects/{object_id}")

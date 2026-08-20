@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, validate_restore_preflight
 
 
@@ -30,6 +30,29 @@ def test_source_model_has_a_durable_discovery_page_checkpoint():
     assert "DISCOVERY_CHECKPOINT_PAGES = 10" in worker
     assert "session.bulk_insert_mappings(ObjectRecord, pending_rows)" in worker
     assert "Atomically persist a bounded discovery batch" in worker
+
+
+def test_remote_discovery_has_a_durable_observable_queue_and_adaptive_throttle():
+    columns = DiscoveryJob.__table__.columns
+    assert {"source_id", "state", "available_at", "lease_expires_at", "attempts", "error", "completed_at"} <= set(columns.keys())
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "def claim_discovery_job" in worker
+    assert "DISCOVERY_REQUEST_INTERVAL_SECONDS = 0.1" in worker
+    assert "DISCOVERY_MAX_THROTTLE_RETRIES = 5" in worker
+    assert "time.sleep(min(30, 2 ** throttle_attempt))" in worker
+    app_source = Path("app/main.py").read_text(encoding="utf-8")
+    assert '@app.get("/api/discovery-queue")' in app_source
+    assert "Remote discovery cannot replace or merge an existing inventory" in app_source
+
+
+def test_large_inventory_uses_keyset_pagination_and_production_indexes():
+    indexes = {index.name for index in ObjectRecord.__table__.indexes}
+    assert {"ix_objects_source_key_id", "ix_objects_source_state_key_id"} <= indexes
+    app_source = Path("app/main.py").read_text(encoding="utf-8")
+    assert "Read inventory with keyset pagination" in app_source
+    assert 'ObjectRecord.object_key > after_key' in app_source
+    script = Path("scripts/create-discovery-indexes.sh").read_text(encoding="utf-8")
+    assert "CREATE INDEX CONCURRENTLY" in script
 
 
 def test_inventory_file_import_is_batched_and_never_calls_aws_discovery():

@@ -25,10 +25,11 @@ from urllib.parse import quote, unquote
 import boto3
 import oci
 from botocore.config import Config
+from botocore.exceptions import ClientError
 from sqlalchemy import func, or_, select
 
 from app.main import (
-    AwsConnection, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
+    AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
     Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_due_global_aws_pricing, runtime_settings, utcnow,
 )
 
@@ -49,6 +50,12 @@ RESTORE_POLL_HEAD_TO_LIST_RATIO = 10
 # never lose a confirmed page and never issue a per-object database lookup.
 DISCOVERY_MAX_KEYS = 1000
 DISCOVERY_CHECKPOINT_PAGES = 10
+# The source scan has one worker and uses a deliberate ceiling of ten List API
+# calls per second. It is far below S3's documented scaling envelope, while
+# keeping the customer's API request burst and the VM/database pressure
+# predictable. SlowDown after the SDK retry budget receives exponential wait.
+DISCOVERY_REQUEST_INTERVAL_SECONDS = 0.1
+DISCOVERY_MAX_THROTTLE_RETRIES = 5
 # Explicit network bounds prevent an interrupted TCP stream from holding the
 # only real worker forever. A task-level retry preserves its multipart
 # checkpoint and lets the worker resume the accepted OCI parts safely.
@@ -188,6 +195,30 @@ def claim_task(session, lease_seconds: int) -> Task | None:
     return task
 
 
+def claim_discovery_job(session, lease_seconds: int) -> DiscoveryJob | None:
+    """Claim one source discovery from its own durable queue."""
+    now = utcnow()
+    available = (DiscoveryJob.state == TaskState.READY) | (
+        (DiscoveryJob.state == TaskState.RUNNING) & (
+            (DiscoveryJob.lease_expires_at < now) | (DiscoveryJob.worker_id == WORKER_ID)
+        )
+    )
+    job = session.scalar(
+        select(DiscoveryJob)
+        .where(available, DiscoveryJob.available_at <= now)
+        .order_by(DiscoveryJob.available_at, DiscoveryJob.id)
+        .with_for_update(skip_locked=True).limit(1)
+    )
+    if not job:
+        return None
+    job.state, job.worker_id = TaskState.RUNNING, WORKER_ID
+    job.attempts += 1
+    job.lease_expires_at = now + timedelta(seconds=max(lease_seconds, 300))
+    event(session, "DISCOVERY_JOB_CLAIMED", f"Discovery job {job.id} claimed by real worker", source_id=job.source_id)
+    session.commit()
+    return job
+
+
 def succeed(session, task: Task, next_kind: str | None = None) -> None:
     if next_kind:
         session.add(Task(wave_id=task.wave_id, kind=next_kind))
@@ -234,7 +265,7 @@ def fail_permanently(session, task: Task, error: str) -> None:
     session.commit()
 
 
-def discover(session, source: Source, settings) -> None:
+def discover(session, source: Source, settings, job: DiscoveryJob | None = None) -> None:
     source.status, source.discovery_error = "DISCOVERING", None
     source.discovery_started_at = utcnow()
     session.commit()
@@ -244,6 +275,7 @@ def discover(session, source: Source, settings) -> None:
     pending_rows: list[dict] = []
     pending_pages = 0
     pending_token = continuation_token
+    next_request_at = 0.0
 
     def checkpoint_batch() -> None:
         """Atomically persist a bounded discovery batch and its S3 cursor."""
@@ -258,6 +290,8 @@ def discover(session, source: Source, settings) -> None:
         source.discovery_pages_completed += pending_pages
         source.discovery_objects_inserted += len(pending_rows)
         source.discovery_continuation_token = pending_token
+        if job:
+            job.lease_expires_at = utcnow() + timedelta(seconds=max(settings.task_lease_seconds, 300))
         session.commit()
         pending_rows.clear()
         pending_pages = 0
@@ -266,7 +300,24 @@ def discover(session, source: Source, settings) -> None:
         request = {"Bucket": source.s3_bucket, "Prefix": source.s3_prefix, "MaxKeys": DISCOVERY_MAX_KEYS}
         if continuation_token:
             request["ContinuationToken"] = continuation_token
-        page = s3.list_objects_v2(**request)
+        throttle_attempt = 0
+        while True:
+            wait = next_request_at - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                page = s3.list_objects_v2(**request)
+                next_request_at = time.monotonic() + DISCOVERY_REQUEST_INTERVAL_SECONDS
+                break
+            except ClientError as error:
+                code = (error.response.get("Error") or {}).get("Code")
+                if code not in {"SlowDown", "Throttling", "ThrottlingException", "RequestLimitExceeded"} or throttle_attempt >= DISCOVERY_MAX_THROTTLE_RETRIES:
+                    raise
+                throttle_attempt += 1
+                # Do not checkpoint ahead of S3. The next request keeps the
+                # same continuation token, so this retry cannot skip keys.
+                time.sleep(min(30, 2 ** throttle_attempt))
+                next_request_at = time.monotonic() + DISCOVERY_REQUEST_INTERVAL_SECONDS
         items = page.get("Contents", [])
         pending_rows.extend({
             "source_id": source.id,
@@ -289,6 +340,8 @@ def discover(session, source: Source, settings) -> None:
         source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
     source.discovery_started_at = None
     source.status, source.discovery_completed_at = "DISCOVERED", finished_at
+    if job:
+        job.state, job.error, job.lease_expires_at, job.completed_at = TaskState.SUCCEEDED, None, None, finished_at
     event(session, "DISCOVERY_COMPLETED", f"Discovery inserted {inserted} object(s) in this run; {source.discovery_objects_inserted} total object(s) across {source.discovery_pages_completed} ListObjectsV2 page(s)", source_id=source.id)
     session.commit()
 
@@ -976,18 +1029,46 @@ def run_once() -> None:
         for pending_source in interrupted:
             pending_source.status = "DISCOVERY_QUEUED"
             pending_source.discovery_started_at = None
+            pending_job = session.scalar(select(DiscoveryJob).where(
+                DiscoveryJob.source_id == pending_source.id,
+                DiscoveryJob.state == TaskState.RUNNING,
+            ).order_by(DiscoveryJob.id.desc()).limit(1))
+            if pending_job:
+                pending_job.state, pending_job.worker_id, pending_job.lease_expires_at = TaskState.READY, None, None
+                pending_job.available_at = utcnow()
+            else:
+                session.add(DiscoveryJob(source_id=pending_source.id))
             event(session, "DISCOVERY_RECOVERED", "Discovery worker interruption recovered from durable page checkpoint", source_id=pending_source.id)
         if interrupted:
             session.commit()
-        source = session.scalar(select(Source).where(Source.status == "DISCOVERY_QUEUED").order_by(Source.discovery_requested_at).with_for_update(skip_locked=True).limit(1))
-        if source:
-            try: discover(session, source, settings)
+        # Upgrade compatibility: sources queued by releases before the
+        # discovery queue existed become visible jobs on the next worker loop.
+        legacy_queued = list(session.scalars(select(Source).where(Source.status == "DISCOVERY_QUEUED")))
+        for queued_source in legacy_queued:
+            exists = session.scalar(select(DiscoveryJob.id).where(
+                DiscoveryJob.source_id == queued_source.id,
+                DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
+            ).limit(1))
+            if not exists:
+                session.add(DiscoveryJob(source_id=queued_source.id))
+        if legacy_queued:
+            session.commit()
+        discovery_job = claim_discovery_job(session, settings.task_lease_seconds)
+        if discovery_job:
+            source = session.get(Source, discovery_job.source_id)
+            if not source or source.status != "DISCOVERY_QUEUED":
+                discovery_job.state, discovery_job.error, discovery_job.lease_expires_at, discovery_job.completed_at = TaskState.FAILED, "Source is no longer eligible for remote discovery", None, utcnow()
+                session.commit()
+                return
+            try: discover(session, source, settings, discovery_job)
             except Exception as error:
                 finished_at = utcnow()
                 if source.discovery_started_at:
                     source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
                 source.discovery_started_at = None
-                source.status, source.discovery_error = "DISCOVERY_FAILED", str(error)[:8000]; event(session, "DISCOVERY_FAILED", source.discovery_error, source_id=source.id); session.commit()
+                source.status, source.discovery_error = "DISCOVERY_FAILED", str(error)[:8000]
+                discovery_job.state, discovery_job.error, discovery_job.lease_expires_at, discovery_job.completed_at = TaskState.FAILED, source.discovery_error, None, finished_at
+                event(session, "DISCOVERY_FAILED", source.discovery_error, source_id=source.id); session.commit()
             return
         task = claim_task(session, settings.task_lease_seconds)
         if not task: return
