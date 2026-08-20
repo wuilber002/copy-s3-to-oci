@@ -150,6 +150,16 @@ def test_all_application_messages_use_raijin_notification_windows():
     assert "stack.append(item)" in page
 
 
+def test_all_confirmation_questions_use_the_raijin_modal_instead_of_browser_confirm():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="confirm-modal"' in page
+    assert "function ask(message" in page
+    assert "function finishConfirmation" in page
+    assert "window.confirm" not in page
+    assert "confirm(" not in page
+    assert page.count("await ask(") >= 14
+
+
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="cost-pricing-modal"' in page
