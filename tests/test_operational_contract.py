@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, observability, parse_aws_connection_payload, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, validate_restore_preflight
 
 
@@ -180,6 +180,34 @@ def test_multipart_size_runtime_setting_has_safe_bounds():
         RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 15}))
     with pytest.raises(ValidationError):
         RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 513}))
+
+
+def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
+    assert {"planned_transfer_seconds"} <= set(ObjectRecord.__table__.columns.keys())
+    from app.main import Wave, RuntimeSettings
+    assert {"planner_mode", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
+    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_pipeline_enabled"} <= set(RuntimeSettings.__table__.columns.keys())
+    payload = DynamicWaveCreate(max_bytes=1024, target_transfer_seconds=3600, max_objects=10,
+                                restore_days=3, restore_tier="BULK")
+    assert payload.target_transfer_seconds == 3600
+
+
+def test_dynamic_prediction_prefers_p75_history_then_conservative_link_model():
+    settings = type("Settings", (), {"multipart_part_size_mib": 64, "max_throughput_mbps": 1000, "transfer_workers": 4})()
+    obj = type("Object", (), {"size_bytes": 512 * 1024})()
+    historical, samples = predict_object_transfer_seconds(obj, settings, {"up_to_1_mib": {"samples": 5, "p75_seconds": 3.5}})
+    fallback, fallback_samples = predict_object_transfer_seconds(obj, settings, {})
+    assert (historical, samples) == (3.5, 5)
+    assert fallback > 0 and fallback_samples == 0
+    assert percentile_75([1, 2, 3, 4]) == 3
+
+
+def test_dynamic_schedule_starts_bulk_restore_before_predicted_transfer_window():
+    now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    times = dynamic_schedule_times(now, [{"restore_tier": "BULK", "predicted_transfer_seconds": 3600}], 6 * 3600)
+    restore_at, transfer_at = times[0]
+    assert restore_at == now
+    assert transfer_at == now + __import__("datetime").timedelta(hours=6)
 
 
 def test_aws_error_summary_exposes_only_status_and_code():

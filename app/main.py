@@ -228,6 +228,9 @@ class ObjectRecord(Base):
     transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_elapsed_seconds: Mapped[float] = mapped_column(Float, default=0)
+    # The planner stores its estimate separately from measured elapsed work.
+    # It is advisory only and never drives a worker without an explicit queue.
+    planned_transfer_seconds: Mapped[float] = mapped_column(Float, default=0)
     transfer_progress_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     transfer_progress_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     transfer_rate_mbps: Mapped[float] = mapped_column(Float, default=0)
@@ -281,6 +284,11 @@ class Wave(Base):
     manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     poll_count: Mapped[int] = mapped_column(Integer, default=0)
+    planner_mode: Mapped[str] = mapped_column(String(32), default="MANUAL")
+    predicted_transfer_seconds: Mapped[float] = mapped_column(Float, default=0)
+    prediction_samples: Mapped[int] = mapped_column(Integer, default=0)
+    planned_restore_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    planned_transfer_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     source: Mapped[Source] = relationship(back_populates="waves")
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="wave")
@@ -374,6 +382,10 @@ class RuntimeSettings(Base):
     cost_pricing_refresh_days: Mapped[int] = mapped_column(Integer, default=7)
     activity_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
     activity_refresh_seconds: Mapped[int] = mapped_column(Integer, default=15)
+    dynamic_wave_target_seconds: Mapped[int] = mapped_column(Integer, default=12 * 3600)
+    dynamic_wave_max_objects: Mapped[int] = mapped_column(Integer, default=50000)
+    dynamic_restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=6 * 3600)
+    dynamic_pipeline_enabled: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -452,6 +464,17 @@ class AutomaticWaveCreate(BaseModel):
     prefix: str = Field(default="", max_length=1024)
 
 
+class DynamicWaveCreate(BaseModel):
+    """Create static waves packed by byte, object-count and predicted duration."""
+    max_bytes: int = Field(gt=0, le=10 * 1024**4)
+    target_transfer_seconds: int = Field(ge=300, le=7 * 24 * 3600)
+    max_objects: int = Field(ge=1, le=500000)
+    restore_days: int = Field(ge=1, le=30)
+    restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
+    prefix: str = Field(default="", max_length=1024)
+    schedule_restores: bool = False
+
+
 class ClaimRequest(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
     lease_seconds: int = Field(default=300, ge=30, le=3600)
@@ -477,6 +500,10 @@ class RuntimeSettingsUpdate(BaseModel):
     cost_estimation_enabled: bool = False
     cost_pricing_auto_refresh_enabled: bool = True
     cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
+    dynamic_wave_target_seconds: int = Field(default=12 * 3600, ge=300, le=7 * 24 * 3600)
+    dynamic_wave_max_objects: int = Field(default=50000, ge=1, le=500000)
+    dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
+    dynamic_pipeline_enabled: bool = False
 
 
 class ActivityRefreshSettingsUpdate(BaseModel):
@@ -520,6 +547,7 @@ def create_schema() -> None:
         "transferred_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_started_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0",
+        "planned_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0",
         "transfer_progress_bytes": "BIGINT NOT NULL DEFAULT 0",
         "transfer_progress_at": "TIMESTAMP WITH TIME ZONE",
         "transfer_rate_mbps": "DOUBLE PRECISION NOT NULL DEFAULT 0",
@@ -552,11 +580,15 @@ def create_schema() -> None:
         "multipart_part_size_mib": "INTEGER NOT NULL DEFAULT 64",
         "activity_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "activity_refresh_seconds": "INTEGER NOT NULL DEFAULT 15",
+        "dynamic_wave_target_seconds": "INTEGER NOT NULL DEFAULT 43200",
+        "dynamic_wave_max_objects": "INTEGER NOT NULL DEFAULT 50000",
+        "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
+        "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
-    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
@@ -651,7 +683,12 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "cost_pricing_auto_refresh_enabled": settings.cost_pricing_auto_refresh_enabled,
             "cost_pricing_refresh_days": settings.cost_pricing_refresh_days,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
-            "activity_refresh_seconds": settings.activity_refresh_seconds, "updated_at": settings.updated_at}
+            "activity_refresh_seconds": settings.activity_refresh_seconds,
+            "dynamic_wave_target_seconds": settings.dynamic_wave_target_seconds,
+            "dynamic_wave_max_objects": settings.dynamic_wave_max_objects,
+            "dynamic_restore_safety_seconds": settings.dynamic_restore_safety_seconds,
+            "dynamic_pipeline_enabled": settings.dynamic_pipeline_enabled,
+            "updated_at": settings.updated_at}
 
 
 def safe_aws_error_summary(error: Exception) -> str:
@@ -2242,18 +2279,131 @@ def discovered_object_filters(source_id: int, prefix: str = "") -> list:
 
 
 def assign_wave(session: Session, source_id: int, name: str, max_bytes: int, restore_days: int,
-                restore_tier: str, objects: list[ObjectRecord], oversized: bool = False) -> Wave:
+                restore_tier: str, objects: list[ObjectRecord], oversized: bool = False,
+                *, planner_mode: str = "MANUAL", predicted_transfer_seconds: float = 0,
+                prediction_samples: int = 0, planned_restore_at: datetime | None = None,
+                planned_transfer_start_at: datetime | None = None) -> Wave:
     assigned_bytes = sum(obj.size_bytes for obj in objects)
     wave = Wave(source_id=source_id, name=name, max_bytes=max_bytes, restore_days=restore_days,
-                restore_tier=restore_tier, status="PLANNED")
+                restore_tier=restore_tier, status="PLANNED", planner_mode=planner_mode,
+                predicted_transfer_seconds=predicted_transfer_seconds, prediction_samples=prediction_samples,
+                planned_restore_at=planned_restore_at, planned_transfer_start_at=planned_transfer_start_at)
     session.add(wave)
     session.flush()
     for obj in objects:
         obj.wave_id = wave.id
         obj.state = ObjectState.WAVE_ASSIGNED
     suffix = " (contains an object larger than the configured target)" if oversized else ""
-    record_event(session, "WAVE_CREATED", f"Wave '{wave.name}' planned with {len(objects)} object(s) and {assigned_bytes} byte(s){suffix}; no task was queued", source_id=source_id, wave_id=wave.id)
+    prediction = f"; predicted transfer {int(predicted_transfer_seconds)}s from {prediction_samples} historical sample(s)" if planner_mode == "DYNAMIC" else ""
+    record_event(session, "WAVE_CREATED", f"Wave '{wave.name}' planned with {len(objects)} object(s) and {assigned_bytes} byte(s){suffix}{prediction}; no task was queued", source_id=source_id, wave_id=wave.id)
     return wave
+
+
+def prediction_bucket(size_bytes: int, multipart_part_size_mib: int) -> str:
+    """Stable, explainable object classes used by the v1 historical model."""
+    mib = 1024 ** 2
+    if size_bytes >= multipart_part_size_mib * mib:
+        return "multipart"
+    if size_bytes <= mib:
+        return "up_to_1_mib"
+    if size_bytes <= 16 * mib:
+        return "up_to_16_mib"
+    if size_bytes <= 256 * mib:
+        return "up_to_256_mib"
+    return "large_single_part"
+
+
+def percentile_75(values: list[float]) -> float:
+    ordered = sorted(value for value in values if value > 0)
+    if not ordered:
+        return 0.0
+    return ordered[min(len(ordered) - 1, math.ceil(len(ordered) * .75) - 1)]
+
+
+def transfer_history_profiles(session: Session, source_id: int, multipart_part_size_mib: int) -> dict[str, dict]:
+    """Return durable P75 per-object elapsed observations for one source.
+
+    Only completed objects with a measured interval participate.  Failed and
+    legacy rows with a zero duration intentionally do not pollute forecasts.
+    """
+    rows = session.execute(
+        select(ObjectRecord.size_bytes, ObjectRecord.transfer_elapsed_seconds)
+        .where(ObjectRecord.source_id == source_id,
+               ObjectRecord.transferred_at.is_not(None),
+               ObjectRecord.transfer_elapsed_seconds > 0,
+               ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]))
+    )
+    grouped: dict[str, list[float]] = {}
+    for size_bytes, elapsed in rows:
+        grouped.setdefault(prediction_bucket(size_bytes, multipart_part_size_mib), []).append(float(elapsed))
+    return {bucket: {"samples": len(values), "p75_seconds": percentile_75(values)}
+            for bucket, values in grouped.items()}
+
+
+def predict_object_transfer_seconds(obj: ObjectRecord, settings: RuntimeSettings, profiles: dict[str, dict]) -> tuple[float, int]:
+    """Predict one object conservatively; history is used only with 5 samples."""
+    bucket = prediction_bucket(obj.size_bytes, settings.multipart_part_size_mib)
+    profile = profiles.get(bucket, {})
+    if profile.get("samples", 0) >= 5 and profile.get("p75_seconds", 0) > 0:
+        return float(profile["p75_seconds"]), int(profile["samples"])
+    # Link-model fallback: service/object overhead + the object's fair share
+    # of configured aggregate bandwidth.  Multipart has a modest setup term.
+    throughput_per_worker = max(1.0, settings.max_throughput_mbps / max(1, settings.transfer_workers))
+    seconds = 0.25 + (obj.size_bytes * 8 / (throughput_per_worker * 1_000_000))
+    if obj.size_bytes >= settings.multipart_part_size_mib * 1024 ** 2:
+        parts = math.ceil(obj.size_bytes / (settings.multipart_part_size_mib * 1024 ** 2))
+        seconds += 1.0 + parts * .08
+    return max(.25, seconds), 0
+
+
+def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_transfer_seconds: int,
+                      max_objects: int, prefix: str = "") -> dict:
+    """Build, but do not persist, deterministic groups for the dynamic planner."""
+    settings = runtime_settings(session)
+    profiles = transfer_history_profiles(session, source_id, settings.multipart_part_size_mib)
+    waves: list[dict] = []
+    current: list[tuple[ObjectRecord, float, int]] = []
+    bytes_total = predicted_sum = sample_count = 0
+
+    def flush(exclusive: bool = False) -> None:
+        nonlocal current, bytes_total, predicted_sum, sample_count
+        if not current:
+            return
+        # Individual estimates represent worker time. Wall time is bounded by
+        # aggregate throughput and by worker parallelism, plus a small setup.
+        link_seconds = bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000)
+        wall_seconds = max(link_seconds, predicted_sum / max(1, settings.transfer_workers)) + 30
+        waves.append({"objects": list(current), "bytes": bytes_total, "object_count": len(current),
+                      "predicted_transfer_seconds": math.ceil(wall_seconds), "prediction_samples": sample_count,
+                      "exclusive": exclusive})
+        current, bytes_total, predicted_sum, sample_count = [], 0, 0.0, 0
+
+    for obj in session.scalars(select(ObjectRecord).where(*discovered_object_filters(source_id, prefix)).order_by(ObjectRecord.object_key, ObjectRecord.id)).yield_per(1000):
+        predicted, samples = predict_object_transfer_seconds(obj, settings, profiles)
+        projected_bytes = bytes_total + obj.size_bytes
+        projected_count = len(current) + 1
+        projected_sum = predicted_sum + predicted
+        projected_wall = max(projected_bytes * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
+                             projected_sum / max(1, settings.transfer_workers)) + 30
+        exceeds = projected_bytes > max_bytes or projected_count > max_objects or projected_wall > target_transfer_seconds
+        if current and exceeds:
+            flush()
+        if not current:
+            # An object beyond any hard/soft target forms an exclusive wave;
+            # it is never silently skipped.
+            current.append((obj, predicted, samples))
+            bytes_total, predicted_sum, sample_count = obj.size_bytes, predicted, samples
+            one_wall = max(bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
+                           predicted_sum / max(1, settings.transfer_workers)) + 30
+            if bytes_total > max_bytes or one_wall > target_transfer_seconds:
+                flush(exclusive=True)
+            continue
+        current.append((obj, predicted, samples))
+        # A wave may mix size classes. Keep the strongest historical sample
+        # count as a confidence indicator; do not inflate it per object.
+        bytes_total, predicted_sum, sample_count = projected_bytes, projected_sum, max(sample_count, samples)
+    flush()
+    return {"waves": waves, "profiles": profiles, "settings": settings}
 
 
 def next_wave_objects(session: Session, source_id: int, max_bytes: int, prefix: str = "") -> tuple[list[ObjectRecord], bool]:
@@ -2357,6 +2507,87 @@ def create_automatic_waves(source_id: int, payload: AutomaticWaveCreate, session
             "names": [wave.name for wave in created]}
 
 
+def dynamic_schedule_times(now: datetime, plans: list[dict], safety_seconds: int) -> list[tuple[datetime, datetime]]:
+    """Forecast a single transfer lane with restore requests issued in advance."""
+    transfer_start = now + timedelta(seconds=safety_seconds)
+    times: list[tuple[datetime, datetime]] = []
+    for plan in plans:
+        # BULK maximum latency is 48h; Standard is planned conservatively at
+        # 12h. The additional configured safety protects the handoff window.
+        restore_lead = (48 if plan.get("restore_tier") == "BULK" else 12) * 3600 + safety_seconds
+        restore_at = max(now, transfer_start - timedelta(seconds=restore_lead))
+        times.append((restore_at, transfer_start))
+        transfer_start += timedelta(seconds=plan["predicted_transfer_seconds"])
+    return times
+
+
+@app.get("/api/sources/{source_id}/waves/dynamic-preview")
+def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1024**4),
+                          target_transfer_seconds: int = Query(ge=300, le=7 * 24 * 3600),
+                          max_objects: int = Query(ge=1, le=500000), prefix: str = Query(default="", max_length=1024),
+                          restore_tier: str = Query(default="BULK", pattern="^(BULK|STANDARD)$"),
+                          session: Session = Depends(get_session)) -> dict:
+    active_source_or_409(session, source_id)
+    result = dynamic_wave_plan(session, source_id, max_bytes, target_transfer_seconds, max_objects, prefix)
+    plans = result["waves"]
+    for plan in plans:
+        plan["restore_tier"] = restore_tier
+    times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
+    return {
+        "objects": sum(plan["object_count"] for plan in plans), "bytes": sum(plan["bytes"] for plan in plans),
+        "estimated_waves": len(plans), "target_transfer_seconds": target_transfer_seconds,
+        "max_objects": max_objects, "profiles": result["profiles"],
+        "historical_samples": sum(value["samples"] for value in result["profiles"].values()),
+        "waves": [{"objects": plan["object_count"], "bytes": plan["bytes"],
+                    "predicted_transfer_seconds": plan["predicted_transfer_seconds"],
+                    "prediction_samples": plan["prediction_samples"], "exclusive": plan["exclusive"],
+                    "planned_restore_at": times[index][0], "planned_transfer_start_at": times[index][1]}
+                  for index, plan in enumerate(plans[:100])],
+        "truncated": len(plans) > 100,
+    }
+
+
+@app.post("/api/sources/{source_id}/waves/dynamic", status_code=201)
+def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Session = Depends(get_session)) -> dict:
+    source = active_source_or_409(session, source_id)
+    result = dynamic_wave_plan(session, source_id, payload.max_bytes, payload.target_transfer_seconds, payload.max_objects, payload.prefix)
+    plans = result["waves"]
+    if not plans:
+        raise HTTPException(status_code=409, detail="No discovered objects match this dynamic-wave selection")
+    if len(plans) > 10000:
+        raise HTTPException(status_code=422, detail="Dynamic plan exceeds the safety limit of 10000 waves. Increase the target size, time, or object limit.")
+    for plan in plans:
+        plan["restore_tier"] = payload.restore_tier
+    schedule_restores = payload.schedule_restores and result["settings"].dynamic_pipeline_enabled
+    times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
+    created: list[Wave] = []
+    for sequence, (plan, timing) in enumerate(zip(plans, times), start=1):
+        name = automatic_wave_name(session, source, payload.prefix, sequence)
+        objects = [obj for obj, _prediction, _samples in plan["objects"]]
+        for obj, prediction, _samples in plan["objects"]:
+            obj.planned_transfer_seconds = prediction
+        wave = assign_wave(session, source.id, name, payload.max_bytes, payload.restore_days, payload.restore_tier,
+                           objects, plan["exclusive"], planner_mode="DYNAMIC",
+                           predicted_transfer_seconds=plan["predicted_transfer_seconds"],
+                           prediction_samples=plan["prediction_samples"], planned_restore_at=timing[0],
+                           planned_transfer_start_at=timing[1])
+        if schedule_restores:
+            wave.status = "RESTORE_SCHEDULED"
+            session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=timing[0]))
+            record_event(session, "DYNAMIC_RESTORE_SCHEDULED",
+                         f"Wave '{wave.name}' restore scheduled for {timing[0].isoformat()} before predicted transfer window {timing[1].isoformat()}",
+                         source_id=source.id, wave_id=wave.id)
+        created.append(wave)
+    record_event(session, "DYNAMIC_WAVES_CREATED",
+                 f"Created {len(created)} dynamic static wave(s); historical samples: {sum(value['samples'] for value in result['profiles'].values())}; restore scheduling {'enabled' if schedule_restores else 'not enabled'}",
+                 source_id=source.id)
+    session.commit()
+    return {"waves": len(created), "objects": sum(plan["object_count"] for plan in plans),
+            "bytes": sum(plan["bytes"] for plan in plans), "scheduled_restores": schedule_restores,
+            "historical_samples": sum(value["samples"] for value in result["profiles"].values()),
+            "names": [wave.name for wave in created]}
+
+
 @app.get("/api/sources/{source_id}/waves")
 def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[dict]:
     source_or_404(session, source_id)
@@ -2419,6 +2650,9 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
              "status": displayed_status(wave),
              "restore_tier": wave.restore_tier,
              "restore_days": wave.restore_days, "objects": count, "bytes": size, "batch_job_id": wave.batch_job_id,
+             "planner_mode": wave.planner_mode, "predicted_transfer_seconds": wave.predicted_transfer_seconds,
+             "prediction_samples": wave.prediction_samples, "planned_restore_at": wave.planned_restore_at,
+             "planned_transfer_start_at": wave.planned_transfer_start_at,
              "restore_timing": timing_by_wave.get(wave.id, {}),
              "transfer_duration_seconds": int((finished - started).total_seconds()) if started and finished and displayed_status(wave) in {"COMPLETED", "TRANSFERRED", "VERIFIED"} else None,
              "last_poll_at": wave.last_poll_at,
