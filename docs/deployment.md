@@ -48,6 +48,8 @@ A console é o plano de controle local e persiste suas operações no PostgreSQL
 
 Os formulários e indicadores principais possuem ícones `i` de ajuda contextual. Eles descrevem limites, impacto operacional e, quando aplicável, impactos de custo e prazo de restore. A ajuda está disponível por mouse e teclado.
 
+A navegação separa claramente os dois contextos: **Status** contém apenas saúde global, observabilidade e prontidão de integrações; **Queue** é a console de acompanhamento da migração, com atividade, fila durável de transferência, workers e auditorias profundas. A atualização automática configurável atua na tela Queue.
+
 Os parâmetros operacionais são persistidos no PostgreSQL. O **worker AWS/OCI real** é um container separado da API e fica inerte por padrão; somente depois da habilitação explícita ele assume discovery e tarefas duráveis de restore, polling e transferência. O worker de simulação é uma ferramenta de teste e nunca chama AWS ou OCI.
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
