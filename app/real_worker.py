@@ -41,6 +41,14 @@ ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCES
 # HeadObject checks only when the archive subset is materially smaller than
 # the source scan.  The conservative factor of 10 also minimizes requests.
 RESTORE_POLL_HEAD_TO_LIST_RATIO = 10
+# A discovery response contains at most 1,000 S3 keys.  Persisting each
+# response separately is very safe, but it turns a 100-million-object bucket
+# into 100,000 PostgreSQL commits.  Commit a bounded group atomically instead:
+# the object rows and its continuation token always advance together.  After a
+# sudden VM stop Raijin can therefore replay at most nine already-read pages,
+# never lose a confirmed page and never issue a per-object database lookup.
+DISCOVERY_MAX_KEYS = 1000
+DISCOVERY_CHECKPOINT_PAGES = 10
 # Explicit network bounds prevent an interrupted TCP stream from holding the
 # only real worker forever. A task-level retry preserves its multipart
 # checkpoint and lets the worker resume the accepted OCI parts safely.
@@ -233,31 +241,47 @@ def discover(session, source: Source, settings) -> None:
     s3, _, _ = aws_clients(settings, source.aws_region, source)
     inserted = 0
     continuation_token = source.discovery_continuation_token
+    pending_rows: list[dict] = []
+    pending_pages = 0
+    pending_token = continuation_token
+
+    def checkpoint_batch() -> None:
+        """Atomically persist a bounded discovery batch and its S3 cursor."""
+        nonlocal inserted, pending_pages
+        if not pending_pages:
+            return
+        if pending_rows:
+            # Mappings bypass the ORM identity map, keeping memory bounded even
+            # when a bucket contains tens of millions of objects.
+            session.bulk_insert_mappings(ObjectRecord, pending_rows)
+        inserted += len(pending_rows)
+        source.discovery_pages_completed += pending_pages
+        source.discovery_objects_inserted += len(pending_rows)
+        source.discovery_continuation_token = pending_token
+        session.commit()
+        pending_rows.clear()
+        pending_pages = 0
+
     while True:
-        request = {"Bucket": source.s3_bucket, "Prefix": source.s3_prefix, "MaxKeys": 1000}
+        request = {"Bucket": source.s3_bucket, "Prefix": source.s3_prefix, "MaxKeys": DISCOVERY_MAX_KEYS}
         if continuation_token:
             request["ContinuationToken"] = continuation_token
         page = s3.list_objects_v2(**request)
         items = page.get("Contents", [])
-        # Discovery has only one worker per source, but older/manual imports
-        # may already have records.  One set-based lookup per S3 page avoids a
-        # database round-trip for every object while keeping reruns idempotent.
-        keys = [item["Key"] for item in items]
-        existing = set(session.scalars(select(ObjectRecord.object_key).where(
-            ObjectRecord.source_id == source.id, ObjectRecord.version_id.is_(None), ObjectRecord.object_key.in_(keys)
-        ))) if keys else set()
-        rows = [ObjectRecord(
-            source_id=source.id, object_key=item["Key"], size_bytes=item["Size"],
-            etag=item.get("ETag", "").strip('"') or None, storage_class=item.get("StorageClass"),
-            last_modified=item.get("LastModified"),
-        ) for item in items if item["Key"] not in existing]
-        session.add_all(rows)
-        inserted += len(rows)
-        source.discovery_pages_completed += 1
-        source.discovery_objects_inserted += len(rows)
+        pending_rows.extend({
+            "source_id": source.id,
+            "object_key": item["Key"],
+            "size_bytes": item["Size"],
+            "etag": item.get("ETag", "").strip('"') or None,
+            "storage_class": item.get("StorageClass"),
+            "last_modified": item.get("LastModified"),
+            "state": ObjectState.DISCOVERED,
+        } for item in items)
+        pending_pages += 1
         continuation_token = page.get("NextContinuationToken")
-        source.discovery_continuation_token = continuation_token
-        session.commit()
+        pending_token = continuation_token
+        if pending_pages >= DISCOVERY_CHECKPOINT_PAGES or not continuation_token:
+            checkpoint_batch()
         if not continuation_token:
             break
     finished_at = utcnow()

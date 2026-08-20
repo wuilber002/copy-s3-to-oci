@@ -27,7 +27,9 @@ def test_source_model_has_a_durable_discovery_page_checkpoint():
     assert {"discovery_continuation_token", "discovery_pages_completed", "discovery_objects_inserted", "discovery_started_at", "discovery_elapsed_seconds"} <= set(columns.keys())
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert 'request["ContinuationToken"] = continuation_token' in worker
-    assert "One set-based lookup per S3 page" in worker
+    assert "DISCOVERY_CHECKPOINT_PAGES = 10" in worker
+    assert "session.bulk_insert_mappings(ObjectRecord, pending_rows)" in worker
+    assert "Atomically persist a bounded discovery batch" in worker
 
 
 def test_inventory_file_import_is_batched_and_never_calls_aws_discovery():

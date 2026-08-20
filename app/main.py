@@ -2172,6 +2172,12 @@ def request_discovery(source_id: int, session: Session = Depends(get_session)) -
     if session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)):
         raise HTTPException(status_code=409, detail="Discovery is immutable after waves are created")
     resume = source.status == "DISCOVERY_FAILED" and bool(source.discovery_continuation_token)
+    # A remote discovery has one exact S3 continuation cursor.  Mixing it with
+    # a previous inventory-file import (or silently starting over on completed
+    # rows) makes the origin non-auditable and forces expensive duplicate
+    # checks.  A failed remote discovery is the only valid resume case.
+    if not resume and session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source_id).limit(1)):
+        raise HTTPException(status_code=409, detail="Remote discovery cannot replace or merge an existing inventory; create a new source or resume the failed remote discovery")
     source.status = "DISCOVERY_QUEUED"
     source.discovery_requested_at = utcnow()
     source.discovery_completed_at = None

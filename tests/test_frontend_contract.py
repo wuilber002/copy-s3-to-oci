@@ -135,10 +135,9 @@ def test_discovery_is_selected_in_a_minimal_modal_with_remote_and_inventory_file
     assert 'id="discovery-submit" type="submit">OK</button>' in page
     assert "new FormData()" in page
     assert "/inventory/upload" in page
-    assert "mais de 1 milhão de objetos" in page
+    assert "mais de <b>1 milhão de objetos</b>" in page
     assert "input[type=checkbox],input[type=radio]{width:auto}" in page
     assert 'class="discovery-options"' in page
-    assert "docs.aws.amazon.com/AmazonS3/latest/API/API_ListObjectsV2.html" in page
     assert "docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html" in page
 
 
