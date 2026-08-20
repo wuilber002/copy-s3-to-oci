@@ -25,6 +25,7 @@ import math
 import re
 import shutil
 from urllib.request import Request, urlopen
+from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -362,6 +363,10 @@ class DiscoveryJob(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
+    mode: Mapped[str] = mapped_column(String(32), default="REMOTE_LIST")
+    inventory_manifest_uri: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    inventory_file_index: Mapped[int] = mapped_column(Integer, default=0)
+    inventory_rows_completed: Mapped[int] = mapped_column(BigInteger, default=0)
     state: Mapped[str] = mapped_column(String(16), default=TaskState.READY, index=True)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -435,6 +440,10 @@ class LegacySourceConnectionMigration(BaseModel):
 class AwsConnectionCreate(BaseModel):
     secret_ocid: str = Field(min_length=20, max_length=255)
     label: str = Field(min_length=1, max_length=255)
+
+
+class InventoryManifestImport(BaseModel):
+    manifest_uri: str = Field(min_length=10, max_length=4096)
 
 
 class CostPricingUpdate(BaseModel):
@@ -619,6 +628,7 @@ def create_schema() -> None:
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
     existing_bucket_columns = {column["name"] for column in inspect(engine).get_columns("oci_bucket_cache")}
     existing_cost_pricing_columns = {column["name"] for column in inspect(engine).get_columns("cost_pricing")}
+    existing_discovery_job_columns = {column["name"] for column in inspect(engine).get_columns("discovery_jobs")}
     with engine.begin() as connection:
         for column, sql_type in expected_columns.items():
             if column not in existing_columns:
@@ -657,6 +667,14 @@ def create_schema() -> None:
             connection.execute(text("ALTER TABLE cost_pricing ADD COLUMN include_oci_costs BOOLEAN NOT NULL DEFAULT TRUE"))
         if "compartment_name" not in existing_bucket_columns:
             connection.execute(text("ALTER TABLE oci_bucket_cache ADD COLUMN compartment_name VARCHAR(255)"))
+        for column, sql_type in {
+            "mode": "VARCHAR(32) NOT NULL DEFAULT 'REMOTE_LIST'",
+            "inventory_manifest_uri": "VARCHAR(4096)",
+            "inventory_file_index": "INTEGER NOT NULL DEFAULT 0",
+            "inventory_rows_completed": "BIGINT NOT NULL DEFAULT 0",
+        }.items():
+            if column not in existing_discovery_job_columns:
+                connection.execute(text(f"ALTER TABLE discovery_jobs ADD COLUMN {column} {sql_type}"))
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -2225,6 +2243,35 @@ def request_discovery(source_id: int, session: Session = Depends(get_session)) -
     return {"source_id": source.id, "status": source.status, "job_id": job.id}
 
 
+@app.post("/api/sources/{source_id}/inventory/manifest")
+def request_inventory_manifest_import(source_id: int, payload: InventoryManifestImport,
+                                      session: Session = Depends(get_session)) -> dict:
+    """Queue direct import of a S3 Inventory manifest and all of its shards."""
+    source = active_source_or_409(session, source_id)
+    parsed = urlparse(payload.manifest_uri)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.lstrip("/"):
+        raise HTTPException(status_code=422, detail="Manifest URI must use s3://bucket/key")
+    if source.status == "DISCOVERING" or session.scalar(select(Wave.id).where(Wave.source_id == source.id).limit(1)):
+        raise HTTPException(status_code=409, detail="Inventory manifest import is immutable after discovery starts or waves are created")
+    if session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source.id).limit(1)):
+        raise HTTPException(status_code=409, detail="Inventory manifest import cannot merge with an existing inventory; create a new source")
+    queued = session.scalar(select(DiscoveryJob.id).where(
+        DiscoveryJob.source_id == source.id,
+        DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
+    ).limit(1))
+    if queued:
+        raise HTTPException(status_code=409, detail=f"Discovery job {queued} is already queued or running for this source")
+    source.status, source.discovery_requested_at = "DISCOVERY_QUEUED", utcnow()
+    source.discovery_started_at, source.discovery_completed_at, source.discovery_error = None, None, None
+    source.discovery_continuation_token, source.discovery_pages_completed = None, 0
+    source.discovery_objects_inserted, source.discovery_elapsed_seconds = 0, 0
+    job = DiscoveryJob(source_id=source.id, mode="S3_INVENTORY_MANIFEST", inventory_manifest_uri=payload.manifest_uri)
+    session.add(job)
+    record_event(session, "INVENTORY_MANIFEST_QUEUED", f"S3 Inventory manifest import queued from {payload.manifest_uri}", source_id=source.id)
+    session.commit()
+    return {"source_id": source.id, "status": source.status, "job_id": job.id, "mode": job.mode}
+
+
 @app.get("/api/sources/{source_id}/summary")
 def source_summary(source_id: int, session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
@@ -2271,7 +2318,7 @@ def discovery_queue(limit: int = 100, session: Session = Depends(get_session)) -
     )
     now = utcnow()
     return [{
-        "id": job.id, "source_id": source.id, "source_name": source.name,
+        "id": job.id, "source_id": source.id, "source_name": source.name, "mode": job.mode,
         "state": job.state, "attempts": job.attempts, "available_at": job.available_at,
         "lease_expires_at": job.lease_expires_at, "worker_id": job.worker_id,
         "error": job.error, "created_at": job.created_at, "completed_at": job.completed_at,

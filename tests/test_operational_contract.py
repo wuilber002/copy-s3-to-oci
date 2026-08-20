@@ -55,6 +55,18 @@ def test_large_inventory_uses_keyset_pagination_and_production_indexes():
     assert "CREATE INDEX CONCURRENTLY" in script
 
 
+def test_s3_inventory_manifest_is_streamed_by_a_durable_discovery_job():
+    columns = DiscoveryJob.__table__.columns
+    assert {"mode", "inventory_manifest_uri", "inventory_file_index", "inventory_rows_completed"} <= set(columns.keys())
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "def import_s3_inventory_manifest" in worker
+    assert "S3 Inventory shard" in worker
+    assert "job.inventory_rows_completed = row_number" in worker
+    assert 'elif discovery_job.mode == "S3_INVENTORY_MANIFEST"' in worker
+    app_source = Path("app/main.py").read_text(encoding="utf-8")
+    assert '@app.post("/api/sources/{source_id}/inventory/manifest")' in app_source
+
+
 def test_inventory_file_import_is_batched_and_never_calls_aws_discovery():
     source = Path("app/main.py").read_text(encoding="utf-8")
     start = source.index("def upload_inventory_file")

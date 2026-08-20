@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import gzip
 import hashlib
 import io
 import json
@@ -18,9 +19,9 @@ import re
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlparse
 
 import boto3
 import oci
@@ -269,6 +270,112 @@ def discover(session, source: Source, settings, job: DiscoveryJob | None = None)
     source.status, source.discovery_error = "DISCOVERING", None
     source.discovery_started_at = utcnow()
     session.commit()
+    remote_discover(session, source, settings, job)
+
+
+def inventory_timestamp(value: str | None):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def import_s3_inventory_manifest(session, source: Source, settings, job: DiscoveryJob) -> None:
+    """Stream every S3 Inventory shard directly from S3 with a durable cursor.
+
+    Inventory CSV shards have no header. The manifest's ``fileSchema`` is the
+    authority for their positional columns. The job cursor is a shard index
+    plus the number of rows committed within that shard; an interruption can
+    reread only the uncommitted tail and never exposes a partial inventory.
+    """
+    if not job.inventory_manifest_uri:
+        raise RuntimeError("Inventory manifest URI is missing")
+    parsed = urlparse(job.inventory_manifest_uri)
+    manifest_bucket, manifest_key = parsed.netloc, parsed.path.lstrip("/")
+    source.status, source.discovery_error, source.discovery_started_at = "DISCOVERING", None, utcnow()
+    session.commit()
+    s3, _, _ = aws_clients(settings, source.aws_region, source)
+    manifest_response = s3.get_object(Bucket=manifest_bucket, Key=manifest_key)
+    manifest = json.loads(manifest_response["Body"].read())
+    schema = [field.strip() for field in str(manifest.get("fileSchema") or "").split(",")]
+    files = manifest.get("files") or []
+    if not schema or not files or "Key" not in schema or "Size" not in schema:
+        raise RuntimeError("S3 Inventory manifest has no CSV files or required Key/Size schema")
+    if manifest.get("sourceBucket") and str(manifest["sourceBucket"]).removeprefix("arn:aws:s3:::") != source.s3_bucket:
+        raise RuntimeError("S3 Inventory manifest source bucket does not match this Raijin source")
+    inserted = 0
+    for file_index in range(job.inventory_file_index, len(files)):
+        file_key = files[file_index].get("key")
+        if not file_key:
+            raise RuntimeError(f"S3 Inventory manifest shard {file_index} has no key")
+        response = s3.get_object(Bucket=manifest_bucket, Key=file_key)
+        body = response["Body"]
+        raw = gzip.GzipFile(fileobj=body) if file_key.endswith(".gz") else body
+        text_stream = io.TextIOWrapper(raw, encoding="utf-8", newline="")
+        reader = csv.DictReader(text_stream, fieldnames=schema)
+        skip_rows = job.inventory_rows_completed if file_index == job.inventory_file_index else 0
+        pending: list[dict] = []
+        processed_since_checkpoint = 0
+        row_number = 0
+
+        def checkpoint() -> None:
+            nonlocal inserted, processed_since_checkpoint
+            if not processed_since_checkpoint:
+                return
+            if pending:
+                session.bulk_insert_mappings(ObjectRecord, pending)
+            inserted += len(pending)
+            source.discovery_objects_inserted += len(pending)
+            job.inventory_rows_completed = row_number
+            job.lease_expires_at = utcnow() + timedelta(seconds=max(settings.task_lease_seconds, 300))
+            session.commit()
+            pending.clear()
+            processed_since_checkpoint = 0
+
+        try:
+            for row in reader:
+                row_number += 1
+                if row_number <= skip_rows:
+                    continue
+                processed_since_checkpoint += 1
+                key = unquote((row.get("Key") or "").strip())
+                if key and (not source.s3_prefix or key.startswith(source.s3_prefix)):
+                    try:
+                        size = int(row.get("Size") or 0)
+                    except ValueError:
+                        size = -1
+                    if size >= 0:
+                        pending.append({
+                            "source_id": source.id, "object_key": key,
+                            "version_id": (row.get("VersionId") or "").strip() or None,
+                            "size_bytes": size,
+                            "etag": (row.get("ETag") or "").strip('"') or None,
+                            "storage_class": (row.get("StorageClass") or "").strip() or None,
+                            "last_modified": inventory_timestamp(row.get("LastModifiedDate")),
+                            "state": ObjectState.DISCOVERED,
+                        })
+                if processed_since_checkpoint >= 5000:
+                    checkpoint()
+            checkpoint()
+        finally:
+            text_stream.close()
+            body.close()
+        job.inventory_file_index, job.inventory_rows_completed = file_index + 1, 0
+        source.discovery_pages_completed += 1
+        job.lease_expires_at = utcnow() + timedelta(seconds=max(settings.task_lease_seconds, 300))
+        session.commit()
+    finished_at = utcnow()
+    if source.discovery_started_at:
+        source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
+    source.discovery_started_at, source.discovery_completed_at, source.status = None, finished_at, "DISCOVERED"
+    job.state, job.error, job.lease_expires_at, job.completed_at = TaskState.SUCCEEDED, None, None, finished_at
+    event(session, "INVENTORY_MANIFEST_IMPORTED", f"S3 Inventory manifest imported {inserted} object(s) in this run; {source.discovery_objects_inserted} total object(s) across {source.discovery_pages_completed} shard(s)", source_id=source.id)
+    session.commit()
+
+
+def remote_discover(session, source: Source, settings, job: DiscoveryJob | None = None) -> None:
     s3, _, _ = aws_clients(settings, source.aws_region, source)
     inserted = 0
     continuation_token = source.discovery_continuation_token
@@ -1060,7 +1167,13 @@ def run_once() -> None:
                 discovery_job.state, discovery_job.error, discovery_job.lease_expires_at, discovery_job.completed_at = TaskState.FAILED, "Source is no longer eligible for remote discovery", None, utcnow()
                 session.commit()
                 return
-            try: discover(session, source, settings, discovery_job)
+            try:
+                if discovery_job.mode == "REMOTE_LIST":
+                    discover(session, source, settings, discovery_job)
+                elif discovery_job.mode == "S3_INVENTORY_MANIFEST":
+                    import_s3_inventory_manifest(session, source, settings, discovery_job)
+                else:
+                    raise RuntimeError(f"Unsupported discovery job mode {discovery_job.mode}")
             except Exception as error:
                 finished_at = utcnow()
                 if source.discovery_started_at:
