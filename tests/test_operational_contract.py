@@ -111,6 +111,13 @@ def test_real_worker_imports_the_runtime_namespace_reader_used_by_transfer_and_a
     assert "read_oci_runtime_config" in worker[worker.index("from app.main import ("):worker.index(")\n\n# The bootstrap")]
 
 
+def test_wave_report_returns_tasks_in_durable_execution_order():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    report = source[source.index("def wave_report"):source.index("\n\n@app.get(\"/api/waves/{wave_id}/cost-estimate\")")]
+    assert 'select(Task).where(Task.wave_id == wave_id).order_by(Task.id)' in report
+    assert 'for t in tasks' in report
+
+
 def test_restore_polling_uses_the_same_control_prefix_as_submission_and_labels_report_errors():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     poll = worker[worker.index("def poll_restore"):worker.index("\n\ndef sha256_b64")]

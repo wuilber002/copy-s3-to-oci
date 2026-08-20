@@ -2475,6 +2475,9 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
         ).where(ObjectRecord.wave_id == wave_id)
     ).one()
     attempts = list(session.scalars(select(RestoreAttempt).where(RestoreAttempt.wave_id == wave_id).order_by(RestoreAttempt.id.desc())))
+    # Relationships have no implicit SQL order. Fetch the durable task
+    # history explicitly so reports always tell the execution story in order.
+    tasks = list(session.scalars(select(Task).where(Task.wave_id == wave_id).order_by(Task.id)))
     latest_poll = session.scalar(
         select(Task).where(Task.wave_id == wave_id, Task.kind == "POLL_RESTORE").order_by(Task.id.desc())
     )
@@ -2491,7 +2494,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
             "restore_timing": restore_timing(session, wave_id),
             "polling": {"state": latest_poll.state if latest_poll else None, "error": latest_poll.error if latest_poll else None},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
-            "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in wave.tasks]}
+            "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in tasks]}
 
 
 @app.get("/api/waves/{wave_id}/cost-estimate")
