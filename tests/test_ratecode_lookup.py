@@ -31,4 +31,4 @@ def test_csv_price_shape_is_one_row_in_input_order():
         {"rate_code": "third", "price_usd": "0.1500000000"},
         {"rate_code": "first", "price_usd": "0.0080000000"},
         {"rate_code": "missing"},
-    ]) == ["0.1500000000", "0.0080000000", ""]
+    ]) == ["0,1500000000", "0,0080000000", ""]

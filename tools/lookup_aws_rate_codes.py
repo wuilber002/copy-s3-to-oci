@@ -94,8 +94,8 @@ def find_rate_codes(catalog: dict, wanted: set[str], service: str) -> dict[str, 
 
 
 def csv_price_row(results: list[dict]) -> list[str]:
-    """Return prices in caller order, with an empty field for a missing code."""
-    return [result.get("price_usd", "") for result in results]
+    """Return prices in caller order for Portuguese/Brazilian Excel."""
+    return [str(result.get("price_usd", "")).replace(".", ",") for result in results]
 
 
 def main() -> int:
@@ -103,7 +103,7 @@ def main() -> int:
     parser.add_argument("--region", required=True, help="AWS Region of the billed resource, for example sa-east-1")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="Emit a JSON array instead of readable text")
-    output.add_argument("--csv-price", action="store_true", help="Emit only price_usd as one CSV column, without a header")
+    output.add_argument("--csv-price", action="store_true", help="Emit only price_usd in Brazilian Excel CSV format (decimal comma, semicolon delimiter, no header)")
     parser.add_argument("rate_codes", nargs="+", metavar="RATE_CODE", help="One or more complete Price List RateCodes")
     args = parser.parse_args()
 
@@ -128,7 +128,7 @@ def main() -> int:
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
     elif args.csv_price:
-        writer = csv.writer(sys.stdout, lineterminator="\n")
+        writer = csv.writer(sys.stdout, delimiter=";", lineterminator="\n")
         writer.writerow(csv_price_row(results))
     else:
         for result in results:
