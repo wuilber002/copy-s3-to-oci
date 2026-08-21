@@ -1389,20 +1389,26 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
 
 
 def restore_timing(session: Session, wave_id: int) -> dict:
-    """Summarize durable per-object S3 restore timestamps for one wave."""
-    requested_at, first_available_at, last_available_at, earliest_expiry_at = session.execute(
+    """Summarize durable per-object S3 restore timestamps and availability."""
+    requested_at, first_available_at, last_available_at, earliest_expiry_at, requested_objects, available_objects = session.execute(
         select(
             func.min(ObjectRecord.restore_requested_at),
             func.min(ObjectRecord.restored_at),
             func.max(ObjectRecord.restored_at),
             func.min(ObjectRecord.restore_expires_at),
+            func.count(ObjectRecord.id),
+            func.count(ObjectRecord.id).filter(ObjectRecord.restored_at.is_not(None)),
         ).where(ObjectRecord.wave_id == wave_id, ObjectRecord.restore_requested_at.is_not(None))
     ).one()
+    requested_objects, available_objects = int(requested_objects or 0), int(available_objects or 0)
     return {
         "requested_at": requested_at,
         "first_available_at": first_available_at,
         "last_available_at": last_available_at,
         "earliest_expiry_at": earliest_expiry_at,
+        "requested_objects": requested_objects,
+        "available_objects": available_objects,
+        "pending_objects": max(0, requested_objects - available_objects),
         "restore_elapsed_seconds": max(0, int((last_available_at - requested_at).total_seconds())) if requested_at and last_available_at else None,
     }
 
@@ -1419,7 +1425,8 @@ def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Sessio
         "last_error": task.error,
         **(restore_timing(session, wave.id) if session is not None else {
             "requested_at": None, "first_available_at": None, "last_available_at": None,
-            "earliest_expiry_at": None, "restore_elapsed_seconds": None,
+            "earliest_expiry_at": None, "requested_objects": 0, "available_objects": 0,
+            "pending_objects": 0, "restore_elapsed_seconds": None,
         }),
     }
 

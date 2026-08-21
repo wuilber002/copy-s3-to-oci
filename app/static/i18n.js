@@ -128,6 +128,9 @@
     ,'Onda em transferência': 'Wave in transfer', 'Próxima onda da fila': 'Next queued wave', 'Solicitar restore': 'Request restore', 'Aguardar restore': 'Wait for restore', 'Transferir arquivos': 'Transfer files'
     ,'Tempo acumulado de cópia': 'Accumulated copy time', 'Status da tarefa': 'Task status', 'Workers de transferência': 'Transfer workers', 'Estado': 'State', 'Arquivo': 'File', 'Progresso': 'Progress', 'Demais ondas na fila': 'Other queued waves', 'Etapa': 'Step', 'Tempo acumulado': 'Accumulated time'
     ,'Não foi possível carregar a fila de transferência.': 'Could not load the transfer queue.', 'Fila de transferência:': 'Transfer queue:'
+    ,'Fila de discovery': 'Discovery queue', 'Carregando fila de discovery…': 'Loading discovery queue…', 'Auditorias profundas': 'Deep audits', 'Nenhuma auditoria profunda em execução.': 'No deep audit is running.'
+    ,'Acompanhamento do restore': 'Restore tracking', 'Ver acompanhamento do restore': 'View restore tracking', 'Disponibilidade': 'Availability', 'Aguardando confirmação': 'Waiting for confirmation', 'Restore solicitado:': 'Restore requested:', 'Último polling:': 'Last polling:', 'Quantidade de polls:': 'Poll count:', 'Primeiro objeto disponível:': 'First object available:', 'Todos os objetos disponíveis:': 'All objects available:', 'Tempo de restore:': 'Restore time:', 'Expiração temporária mais próxima:': 'Earliest temporary expiry:', 'Tentativas de restore': 'Restore attempts', 'Execução Batch:': 'Batch execution:', 'submissão AWS:': 'AWS submission:', 'aceitos': 'accepted', 'falhos': 'failed', 'Nenhuma tentativa Batch registrada.': 'No Batch attempt recorded.'
+    ,'RESTORE 100% DISPONÍVEL': 'RESTORE 100% AVAILABLE', 'RESTORE PARCIAL:': 'PARTIAL RESTORE:', 'DISPONÍVEIS': 'AVAILABLE'
   };
   let language = localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'pt';
   let translating = false;
