@@ -93,6 +93,11 @@ def find_rate_codes(catalog: dict, wanted: set[str], service: str) -> dict[str, 
     return found
 
 
+def csv_price_row(results: list[dict]) -> list[str]:
+    """Return prices in caller order, with an empty field for a missing code."""
+    return [result.get("price_usd", "") for result in results]
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--region", required=True, help="AWS Region of the billed resource, for example sa-east-1")
@@ -124,8 +129,7 @@ def main() -> int:
         print(json.dumps(results, ensure_ascii=False, indent=2))
     elif args.csv_price:
         writer = csv.writer(sys.stdout, lineterminator="\n")
-        for result in results:
-            writer.writerow([result.get("price_usd", "")])
+        writer.writerow(csv_price_row(results))
     else:
         for result in results:
             print(f"RateCode: {result['rate_code']}")
