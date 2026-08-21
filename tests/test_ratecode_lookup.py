@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-from tools.lookup_aws_rate_codes import csv_price_row, metric_name, parse_output_units, spreadsheet_price
+from tools.lookup_aws_rate_codes import csv_price_row, metric_name, parse_output_units, resolve_rate_codes, spreadsheet_price
 
 
 def test_ratecode_lookup_labels_raijin_metrics_from_public_attributes():
@@ -43,3 +43,8 @@ def test_spreadsheet_price_scales_only_when_the_ratecode_mapping_requests_it():
 
 def test_parse_output_units_is_explicit_and_ratecode_based():
     assert parse_output_units(["abc=per_1000", "def=source"]) == {"abc": "per_1000", "def": "source"}
+
+
+def test_output_unit_only_form_preserves_option_order_as_output_order():
+    mappings = parse_output_units(["third=source", "first=per_1000", "second=source"])
+    assert resolve_rate_codes([], mappings) == ["third", "first", "second"]

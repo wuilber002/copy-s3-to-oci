@@ -13,6 +13,11 @@ Examples:
     --output-unit EFD42GHQBGKAPBHU.JRTCKXETXF.6YS6EN2CT7=per_1000 \
     EFD42GHQBGKAPBHU.JRTCKXETXF.6YS6EN2CT7
 
+  # Fully declarative form: the --output-unit order is the CSV output order.
+  python3 tools/lookup_aws_rate_codes.py --region sa-east-1 --csv-price \
+    --output-unit QKTPK3975YUWDU3Q.JRTCKXETXF.Q3Z75P77EN=source \
+    --output-unit EFD42GHQBGKAPBHU.JRTCKXETXF.6YS6EN2CT7=per_1000
+
 The script does not use AWS credentials and does not access the customer
 account. A RateCode is a Price List rate-dimension identifier and is regional,
 so pass the AWS Region where the billed S3 bucket resides.
@@ -111,8 +116,22 @@ def parse_output_units(specifications: list[str]) -> dict[str, str]:
             raise ValueError(f"Invalid --output-unit '{specification}'; use RATE_CODE=source, per_1000, or per_1m") from error
         if not rate_code or output_unit not in OUTPUT_UNIT_FACTORS:
             raise ValueError(f"Invalid --output-unit '{specification}'; use RATE_CODE=source, per_1000, or per_1m")
+        if rate_code in mappings:
+            raise ValueError(f"RateCode '{rate_code}' was provided more than once in --output-unit")
         mappings[rate_code] = output_unit
     return mappings
+
+
+def resolve_rate_codes(positional_rate_codes: list[str], output_units: dict[str, str]) -> list[str]:
+    """Use positional order when supplied, otherwise preserve --output-unit order."""
+    if positional_rate_codes:
+        unknown_unit_codes = set(output_units) - set(positional_rate_codes)
+        if unknown_unit_codes:
+            raise ValueError("--output-unit was provided for a RateCode not present in the positional input: " + ", ".join(sorted(unknown_unit_codes)))
+        return positional_rate_codes
+    if output_units:
+        return list(output_units)
+    raise ValueError("Provide one or more RATE_CODE arguments, or one or more --output-unit RATE_CODE=UNIT mappings")
 
 
 def spreadsheet_price(result: dict, output_unit: str = "source") -> str:
@@ -141,7 +160,7 @@ def main() -> int:
     output.add_argument("--json", action="store_true", help="Emit a JSON array instead of readable text")
     output.add_argument("--csv-price", action="store_true", help="Emit selected-unit prices in Brazilian Excel CSV format (decimal comma, semicolon delimiter, no header)")
     parser.add_argument("--output-unit", action="append", default=[], metavar="RATE_CODE=UNIT", help="Scale one RateCode: source (default), per_1000, or per_1m; may be repeated")
-    parser.add_argument("rate_codes", nargs="+", metavar="RATE_CODE", help="One or more complete Price List RateCodes")
+    parser.add_argument("rate_codes", nargs="*", metavar="RATE_CODE", help="Complete Price List RateCodes; optional when every code is provided through --output-unit")
     # Operators commonly paste RateCodes in groups and add --output-unit
     # mappings between them. parse_intermixed_args accepts that natural CLI
     # ordering while preserving the exact positional RateCode order.
@@ -149,13 +168,11 @@ def main() -> int:
 
     try:
         output_units = parse_output_units(args.output_unit)
+        rate_codes = resolve_rate_codes(args.rate_codes, output_units)
     except ValueError as error:
         parser.error(str(error))
-    unknown_unit_codes = set(output_units) - set(args.rate_codes)
-    if unknown_unit_codes:
-        parser.error("--output-unit was provided for a RateCode not present in the positional input: " + ", ".join(sorted(unknown_unit_codes)))
 
-    wanted = set(args.rate_codes)
+    wanted = set(rate_codes)
     found: dict[str, dict] = {}
     try:
         for service, template in CATALOGS.items():
@@ -165,7 +182,7 @@ def main() -> int:
         return 2
 
     results = []
-    for rate_code in args.rate_codes:
+    for rate_code in rate_codes:
         value = found.get(rate_code)
         if value is None:
             value = {"rate_code": rate_code, "found": False, "region": args.region}
