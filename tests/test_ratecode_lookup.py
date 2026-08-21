@@ -1,3 +1,6 @@
+import subprocess
+import sys
+
 from tools.lookup_aws_rate_codes import metric_name
 
 
@@ -11,3 +14,13 @@ def test_ratecode_lookup_labels_raijin_metrics_from_public_attributes():
     assert metric_name("AWSDataTransfer", {
         "transferType": "AWS Outbound", "toLocation": "External"
     }, {"description": "$0.150 per GB - up to 10 TB / month data transfer out"}) == "Data Transfer OUT to Internet — first tier"
+
+
+def test_ratecode_lookup_help_documents_csv_price_mode():
+    result = subprocess.run(
+        [sys.executable, "tools/lookup_aws_rate_codes.py", "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert "--csv-price" in result.stdout

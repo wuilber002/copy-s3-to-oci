@@ -17,6 +17,7 @@ so pass the AWS Region where the billed S3 bucket resides.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from urllib.request import Request, urlopen
@@ -95,7 +96,9 @@ def find_rate_codes(catalog: dict, wanted: set[str], service: str) -> dict[str, 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--region", required=True, help="AWS Region of the billed resource, for example sa-east-1")
-    parser.add_argument("--json", action="store_true", help="Emit a JSON array instead of readable text")
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument("--json", action="store_true", help="Emit a JSON array instead of readable text")
+    output.add_argument("--csv-price", action="store_true", help="Emit only price_usd as one CSV column, without a header")
     parser.add_argument("rate_codes", nargs="+", metavar="RATE_CODE", help="One or more complete Price List RateCodes")
     args = parser.parse_args()
 
@@ -119,6 +122,10 @@ def main() -> int:
 
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
+    elif args.csv_price:
+        writer = csv.writer(sys.stdout, lineterminator="\n")
+        for result in results:
+            writer.writerow([result.get("price_usd", "")])
     else:
         for result in results:
             print(f"RateCode: {result['rate_code']}")
