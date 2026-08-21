@@ -22,6 +22,21 @@ def test_workbook_rate_mapper_uses_raijin_units_and_supported_dimensions():
     assert rates["deep_bulk_per_gib"] > 0.0025
 
 
+def test_workbook_rate_mapper_avoids_infrequent_access_and_manifest_generation_prices():
+    def add(catalog, sku, attributes, price):
+        catalog["products"][sku] = {"sku": sku, "attributes": attributes}
+        catalog["terms"]["OnDemand"][sku] = {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": str(price)}}}}}
+
+    catalog = {"products": {}, "terms": {"OnDemand": {}}}
+    add(catalog, "infrequent", {"storageClass": "Infrequent Access", "usagetype": "TimedStorage-SIA-ByteHrs"}, 0.0125)
+    add(catalog, "standard", {"storageClass": "General Purpose", "usagetype": "TimedStorage-ByteHrs"}, 0.023)
+    add(catalog, "manifest", {"feeDescription": "Per object fee to generate Batch Operations Manifest"}, 0.000000015)
+    add(catalog, "object-operation", {"feeDescription": "Per object fee for object operations performed by Batch Operations"}, 0.000001)
+    rates = refresh.s3_rates(catalog)
+    assert rates["temporary_standard_per_gib_month"] > 0.023
+    assert rates["batch_object_per_object"] == 0.000001
+
+
 def test_workbook_transfer_mapper_selects_only_aws_outbound_external():
     catalog = {
         "products": {"external": {"sku": "external", "attributes": {"toLocation": "External", "transferType": "AWS Outbound", "fromLocation": "South America (Sao Paulo)"}}},

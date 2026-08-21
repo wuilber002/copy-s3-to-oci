@@ -884,9 +884,14 @@ def public_s3_rates_from_catalog(catalog: dict) -> dict[str, float]:
         # AWS publishes byte/GB prices in decimal GB. Raijin presents binary
         # GiB, so normalize all data-sized rates here once.
         data_price = price * (1024**3 / 1_000_000_000)
+        batch_fee = str(attributes.get("feeDescription") or "").lower()
+        usage_type = str(attributes.get("usagetype") or "")
+        is_standard_storage = attributes.get("storageClass") == "General Purpose" and (
+            usage_type == "TimedStorage-ByteHrs" or re.fullmatch(r"[A-Z]+\d+-TimedStorage-ByteHrs", usage_type) is not None
+        )
         if "batch" in blob and "job" in blob:
             rates.setdefault("aws_batch_job_usd", price)
-        elif "batch" in blob and ("object" in blob or "operation" in blob):
+        elif "per object fee for object operations performed by batch operations" in batch_fee:
             rates.setdefault("aws_batch_object_usd_per_1000", price * 1000)
         elif "tier1" in blob or "put/copy/post/list" in blob:
             rates.setdefault("aws_s3_put_list_usd_per_1000", price * 1000)
@@ -900,7 +905,7 @@ def public_s3_rates_from_catalog(catalog: dict) -> dict[str, float]:
             rates.setdefault("aws_glacier_bulk_retrieval_usd_per_gib", data_price)
         elif "glacier" in blob and "retrieval" in blob and "standard" in blob and "deep" not in blob:
             rates.setdefault("aws_glacier_standard_retrieval_usd_per_gib", data_price)
-        elif "timedstorage" in blob and "standard" in blob and "archive" not in blob:
+        elif is_standard_storage:
             rates.setdefault("aws_restore_temp_standard_usd_per_gib_month", data_price)
     return rates
 

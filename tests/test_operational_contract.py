@@ -342,7 +342,7 @@ def test_public_aws_price_list_preserves_sub_cent_request_rates():
     products, terms = {}, {}
     for sku, attributes, price in (
         ("batch-job", {"feeCode": "S3-BatchOperations-Jobs"}, 0.25),
-        ("batch-object", {"feeCode": "S3-BatchOperations-Objects"}, 0.000001),
+        ("batch-object", {"feeDescription": "Per object fee for object operations performed by Batch Operations"}, 0.000001),
         ("tier1", {"group": "S3-API-Tier1"}, 0.000007),
         ("tier2", {"group": "S3-API-Tier2"}, 0.00000056),
     ):
@@ -354,6 +354,25 @@ def test_public_aws_price_list_preserves_sub_cent_request_rates():
     assert rates["aws_batch_object_usd_per_1000"] == pytest.approx(0.001)
     assert rates["aws_s3_put_list_usd_per_1000"] == pytest.approx(0.007)
     assert rates["aws_s3_get_usd_per_1000"] == pytest.approx(0.00056)
+
+
+def test_public_pricing_uses_standard_storage_and_batch_object_operation_not_similar_skus():
+    def product(sku, attributes, price):
+        return ({"sku": sku, "attributes": attributes}, {sku: {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": str(price)}}}}}})
+
+    products, terms = {}, {}
+    for sku, attributes, price in (
+        ("infrequent", {"storageClass": "Infrequent Access", "usagetype": "TimedStorage-SIA-ByteHrs"}, 0.0125),
+        ("standard", {"storageClass": "General Purpose", "usagetype": "TimedStorage-ByteHrs"}, 0.023),
+        ("manifest", {"feeDescription": "Per object fee to generate Batch Operations Manifest"}, 0.000000015),
+        ("object-operation", {"feeDescription": "Per object fee for object operations performed by Batch Operations"}, 0.000001),
+    ):
+        item, item_terms = product(sku, attributes, price)
+        products[sku] = item
+        terms.update(item_terms)
+    rates = public_s3_rates_from_catalog({"products": products, "terms": {"OnDemand": terms}})
+    assert rates["aws_restore_temp_standard_usd_per_gib_month"] == pytest.approx(0.023 * (1024**3 / 1_000_000_000))
+    assert rates["aws_batch_object_usd_per_1000"] == pytest.approx(0.001)
 
 
 def test_public_aws_transfer_catalog_uses_only_external_egress_rate():

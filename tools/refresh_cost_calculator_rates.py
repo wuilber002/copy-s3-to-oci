@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -65,9 +66,14 @@ def s3_rates(catalog: dict) -> dict[str, float]:
         if price is None:
             continue
         gib_price = price * (1024 ** 3 / 1_000_000_000)
+        batch_fee = str(attrs.get("feeDescription") or "").lower()
+        usage_type = str(attrs.get("usagetype") or "")
+        is_standard_storage = attrs.get("storageClass") == "General Purpose" and (
+            usage_type == "TimedStorage-ByteHrs" or re.fullmatch(r"[A-Z]+\d+-TimedStorage-ByteHrs", usage_type) is not None
+        )
         if "batch" in blob and "job" in blob:
             rates.setdefault("batch_job", price)
-        elif "batch" in blob and ("object" in blob or "operation" in blob):
+        elif "per object fee for object operations performed by batch operations" in batch_fee:
             rates.setdefault("batch_object_per_object", price)
         elif "tier1" in blob or "put/copy/post/list" in blob:
             rates.setdefault("put_list_per_1000", price * 1000)
@@ -77,7 +83,7 @@ def s3_rates(catalog: dict) -> dict[str, float]:
             rates.setdefault("deep_bulk_per_gib", gib_price)
         elif "deep" in blob and "retrieval" in blob and "standard" in blob:
             rates.setdefault("deep_standard_per_gib", gib_price)
-        elif "timedstorage" in blob and "standard" in blob and "archive" not in blob:
+        elif is_standard_storage:
             rates.setdefault("temporary_standard_per_gib_month", gib_price)
     return rates
 
