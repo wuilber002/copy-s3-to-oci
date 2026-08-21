@@ -2793,7 +2793,9 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
         raise HTTPException(status_code=422, detail="Dynamic plan exceeds the safety limit of 10000 waves. Increase the target size, time, or object limit.")
     for plan in plans:
         plan["restore_tier"] = payload.restore_tier
-    schedule_restores = payload.schedule_restores and result["settings"].dynamic_pipeline_enabled
+    if payload.schedule_restores and not result["settings"].dynamic_pipeline_enabled:
+        raise HTTPException(status_code=422, detail="Enable and save the dynamic restore pipeline in Settings before scheduling early restores.")
+    schedule_restores = payload.schedule_restores
     times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
     created: list[Wave] = []
     for sequence, (plan, timing) in enumerate(zip(plans, times), start=1):
