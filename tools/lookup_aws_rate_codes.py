@@ -142,7 +142,10 @@ def main() -> int:
     output.add_argument("--csv-price", action="store_true", help="Emit selected-unit prices in Brazilian Excel CSV format (decimal comma, semicolon delimiter, no header)")
     parser.add_argument("--output-unit", action="append", default=[], metavar="RATE_CODE=UNIT", help="Scale one RateCode: source (default), per_1000, or per_1m; may be repeated")
     parser.add_argument("rate_codes", nargs="+", metavar="RATE_CODE", help="One or more complete Price List RateCodes")
-    args = parser.parse_args()
+    # Operators commonly paste RateCodes in groups and add --output-unit
+    # mappings between them. parse_intermixed_args accepts that natural CLI
+    # ordering while preserving the exact positional RateCode order.
+    args = parser.parse_intermixed_args()
 
     try:
         output_units = parse_output_units(args.output_unit)

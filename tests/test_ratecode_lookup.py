@@ -24,6 +24,7 @@ def test_ratecode_lookup_help_documents_csv_price_mode():
         text=True,
     )
     assert "--csv-price" in result.stdout
+    assert "parse_intermixed_args" in open("tools/lookup_aws_rate_codes.py", encoding="utf-8").read()
 
 
 def test_csv_price_shape_is_one_row_in_input_order():
