@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-from tools.lookup_aws_rate_codes import csv_price_row, metric_name
+from tools.lookup_aws_rate_codes import csv_price_row, metric_name, spreadsheet_price
 
 
 def test_ratecode_lookup_labels_raijin_metrics_from_public_attributes():
@@ -32,3 +32,9 @@ def test_csv_price_shape_is_one_row_in_input_order():
         {"rate_code": "first", "price_usd": "0.0080000000"},
         {"rate_code": "missing"},
     ]) == ["0,1500000000", "0,0080000000", ""]
+
+
+def test_spreadsheet_price_normalizes_request_dimensions_per_thousand():
+    assert spreadsheet_price({"price_usd": "0.0000070000", "unit": "Requests"}) == "0.0070000000"
+    assert spreadsheet_price({"price_usd": "0.0000005600", "unit": "Requests"}) == "0.0005600000"
+    assert spreadsheet_price({"price_usd": "0.0000010000", "unit": "Objects"}) == "0.0000010000"

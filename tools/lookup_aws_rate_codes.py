@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from decimal import Decimal, InvalidOperation
 import json
 import sys
 from urllib.request import Request, urlopen
@@ -93,9 +94,29 @@ def find_rate_codes(catalog: dict, wanted: set[str], service: str) -> dict[str, 
     return found
 
 
+def spreadsheet_price(result: dict) -> str:
+    """Return a public price expressed in the Raijin workbook's displayed unit.
+
+    AWS Price List dimensions with unit ``Requests`` are priced per individual
+    request. The Raijin workbook displays its request metrics per 1,000
+    requests, so only those values are normalized here. GB, GB-Mo, Jobs and
+    Objects already match the workbook's units and remain unchanged.
+    """
+    raw = result.get("price_usd", "")
+    if raw in (None, ""):
+        return ""
+    try:
+        value = Decimal(str(raw))
+    except InvalidOperation:
+        return str(raw)
+    if result.get("unit") == "Requests":
+        value *= 1000
+    return format(value, "f")
+
+
 def csv_price_row(results: list[dict]) -> list[str]:
-    """Return prices in caller order for Portuguese/Brazilian Excel."""
-    return [str(result.get("price_usd", "")).replace(".", ",") for result in results]
+    """Return workbook-unit prices in caller order for Portuguese/Brazilian Excel."""
+    return [spreadsheet_price(result).replace(".", ",") for result in results]
 
 
 def main() -> int:
@@ -103,7 +124,7 @@ def main() -> int:
     parser.add_argument("--region", required=True, help="AWS Region of the billed resource, for example sa-east-1")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="Emit a JSON array instead of readable text")
-    output.add_argument("--csv-price", action="store_true", help="Emit only price_usd in Brazilian Excel CSV format (decimal comma, semicolon delimiter, no header)")
+    output.add_argument("--csv-price", action="store_true", help="Emit workbook-unit prices in Brazilian Excel CSV format (decimal comma, semicolon delimiter, no header)")
     parser.add_argument("rate_codes", nargs="+", metavar="RATE_CODE", help="One or more complete Price List RateCodes")
     args = parser.parse_args()
 
