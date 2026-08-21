@@ -9,6 +9,10 @@ Examples:
   python3 tools/lookup_aws_rate_codes.py --region us-east-1 \
     HQEH3ZWJVT46JHRG.JRTCKXETXF.Q3Z75P77EN
 
+  python3 tools/lookup_aws_rate_codes.py --region sa-east-1 --csv-price \
+    --output-unit EFD42GHQBGKAPBHU.JRTCKXETXF.6YS6EN2CT7=per_1000 \
+    EFD42GHQBGKAPBHU.JRTCKXETXF.6YS6EN2CT7
+
 The script does not use AWS credentials and does not access the customer
 account. A RateCode is a Price List rate-dimension identifier and is regional,
 so pass the AWS Region where the billed S3 bucket resides.
@@ -94,14 +98,25 @@ def find_rate_codes(catalog: dict, wanted: set[str], service: str) -> dict[str, 
     return found
 
 
-def spreadsheet_price(result: dict) -> str:
-    """Return a public price expressed in the Raijin workbook's displayed unit.
+OUTPUT_UNIT_FACTORS = {"source": Decimal("1"), "per_1000": Decimal("1000"), "per_1m": Decimal("1000000")}
 
-    AWS Price List dimensions with unit ``Requests`` are priced per individual
-    request. The Raijin workbook displays its request metrics per 1,000
-    requests, so only those values are normalized here. GB, GB-Mo, Jobs and
-    Objects already match the workbook's units and remain unchanged.
-    """
+
+def parse_output_units(specifications: list[str]) -> dict[str, str]:
+    """Parse ``RATE_CODE=unit`` mappings supplied by the operator."""
+    mappings: dict[str, str] = {}
+    for specification in specifications:
+        try:
+            rate_code, output_unit = specification.rsplit("=", 1)
+        except ValueError as error:
+            raise ValueError(f"Invalid --output-unit '{specification}'; use RATE_CODE=source, per_1000, or per_1m") from error
+        if not rate_code or output_unit not in OUTPUT_UNIT_FACTORS:
+            raise ValueError(f"Invalid --output-unit '{specification}'; use RATE_CODE=source, per_1000, or per_1m")
+        mappings[rate_code] = output_unit
+    return mappings
+
+
+def spreadsheet_price(result: dict, output_unit: str = "source") -> str:
+    """Return the public price scaled to an explicitly selected output unit."""
     raw = result.get("price_usd", "")
     if raw in (None, ""):
         return ""
@@ -109,14 +124,14 @@ def spreadsheet_price(result: dict) -> str:
         value = Decimal(str(raw))
     except InvalidOperation:
         return str(raw)
-    if result.get("unit") == "Requests":
-        value *= 1000
+    value *= OUTPUT_UNIT_FACTORS[output_unit]
     return format(value, "f")
 
 
-def csv_price_row(results: list[dict]) -> list[str]:
-    """Return workbook-unit prices in caller order for Portuguese/Brazilian Excel."""
-    return [spreadsheet_price(result).replace(".", ",") for result in results]
+def csv_price_row(results: list[dict], output_units: dict[str, str] | None = None) -> list[str]:
+    """Return explicitly scaled prices in caller order for Portuguese/Brazilian Excel."""
+    output_units = output_units or {}
+    return [spreadsheet_price(result, output_units.get(result.get("rate_code", ""), "source")).replace(".", ",") for result in results]
 
 
 def main() -> int:
@@ -124,9 +139,18 @@ def main() -> int:
     parser.add_argument("--region", required=True, help="AWS Region of the billed resource, for example sa-east-1")
     output = parser.add_mutually_exclusive_group()
     output.add_argument("--json", action="store_true", help="Emit a JSON array instead of readable text")
-    output.add_argument("--csv-price", action="store_true", help="Emit workbook-unit prices in Brazilian Excel CSV format (decimal comma, semicolon delimiter, no header)")
+    output.add_argument("--csv-price", action="store_true", help="Emit selected-unit prices in Brazilian Excel CSV format (decimal comma, semicolon delimiter, no header)")
+    parser.add_argument("--output-unit", action="append", default=[], metavar="RATE_CODE=UNIT", help="Scale one RateCode: source (default), per_1000, or per_1m; may be repeated")
     parser.add_argument("rate_codes", nargs="+", metavar="RATE_CODE", help="One or more complete Price List RateCodes")
     args = parser.parse_args()
+
+    try:
+        output_units = parse_output_units(args.output_unit)
+    except ValueError as error:
+        parser.error(str(error))
+    unknown_unit_codes = set(output_units) - set(args.rate_codes)
+    if unknown_unit_codes:
+        parser.error("--output-unit was provided for a RateCode not present in the positional input: " + ", ".join(sorted(unknown_unit_codes)))
 
     wanted = set(args.rate_codes)
     found: dict[str, dict] = {}
@@ -150,7 +174,7 @@ def main() -> int:
         print(json.dumps(results, ensure_ascii=False, indent=2))
     elif args.csv_price:
         writer = csv.writer(sys.stdout, delimiter=";", lineterminator="\n")
-        writer.writerow(csv_price_row(results))
+        writer.writerow(csv_price_row(results, output_units))
     else:
         for result in results:
             print(f"RateCode: {result['rate_code']}")

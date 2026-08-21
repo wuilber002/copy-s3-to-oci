@@ -1,7 +1,7 @@
 import subprocess
 import sys
 
-from tools.lookup_aws_rate_codes import csv_price_row, metric_name, spreadsheet_price
+from tools.lookup_aws_rate_codes import csv_price_row, metric_name, parse_output_units, spreadsheet_price
 
 
 def test_ratecode_lookup_labels_raijin_metrics_from_public_attributes():
@@ -31,10 +31,14 @@ def test_csv_price_shape_is_one_row_in_input_order():
         {"rate_code": "third", "price_usd": "0.1500000000"},
         {"rate_code": "first", "price_usd": "0.0080000000"},
         {"rate_code": "missing"},
-    ]) == ["0,1500000000", "0,0080000000", ""]
+    ], {"third": "per_1000"}) == ["150,0000000000", "0,0080000000", ""]
 
 
-def test_spreadsheet_price_normalizes_request_dimensions_per_thousand():
-    assert spreadsheet_price({"price_usd": "0.0000070000", "unit": "Requests"}) == "0.0070000000"
-    assert spreadsheet_price({"price_usd": "0.0000005600", "unit": "Requests"}) == "0.0005600000"
-    assert spreadsheet_price({"price_usd": "0.0000010000", "unit": "Objects"}) == "0.0000010000"
+def test_spreadsheet_price_scales_only_when_the_ratecode_mapping_requests_it():
+    item = {"price_usd": "0.0000070000", "unit": "Requests"}
+    assert spreadsheet_price(item) == "0.0000070000"
+    assert spreadsheet_price(item, "per_1000") == "0.0070000000"
+
+
+def test_parse_output_units_is_explicit_and_ratecode_based():
+    assert parse_output_units(["abc=per_1000", "def=source"]) == {"abc": "per_1000", "def": "source"}
