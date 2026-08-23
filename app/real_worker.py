@@ -30,7 +30,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
-    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
+    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -613,13 +613,18 @@ def restore_attempt_for_job(session, wave: Wave, source: Source) -> RestoreAttem
     return attempt
 
 
-def import_completion_report(session, s3, operation: dict[str, str], attempt: RestoreAttempt, objects: list[ObjectRecord]) -> bool:
+def import_completion_report(session, s3, operation: dict[str, str], attempt: RestoreAttempt, objects: list[ObjectRecord]) -> tuple[bool, dict[str, int]]:
     """Import per-object S3 Batch evidence. False means AWS has not published it yet."""
     prefix = f"{operation['control_prefix'].rstrip('/')}/reports/wave-{attempt.wave_id}/attempt-{attempt.id}/"
-    keys = [entry["Key"] for page in s3.get_paginator("list_objects_v2").paginate(Bucket=operation["control_bucket"], Prefix=prefix) for entry in page.get("Contents", [])]
+    metrics = {"list_requests": 0, "get_requests": 0}
+    keys: list[str] = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=operation["control_bucket"], Prefix=prefix):
+        metrics["list_requests"] += 1
+        keys.extend(entry["Key"] for entry in page.get("Contents", []))
     manifest_key = next((key for key in keys if key.endswith("manifest.json")), None)
     if not manifest_key:
-        return False
+        return False, metrics
+    metrics["get_requests"] += 1
     manifest_response = s3.get_object(Bucket=operation["control_bucket"], Key=manifest_key)
     manifest_body = manifest_response["Body"].read().decode("utf-8")
     manifest = json.loads(manifest_body)
@@ -630,6 +635,7 @@ def import_completion_report(session, s3, operation: dict[str, str], attempt: Re
         report_key = result.get("Key")
         if not report_key:
             continue
+        metrics["get_requests"] += 1
         report = s3.get_object(Bucket=result.get("Bucket", operation["control_bucket"]), Key=report_key)
         report_etag = report.get("ETag", "").strip('"') or None
         for row in csv.reader(io.StringIO(report["Body"].read().decode("utf-8", "replace"))):
@@ -645,7 +651,7 @@ def import_completion_report(session, s3, operation: dict[str, str], attempt: Re
                 session.add(outcome)
             outcome.task_status, outcome.http_status = task_status.upper(), int(http_status) if http_status.isdigit() else None
             outcome.error_code, outcome.error_message, outcome.report_key, outcome.report_etag = error_code or None, error_message or None, report_key, report_etag
-    return True
+    return True, metrics
 
 
 def fail_restore_attempt(session, task: Task, wave: Wave, attempt: RestoreAttempt, message: str) -> None:
@@ -722,51 +728,59 @@ def poll_restore(session, task: Task, settings) -> None:
     s3, s3control, account_id = aws_clients(settings, source.aws_region, source)
     if wave.batch_job_id:
         attempt = restore_attempt_for_job(session, wave, source)
-        job = s3control.describe_job(AccountId=account_id, JobId=wave.batch_job_id)["Job"]
-        attempt.job_status = wave.batch_job_status = job.get("Status")
-        if job["Status"] not in {"Complete", "Completed"}:
-            if job["Status"] in {"Failed", "Cancelled", "Canceled"}:
-                fail_restore_attempt(session, task, wave, attempt, f"Batch job {wave.batch_job_id} ended as {job['Status']}")
+        # The Batch completion report is immutable evidence.  Once imported,
+        # do not call DescribeJob or re-list/re-read its report on every
+        # availability poll.  That was the source of repeated events and
+        # avoidable charged control-bucket requests in the first archive test.
+        if attempt.completed_at is None:
+            attempt.batch_describe_requests = int(attempt.batch_describe_requests or 0) + 1
+            job = s3control.describe_job(AccountId=account_id, JobId=wave.batch_job_id)["Job"]
+            attempt.job_status = wave.batch_job_status = job.get("Status")
+            if job["Status"] not in {"Complete", "Completed"}:
+                if job["Status"] in {"Failed", "Cancelled", "Canceled"}:
+                    fail_restore_attempt(session, task, wave, attempt, f"Batch job {wave.batch_job_id} ended as {job['Status']}")
+                    return
+                wave.status = "RESTORING"
+                wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
+                session.commit()
+                retry(session, task, f"Batch job status is {job['Status']}", min(1800, 300 + wave.poll_count * 60))
                 return
-            wave.status = "RESTORING"
-            wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
+            progress = job.get("ProgressSummary", {}) or {}
+            attempt.succeeded_objects = int(progress.get("NumberOfTasksSucceeded") or 0)
+            attempt.failed_objects = int(progress.get("NumberOfTasksFailed") or 0)
+            total = int(progress.get("TotalNumberOfTasks") or 0)
+            if total != attempt.expected_objects or attempt.failed_objects or attempt.succeeded_objects != attempt.expected_objects:
+                message = f"Batch job completed with {attempt.succeeded_objects}/{attempt.expected_objects} succeeded and {attempt.failed_objects} failed"
+                if attempt.failed_objects == attempt.expected_objects:
+                    for result in session.scalars(select(RestoreObjectResult).where(RestoreObjectResult.attempt_id == attempt.id)):
+                        result.task_status, result.error_message = "FAILED", "Batch job completed with no successful restore requests; completion report unavailable"
+                fail_restore_attempt(session, task, wave, attempt, message)
+                return
+            objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
+            try:
+                report_available, report_metrics = import_completion_report(session, s3, operation, attempt, objects)
+                attempt.completion_report_list_requests = int(attempt.completion_report_list_requests or 0) + report_metrics["list_requests"]
+                attempt.completion_report_get_requests = int(attempt.completion_report_get_requests or 0) + report_metrics["get_requests"]
+            except Exception as error:
+                _, summary = classify_task_error(error)
+                raise RuntimeError(f"S3 Batch completion-report processing failed: {summary}") from error
+            if not report_available:
+                wave.status = "RESTORE_REQUESTED"
+                wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
+                session.commit()
+                retry(session, task, "Batch job accepted all objects; waiting for completion report evidence", 60)
+                return
+            failed_results = session.scalar(select(func.count(RestoreObjectResult.id)).where(RestoreObjectResult.attempt_id == attempt.id, RestoreObjectResult.task_status != "SUCCEEDED")) or 0
+            if failed_results:
+                fail_restore_attempt(session, task, wave, attempt, f"Completion report contains {failed_results} failed or unknown restore request(s)")
+                return
+            attempt.completed_at = utcnow()
+            for obj in objects:
+                if obj.storage_class in ARCHIVE_CLASSES and obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING}:
+                    obj.state = ObjectState.RESTORE_REQUEST_ACCEPTED
+            wave.status = "RESTORE_REQUEST_ACCEPTED"
+            event(session, "RESTORE_REQUEST_ACCEPTED", f"Batch job {wave.batch_job_id} accepted all {attempt.expected_objects} archive restore request(s) with per-object evidence", source_id=source.id, wave_id=wave.id)
             session.commit()
-            retry(session, task, f"Batch job status is {job['Status']}", min(1800, 300 + wave.poll_count * 60))
-            return
-        progress = job.get("ProgressSummary", {}) or {}
-        attempt.succeeded_objects = int(progress.get("NumberOfTasksSucceeded") or 0)
-        attempt.failed_objects = int(progress.get("NumberOfTasksFailed") or 0)
-        total = int(progress.get("TotalNumberOfTasks") or 0)
-        if total != attempt.expected_objects or attempt.failed_objects or attempt.succeeded_objects != attempt.expected_objects:
-            message = f"Batch job completed with {attempt.succeeded_objects}/{attempt.expected_objects} succeeded and {attempt.failed_objects} failed"
-            if attempt.failed_objects == attempt.expected_objects:
-                for result in session.scalars(select(RestoreObjectResult).where(RestoreObjectResult.attempt_id == attempt.id)):
-                    result.task_status, result.error_message = "FAILED", "Batch job completed with no successful restore requests; completion report unavailable"
-            fail_restore_attempt(session, task, wave, attempt, message)
-            return
-        objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
-        try:
-            report_available = import_completion_report(session, s3, operation, attempt, objects)
-        except Exception as error:
-            _, summary = classify_task_error(error)
-            raise RuntimeError(f"S3 Batch completion-report processing failed: {summary}") from error
-        if not report_available:
-            wave.status = "RESTORE_REQUESTED"
-            wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
-            session.commit()
-            retry(session, task, "Batch job accepted all objects; waiting for completion report evidence", 60)
-            return
-        failed_results = session.scalar(select(func.count(RestoreObjectResult.id)).where(RestoreObjectResult.attempt_id == attempt.id, RestoreObjectResult.task_status != "SUCCEEDED")) or 0
-        if failed_results:
-            fail_restore_attempt(session, task, wave, attempt, f"Completion report contains {failed_results} failed or unknown restore request(s)")
-            return
-        attempt.completed_at = utcnow()
-        for obj in objects:
-            if obj.storage_class in ARCHIVE_CLASSES and obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING}:
-                obj.state = ObjectState.RESTORE_REQUEST_ACCEPTED
-        wave.status = "RESTORE_REQUEST_ACCEPTED"
-        event(session, "RESTORE_REQUEST_ACCEPTED", f"Batch job {wave.batch_job_id} accepted all {attempt.expected_objects} archive restore request(s) with per-object evidence", source_id=source.id, wave_id=wave.id)
-        session.commit()
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
     pending_archives = [obj for obj in objects if obj.storage_class in ARCHIVE_CLASSES and obj.state in {
         ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING,
@@ -1249,6 +1263,9 @@ def run_once(role: str = WORKER_ROLE) -> None:
         allowed_task_kinds = task_kinds_for_role(role)
         if role in {"governance", "all"}:
             refresh_due_global_aws_pricing(session)
+            if settings.dynamic_pipeline_enabled:
+                release_dynamic_restore_horizon(session, settings)
+                session.commit()
         # There is exactly one real worker per VM.  If it was interrupted while
         # discovery was running, its page checkpoint is already committed. Make
         # the source eligible again instead of leaving it permanently stuck in
@@ -1322,11 +1339,17 @@ def run_once(role: str = WORKER_ROLE) -> None:
 
 
 if __name__ == "__main__":
+    failure_delay = 5
     while True:
-        try: run_once()
+        try:
+            run_once()
+            failure_delay = 5
         except Exception as error:
             # A transient database/network failure must not kill the durable
             # service. Task-level errors are persisted by run_once; this is a
             # last-resort guard for failures before a task can be claimed.
             print(f"real worker loop error: {type(error).__name__}: {error}", flush=True)
+            time.sleep(failure_delay)
+            failure_delay = min(60, failure_delay * 2)
+            continue
         time.sleep(5)

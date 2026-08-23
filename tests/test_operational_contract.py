@@ -254,8 +254,8 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     assert {"planned_transfer_seconds"} <= set(ObjectRecord.__table__.columns.keys())
     from app.main import DynamicPipelineRun, Wave, RuntimeSettings
     assert {"planner_mode", "pipeline_run_id", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
-    assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
-    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_pipeline_enabled"} <= set(RuntimeSettings.__table__.columns.keys())
+    assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "restore_horizon_waves", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
+    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves", "dynamic_pipeline_enabled"} <= set(RuntimeSettings.__table__.columns.keys())
     payload = DynamicWaveCreate(max_bytes=1024, target_transfer_seconds=3600, max_objects=10,
                                 restore_days=3, restore_tier="BULK")
     assert payload.target_transfer_seconds == 3600
@@ -291,7 +291,26 @@ def test_dynamic_schedule_starts_bulk_restore_before_predicted_transfer_window()
     times = dynamic_schedule_times(now, [{"restore_tier": "BULK", "predicted_transfer_seconds": 3600}], 6 * 3600)
     restore_at, transfer_at = times[0]
     assert restore_at == now
-    assert transfer_at == now + __import__("datetime").timedelta(hours=6)
+    assert transfer_at == now + __import__("datetime").timedelta(hours=54)
+
+
+def test_dynamic_scheduler_uses_a_durable_restore_horizon_and_not_all_jobs_at_once():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "def release_dynamic_restore_horizon" in source
+    assert "restore_horizon_waves" in source
+    assert "release_dynamic_restore_horizon(session, result[\"settings\"])" in source
+    assert "release_dynamic_restore_horizon(session, settings)" in worker
+
+
+def test_restore_completion_evidence_is_idempotent_and_request_metrics_are_durable():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    poll = worker[worker.index("def poll_restore"):worker.index("\n\nDIRECT_SHA_LIMIT")]
+    assert "if attempt.completed_at is None:" in poll
+    assert "attempt.batch_describe_requests" in poll
+    assert "attempt.completion_report_list_requests" in poll
+    assert "completion_report_get_requests" in source
 
 
 def test_aws_error_summary_exposes_only_status_and_code():

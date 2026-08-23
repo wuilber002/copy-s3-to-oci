@@ -362,6 +362,7 @@ class DynamicPipelineRun(Base):
     target_transfer_seconds: Mapped[int] = mapped_column(Integer, default=0)
     max_objects: Mapped[int] = mapped_column(Integer, default=0)
     restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=2)
     restore_days: Mapped[int] = mapped_column(Integer, default=0)
     restore_tier: Mapped[str] = mapped_column(String(16), default="BULK")
     transfer_strategy: Mapped[str] = mapped_column(String(32), default="AFTER_ALL_RESTORED")
@@ -388,6 +389,12 @@ class RestoreAttempt(Base):
     report_manifest_key: Mapped[str | None] = mapped_column(String(2048), nullable=True)
     report_manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     failure_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Exact request accounting for Batch confirmation/report evidence.  This
+    # lets an operator distinguish charged control-plane calls from targeted
+    # per-object availability HeadObject calls.
+    batch_describe_requests: Mapped[int] = mapped_column(Integer, default=0)
+    completion_report_list_requests: Mapped[int] = mapped_column(Integer, default=0)
+    completion_report_get_requests: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -482,6 +489,7 @@ class RuntimeSettings(Base):
     dynamic_wave_target_seconds: Mapped[int] = mapped_column(Integer, default=12 * 3600)
     dynamic_wave_max_objects: Mapped[int] = mapped_column(Integer, default=50000)
     dynamic_restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=6 * 3600)
+    dynamic_restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=2)
     dynamic_pipeline_enabled: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -609,6 +617,7 @@ class RuntimeSettingsUpdate(BaseModel):
     dynamic_wave_target_seconds: int = Field(default=12 * 3600, ge=300, le=7 * 24 * 3600)
     dynamic_wave_max_objects: int = Field(default=50000, ge=1, le=500000)
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
+    dynamic_restore_horizon_waves: int = Field(default=2, ge=1, le=20)
     dynamic_pipeline_enabled: bool = False
 
 
@@ -689,6 +698,7 @@ def create_schema() -> None:
         "dynamic_wave_target_seconds": "INTEGER NOT NULL DEFAULT 43200",
         "dynamic_wave_max_objects": "INTEGER NOT NULL DEFAULT 50000",
         "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
+        "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2",
         "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
@@ -701,6 +711,8 @@ def create_schema() -> None:
     existing_bucket_columns = {column["name"] for column in inspect(engine).get_columns("oci_bucket_cache")}
     existing_cost_pricing_columns = {column["name"] for column in inspect(engine).get_columns("cost_pricing")}
     existing_discovery_job_columns = {column["name"] for column in inspect(engine).get_columns("discovery_jobs")}
+    existing_run_columns = {column["name"] for column in inspect(engine).get_columns("dynamic_pipeline_runs")}
+    existing_restore_attempt_columns = {column["name"] for column in inspect(engine).get_columns("restore_attempts")}
     with engine.begin() as connection:
         for column, sql_type in expected_columns.items():
             if column not in existing_columns:
@@ -733,6 +745,16 @@ def create_schema() -> None:
         for column, sql_type in wave_columns.items():
             if column not in existing_wave_columns:
                 connection.execute(text(f"ALTER TABLE waves ADD COLUMN {column} {sql_type}"))
+        for column, sql_type in {"restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2"}.items():
+            if column not in existing_run_columns:
+                connection.execute(text(f"ALTER TABLE dynamic_pipeline_runs ADD COLUMN {column} {sql_type}"))
+        for column, sql_type in {
+            "batch_describe_requests": "INTEGER NOT NULL DEFAULT 0",
+            "completion_report_list_requests": "INTEGER NOT NULL DEFAULT 0",
+            "completion_report_get_requests": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if column not in existing_restore_attempt_columns:
+                connection.execute(text(f"ALTER TABLE restore_attempts ADD COLUMN {column} {sql_type}"))
         if "include_aws_transfer_out" not in existing_cost_pricing_columns:
             connection.execute(text("ALTER TABLE cost_pricing ADD COLUMN include_aws_transfer_out BOOLEAN NOT NULL DEFAULT TRUE"))
         if "include_oci_costs" not in existing_cost_pricing_columns:
@@ -840,6 +862,7 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "dynamic_wave_target_seconds": settings.dynamic_wave_target_seconds,
             "dynamic_wave_max_objects": settings.dynamic_wave_max_objects,
             "dynamic_restore_safety_seconds": settings.dynamic_restore_safety_seconds,
+            "dynamic_restore_horizon_waves": settings.dynamic_restore_horizon_waves,
             "dynamic_pipeline_enabled": settings.dynamic_pipeline_enabled,
             "updated_at": settings.updated_at}
 
@@ -1559,6 +1582,11 @@ def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Sessio
             "throttle_retries": int(getattr(wave, "availability_throttle_retries", 0) or 0),
             "last_checked_objects": int(getattr(wave, "last_availability_poll_objects", 0) or 0),
             "last_elapsed_seconds": round(float(getattr(wave, "last_availability_poll_seconds", 0) or 0), 2),
+        },
+        "batch_evidence_polling": {
+            "describe_requests": int(getattr(attempt, "batch_describe_requests", 0) or 0) if attempt else 0,
+            "completion_report_list_requests": int(getattr(attempt, "completion_report_list_requests", 0) or 0) if attempt else 0,
+            "completion_report_get_requests": int(getattr(attempt, "completion_report_get_requests", 0) or 0) if attempt else 0,
         },
         **timing,
     }
@@ -2882,7 +2910,11 @@ def predict_object_transfer_seconds(obj: ObjectRecord, settings: RuntimeSettings
     # Link-model fallback: service/object overhead + the object's fair share
     # of configured aggregate bandwidth.  Multipart has a modest setup term.
     throughput_per_worker = max(1.0, settings.max_throughput_mbps / max(1, settings.transfer_workers))
-    seconds = 0.25 + (obj.size_bytes * 8 / (throughput_per_worker * 1_000_000))
+    # Small-object operations are dominated by request, TLS and OCI write
+    # overhead.  The prior 0.25-second cold estimate underpredicted the
+    # Deep Archive validation workload by about 4x.  Use a conservative
+    # baseline until this source has its own durable P75 history.
+    seconds = 1.25 + (obj.size_bytes * 8 / (throughput_per_worker * 1_000_000))
     if obj.size_bytes >= settings.multipart_part_size_mib * 1024 ** 2:
         parts = math.ceil(obj.size_bytes / (settings.multipart_part_size_mib * 1024 ** 2))
         seconds += 1.0 + parts * .08
@@ -3042,7 +3074,12 @@ def create_automatic_waves(source_id: int, payload: AutomaticWaveCreate, session
 
 def dynamic_schedule_times(now: datetime, plans: list[dict], safety_seconds: int) -> list[tuple[datetime, datetime]]:
     """Forecast a single transfer lane with restore requests issued in advance."""
-    transfer_start = now + timedelta(seconds=safety_seconds)
+    # The first transfer cannot begin before the selected restore SLA.  The
+    # former forecast started at ``now + safety``, which displayed an
+    # impossible Bulk transfer window and released every restore immediately.
+    first_tier = plans[0].get("restore_tier") if plans else "BULK"
+    first_restore_lead = (48 if first_tier == "BULK" else 12) * 3600 + safety_seconds
+    transfer_start = now + timedelta(seconds=first_restore_lead)
     times: list[tuple[datetime, datetime]] = []
     for plan in plans:
         # BULK maximum latency is 48h; Standard is planned conservatively at
@@ -3052,6 +3089,51 @@ def dynamic_schedule_times(now: datetime, plans: list[dict], safety_seconds: int
         times.append((restore_at, transfer_start))
         transfer_start += timedelta(seconds=plan["predicted_transfer_seconds"])
     return times
+
+
+def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings, now: datetime | None = None) -> int:
+    """Release only due restores inside each dynamic run's durable horizon.
+
+    Waves remain fully planned and auditable from creation time, but charged
+    S3 Batch jobs are emitted gradually.  A slot is occupied from submission
+    until the wave reaches a terminal success state; this avoids restoring an
+    unbounded set of temporary copies while preserving the transfer pipeline.
+    """
+    now = now or utcnow()
+    released = 0
+    active_statuses = {"RESTORE_REQUESTED", "RESTORE_REQUEST_ACCEPTED", "RESTORING", "RESTORED", "TRANSFERRING"}
+    runs = list(session.scalars(select(DynamicPipelineRun).where(
+        DynamicPipelineRun.scheduled_restores.is_(True),
+        DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
+    )))
+    for run in runs:
+        horizon = max(1, int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1))
+        waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
+            Wave.planned_restore_at, Wave.id
+        )))
+        occupied = sum(1 for wave in waves if wave.status in active_statuses or (
+            wave.status == "RESTORE_SCHEDULED" and session.scalar(select(Task.id).where(
+                Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
+            ).limit(1)) is not None
+        ))
+        for wave in waves:
+            if occupied >= horizon:
+                break
+            if wave.status != "RESTORE_SCHEDULED" or (wave.planned_restore_at and wave.planned_restore_at > now):
+                continue
+            exists = session.scalar(select(Task.id).where(
+                Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
+            ).limit(1))
+            if exists is not None:
+                continue
+            session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=now))
+            record_event(session, "DYNAMIC_RESTORE_RELEASED",
+                         f"Dynamic pipeline run {run.id} released restore for wave '{wave.name}' within horizon {horizon}",
+                         source_id=wave.source_id, wave_id=wave.id)
+            occupied += 1
+            released += 1
+        refresh_dynamic_pipeline_run(session, run)
+    return released
 
 
 @app.get("/api/sources/{source_id}/waves/dynamic-preview")
@@ -3102,6 +3184,7 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
         max_objects=payload.max_objects, restore_safety_seconds=result["settings"].dynamic_restore_safety_seconds,
         restore_days=payload.restore_days, restore_tier=payload.restore_tier,
         transfer_strategy=source.transfer_strategy, scheduled_restores=schedule_restores,
+        restore_horizon_waves=result["settings"].dynamic_restore_horizon_waves,
         historical_samples=historical_samples,
     )
     session.add(run); session.flush()
@@ -3118,7 +3201,6 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
                            planned_transfer_start_at=timing[1], pipeline_run_id=run.id)
         if schedule_restores:
             wave.status = "RESTORE_SCHEDULED"
-            session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=timing[0]))
             record_event(session, "DYNAMIC_RESTORE_SCHEDULED",
                          f"Wave '{wave.name}' restore scheduled for {timing[0].isoformat()} before predicted transfer window {timing[1].isoformat()}",
                          source_id=source.id, wave_id=wave.id)
@@ -3126,6 +3208,8 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
     record_event(session, "DYNAMIC_WAVES_CREATED",
                  f"Dynamic pipeline run {run.id} created {len(created)} wave(s); historical samples: {historical_samples}; restore scheduling {'enabled' if schedule_restores else 'not enabled'}",
                  source_id=source.id)
+    if schedule_restores:
+        release_dynamic_restore_horizon(session, result["settings"])
     session.commit()
     return {"waves": len(created), "objects": sum(plan["object_count"] for plan in plans),
             "bytes": sum(plan["bytes"] for plan in plans), "scheduled_restores": schedule_restores,
@@ -3308,6 +3392,9 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                                   "manifest_key": attempt.manifest_key, "report_manifest_key": attempt.report_manifest_key,
                                   "submission": "AWS_ACCEPTED" if attempt.job_id else "NOT_SUBMITTED",
                                   "completion_evidence": "PUBLISHED" if attempt.report_manifest_key else "PENDING",
+                                  "request_metrics": {"describe_requests": int(attempt.batch_describe_requests or 0),
+                                                      "completion_report_list_requests": int(attempt.completion_report_list_requests or 0),
+                                                      "completion_report_get_requests": int(attempt.completion_report_get_requests or 0)},
                                   "failure_summary": attempt.failure_summary,
                                   "created_at": attempt.created_at, "completed_at": attempt.completed_at}
                                  for attempt in attempts],
