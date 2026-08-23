@@ -252,8 +252,9 @@ def test_multipart_size_runtime_setting_has_safe_bounds():
 
 def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     assert {"planned_transfer_seconds"} <= set(ObjectRecord.__table__.columns.keys())
-    from app.main import Wave, RuntimeSettings
-    assert {"planner_mode", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
+    from app.main import DynamicPipelineRun, Wave, RuntimeSettings
+    assert {"planner_mode", "pipeline_run_id", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
+    assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
     assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_pipeline_enabled"} <= set(RuntimeSettings.__table__.columns.keys())
     payload = DynamicWaveCreate(max_bytes=1024, target_transfer_seconds=3600, max_objects=10,
                                 restore_days=3, restore_tier="BULK")
@@ -270,6 +271,9 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert 'id="flight-board-button"' in frontend
     assert 'function showFlightBoard()' in frontend
     assert 'flight-board-legend' in frontend
+    assert '@app.get("/api/sources/{source_id}/pipeline-history")' in source
+    assert 'id="pipeline-history-card"' in frontend
+    assert 'function loadPipelineHistory()' in frontend
 
 
 def test_dynamic_prediction_prefers_p75_history_then_conservative_link_model():

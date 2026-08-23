@@ -30,7 +30,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
-    Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_due_global_aws_pricing, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
+    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -1149,6 +1149,10 @@ def transfer_wave(session, task: Task, settings) -> None:
     else:
         wave.status = "COMPLETED" if not remaining and not delivery_pending else "TRANSFERRED_WITH_ERRORS"
         event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed and {delivery_pending} object(s) without OCI cryptographic delivery evidence.", source_id=source.id, wave_id=wave.id)
+    if wave.pipeline_run_id:
+        run = session.get(DynamicPipelineRun, wave.pipeline_run_id)
+        if run:
+            refresh_dynamic_pipeline_run(session, run)
     succeed(session, task)
 
 

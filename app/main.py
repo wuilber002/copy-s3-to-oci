@@ -333,6 +333,7 @@ class Wave(Base):
     manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     poll_count: Mapped[int] = mapped_column(Integer, default=0)
+    pipeline_run_id: Mapped[int | None] = mapped_column(ForeignKey("dynamic_pipeline_runs.id"), nullable=True, index=True)
     availability_head_requests: Mapped[int] = mapped_column(BigInteger, default=0)
     availability_poll_elapsed_seconds: Mapped[float] = mapped_column(Float, default=0)
     availability_throttle_retries: Mapped[int] = mapped_column(Integer, default=0)
@@ -347,6 +348,27 @@ class Wave(Base):
     source: Mapped[Source] = relationship(back_populates="waves")
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="wave")
     tasks: Mapped[list[Task]] = relationship(back_populates="wave")
+
+
+class DynamicPipelineRun(Base):
+    """Immutable planning snapshot for one dynamic-wave creation operation."""
+    __tablename__ = "dynamic_pipeline_runs"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
+    planner_version: Mapped[str] = mapped_column(String(32), default="v1")
+    status: Mapped[str] = mapped_column(String(32), default="PLANNED", index=True)
+    target_max_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    target_transfer_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    max_objects: Mapped[int] = mapped_column(Integer, default=0)
+    restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    restore_days: Mapped[int] = mapped_column(Integer, default=0)
+    restore_tier: Mapped[str] = mapped_column(String(16), default="BULK")
+    transfer_strategy: Mapped[str] = mapped_column(String(32), default="AFTER_ALL_RESTORED")
+    scheduled_restores: Mapped[bool] = mapped_column(default=False)
+    historical_samples: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class RestoreAttempt(Base):
@@ -672,7 +694,7 @@ def create_schema() -> None:
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
-    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
@@ -725,6 +747,23 @@ def create_schema() -> None:
         }.items():
             if column not in existing_discovery_job_columns:
                 connection.execute(text(f"ALTER TABLE discovery_jobs ADD COLUMN {column} {sql_type}"))
+    # Preserve prior dynamic waves as a single, clearly labelled historical
+    # run per source. Their existing plans, object timestamps and task/event
+    # history remain authoritative; this only creates the missing grouping.
+    with SessionLocal() as session:
+        legacy_source_ids = list(session.scalars(select(Wave.source_id).where(
+            Wave.planner_mode == "DYNAMIC", Wave.pipeline_run_id.is_(None)
+        ).distinct()))
+        for source_id in legacy_source_ids:
+            run = DynamicPipelineRun(source_id=source_id, planner_version="v1-legacy-import",
+                                     status="HISTORICAL", transfer_strategy="AFTER_ALL_RESTORED")
+            session.add(run); session.flush()
+            for wave in session.scalars(select(Wave).where(
+                Wave.source_id == source_id, Wave.planner_mode == "DYNAMIC", Wave.pipeline_run_id.is_(None)
+            )):
+                wave.pipeline_run_id = run.id
+        if legacy_source_ids:
+            session.commit()
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -744,6 +783,27 @@ def wave_or_404(session: Session, wave_id: int) -> Wave:
     if not wave:
         raise HTTPException(status_code=404, detail="Wave not found")
     return wave
+
+
+def refresh_dynamic_pipeline_run(session: Session, run: DynamicPipelineRun) -> str:
+    """Derive and persist the durable lifecycle of one dynamic pipeline run."""
+    statuses = list(session.scalars(select(Wave.status).where(Wave.pipeline_run_id == run.id)))
+    succeeded = {"COMPLETED", "VERIFIED", "TRANSFERRED"}
+    if statuses and all(status in succeeded for status in statuses):
+        if run.status != "COMPLETED":
+            completed_at = session.scalar(select(func.max(ObjectRecord.transferred_at)).where(
+                ObjectRecord.wave_id.in_(select(Wave.id).where(Wave.pipeline_run_id == run.id))
+            ))
+            run.status, run.completed_at = "COMPLETED", completed_at or utcnow()
+    elif any(status in {"TRANSFERRED_WITH_ERRORS", "RESTORE_REQUEST_FAILED", "VERIFICATION_FAILED"} for status in statuses):
+        if run.status != "COMPLETED":
+            run.status = "NEEDS_ATTENTION"
+    elif any(status in {"RESTORING", "RESTORED", "TRANSFERRING"} for status in statuses):
+        if run.status not in {"COMPLETED", "HISTORICAL"}:
+            run.status = "IN_PROGRESS"
+    elif run.status not in {"COMPLETED", "HISTORICAL"}:
+        run.status = "SCHEDULED" if run.scheduled_restores else "PLANNED"
+    return run.status
 
 
 def task_or_404(session: Session, task_id: int) -> Task:
@@ -1579,16 +1639,25 @@ def flight_board_availability(session: Session = Depends(get_session)) -> dict:
 
 
 @app.get("/api/flight-board")
-def flight_board(session: Session = Depends(get_session)) -> dict:
+def flight_board(run_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> dict:
     """Return local-only planned and actual phases for dynamic migration waves."""
     now = utcnow()
+    filters = [Wave.planner_mode == "DYNAMIC"]
+    if run_id is not None:
+        filters.append(Wave.pipeline_run_id == run_id)
     rows = list(session.execute(
-        select(Wave, Source.name).join(Source).where(Wave.planner_mode == "DYNAMIC")
+        select(Wave, Source.name).join(Source).where(*filters)
         .order_by(Wave.planned_transfer_start_at.nulls_last(), Wave.id).limit(500)
     ))
     wave_ids = [wave.id for wave, _source_name in rows]
     if not wave_ids:
         return {"waves": [], "generated_at": now, "truncated": False}
+    run_ids = [wave.pipeline_run_id for wave, _ in rows if wave.pipeline_run_id is not None]
+    runs = list(session.scalars(select(DynamicPipelineRun).where(DynamicPipelineRun.id.in_(run_ids)))) if run_ids else []
+    for run in runs:
+        refresh_dynamic_pipeline_run(session, run)
+    if runs:
+        session.commit()
     object_times = {
         wave_id: {"restore_requested_at": requested, "first_available_at": first_available,
                   "last_available_at": last_available, "transfer_started_at": transfer_started,
@@ -1649,6 +1718,7 @@ def flight_board(session: Session = Depends(get_session)) -> dict:
             status = "RESTORED"
         board_waves.append({
             "wave_id": wave.id, "wave_name": wave.name, "source_name": source_name,
+            "pipeline_run_id": wave.pipeline_run_id,
             "status": status, "task_state": task.state if task else None,
             "started_at": request_at or transfer_started_at,
             "completed_at": transfer_completed_at if status in {"COMPLETED", "VERIFIED", "TRANSFERRED"} else None,
@@ -1662,6 +1732,43 @@ def flight_board(session: Session = Depends(get_session)) -> dict:
             "timeline_start_at": min(timeline_points) if timeline_points else now,
             "timeline_end_at": max(timeline_points) if timeline_points else now + timedelta(hours=1),
             "truncated": len(rows) >= 500}
+
+
+@app.get("/api/sources/{source_id}/pipeline-history")
+def source_pipeline_history(source_id: int, session: Session = Depends(get_session)) -> list[dict]:
+    """Durable dynamic-pipeline runs attached to a source, including completed ones."""
+    source_or_404(session, source_id)
+    runs = list(session.scalars(select(DynamicPipelineRun).where(
+        DynamicPipelineRun.source_id == source_id
+    ).order_by(DynamicPipelineRun.created_at.desc(), DynamicPipelineRun.id.desc())))
+    if not runs:
+        return []
+    run_ids = [run.id for run in runs]
+    counts = {
+        run_id: (int(total), int(completed), started_at, completed_at)
+        for run_id, total, completed, started_at, completed_at in session.execute(
+            select(Wave.pipeline_run_id, func.count(func.distinct(Wave.id)),
+                   func.count(func.distinct(case((Wave.status.in_(["COMPLETED", "VERIFIED", "TRANSFERRED"]), Wave.id), else_=None))),
+                   func.min(ObjectRecord.restore_requested_at), func.max(ObjectRecord.transferred_at))
+            .outerjoin(ObjectRecord, ObjectRecord.wave_id == Wave.id)
+            .where(Wave.pipeline_run_id.in_(run_ids)).group_by(Wave.pipeline_run_id)
+        )
+    }
+    for run in runs:
+        refresh_dynamic_pipeline_run(session, run)
+    session.commit()
+    return [{"id": run.id, "status": run.status, "planner_version": run.planner_version,
+             "created_at": run.created_at, "completed_at": run.completed_at,
+             "target_max_bytes": run.target_max_bytes, "target_transfer_seconds": run.target_transfer_seconds,
+             "max_objects": run.max_objects, "restore_safety_seconds": run.restore_safety_seconds,
+             "restore_days": run.restore_days, "restore_tier": run.restore_tier,
+             "transfer_strategy": run.transfer_strategy, "scheduled_restores": run.scheduled_restores,
+             "historical_samples": run.historical_samples,
+             "waves": counts.get(run.id, (0, 0, None, None))[0],
+             "completed_waves": counts.get(run.id, (0, 0, None, None))[1],
+             "started_at": counts.get(run.id, (0, 0, None, None))[2],
+             "last_transfer_at": counts.get(run.id, (0, 0, None, None))[3]}
+            for run in runs]
 
 
 @app.get("/api/deep-audits")
@@ -2706,12 +2813,14 @@ def assign_wave(session: Session, source_id: int, name: str, max_bytes: int, res
                 restore_tier: str, objects: list[ObjectRecord], oversized: bool = False,
                 *, planner_mode: str = "MANUAL", predicted_transfer_seconds: float = 0,
                 prediction_samples: int = 0, planned_restore_at: datetime | None = None,
-                planned_transfer_start_at: datetime | None = None) -> Wave:
+                planned_transfer_start_at: datetime | None = None,
+                pipeline_run_id: int | None = None) -> Wave:
     assigned_bytes = sum(obj.size_bytes for obj in objects)
     wave = Wave(source_id=source_id, name=name, max_bytes=max_bytes, restore_days=restore_days,
                 restore_tier=restore_tier, status="PLANNED", planner_mode=planner_mode,
                 predicted_transfer_seconds=predicted_transfer_seconds, prediction_samples=prediction_samples,
-                planned_restore_at=planned_restore_at, planned_transfer_start_at=planned_transfer_start_at)
+                planned_restore_at=planned_restore_at, planned_transfer_start_at=planned_transfer_start_at,
+                pipeline_run_id=pipeline_run_id)
     session.add(wave)
     session.flush()
     for obj in objects:
@@ -2986,6 +3095,16 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
         raise HTTPException(status_code=422, detail="Enable and save the dynamic restore pipeline in Settings before scheduling early restores.")
     schedule_restores = payload.schedule_restores
     times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
+    historical_samples = sum(value["samples"] for value in result["profiles"].values())
+    run = DynamicPipelineRun(
+        source_id=source.id, status="SCHEDULED" if schedule_restores else "PLANNED",
+        target_max_bytes=payload.max_bytes, target_transfer_seconds=payload.target_transfer_seconds,
+        max_objects=payload.max_objects, restore_safety_seconds=result["settings"].dynamic_restore_safety_seconds,
+        restore_days=payload.restore_days, restore_tier=payload.restore_tier,
+        transfer_strategy=source.transfer_strategy, scheduled_restores=schedule_restores,
+        historical_samples=historical_samples,
+    )
+    session.add(run); session.flush()
     created: list[Wave] = []
     for sequence, (plan, timing) in enumerate(zip(plans, times), start=1):
         name = automatic_wave_name(session, source, payload.prefix, sequence)
@@ -2996,7 +3115,7 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
                            objects, plan["exclusive"], planner_mode="DYNAMIC",
                            predicted_transfer_seconds=plan["predicted_transfer_seconds"],
                            prediction_samples=plan["prediction_samples"], planned_restore_at=timing[0],
-                           planned_transfer_start_at=timing[1])
+                           planned_transfer_start_at=timing[1], pipeline_run_id=run.id)
         if schedule_restores:
             wave.status = "RESTORE_SCHEDULED"
             session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=timing[0]))
@@ -3005,12 +3124,12 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
                          source_id=source.id, wave_id=wave.id)
         created.append(wave)
     record_event(session, "DYNAMIC_WAVES_CREATED",
-                 f"Created {len(created)} dynamic static wave(s); historical samples: {sum(value['samples'] for value in result['profiles'].values())}; restore scheduling {'enabled' if schedule_restores else 'not enabled'}",
+                 f"Dynamic pipeline run {run.id} created {len(created)} wave(s); historical samples: {historical_samples}; restore scheduling {'enabled' if schedule_restores else 'not enabled'}",
                  source_id=source.id)
     session.commit()
     return {"waves": len(created), "objects": sum(plan["object_count"] for plan in plans),
             "bytes": sum(plan["bytes"] for plan in plans), "scheduled_restores": schedule_restores,
-            "historical_samples": sum(value["samples"] for value in result["profiles"].values()),
+            "historical_samples": historical_samples, "pipeline_run_id": run.id,
             "names": [wave.name for wave in created]}
 
 
