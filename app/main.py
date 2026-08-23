@@ -3406,6 +3406,9 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                         "throttle_retries": int(wave.availability_throttle_retries or 0),
                         "last_checked_objects": int(wave.last_availability_poll_objects or 0),
                         "last_elapsed_seconds": round(float(wave.last_availability_poll_seconds or 0), 2)},
+            "batch_evidence_polling": {"describe_requests": int(sum(attempt.batch_describe_requests or 0 for attempt in attempts)),
+                                       "completion_report_list_requests": int(sum(attempt.completion_report_list_requests or 0 for attempt in attempts)),
+                                       "completion_report_get_requests": int(sum(attempt.completion_report_get_requests or 0 for attempt in attempts))},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in tasks]}
 
