@@ -307,6 +307,8 @@ def test_restore_availability_polling_starts_at_two_hours_then_converges_to_thir
     assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=36), "BULK") == 1800
     assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=2), "BULK", partial_availability=True) == 1800
     assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=2), "BULK", partial_availability=True, transfer_strategy="AS_OBJECTS_AVAILABLE") == 300
+    assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=2), "BULK", partial_availability=True, transfer_strategy="AS_OBJECTS_AVAILABLE", pending_objects=5_001) == 600
+    assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=2), "BULK", partial_availability=True, transfer_strategy="AS_OBJECTS_AVAILABLE", pending_objects=50_001) == 1800
 
 
 def test_aws_connection_secret_schema_requires_matching_account_role_arns():

@@ -47,7 +47,8 @@ ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCES
 # than repeatedly scanning a full source prefix that may contain many other
 # waves. Requests are bounded concurrently to preserve predictable pressure
 # on S3 and the VM; this changes speed, not the number of billed HEAD calls.
-RESTORE_POLL_HEAD_CONCURRENCY = 16
+RESTORE_POLL_HEAD_CONCURRENCY = 10
+RESTORE_POLL_HEAD_REQUESTS_PER_SECOND = 10
 RESTORE_POLL_HEAD_BATCH_SIZE = 1_000
 # A discovery response contains at most 1,000 S3 keys.  Persisting each
 # response separately is very safe, but it turns a 100-million-object bucket
@@ -496,7 +497,7 @@ def should_poll_restore_with_head(wave_archive_objects: int, source_objects: int
     return True
 
 
-def restored_pending_archives_from_head(s3, source: Source, archives: list[ObjectRecord]) -> dict[int, datetime | None]:
+def restored_pending_archives_from_head(s3, source: Source, archives: list[ObjectRecord]) -> tuple[dict[int, datetime | None], dict[str, float | int]]:
     """Return only wave objects observed as restored by bounded HeadObject calls.
 
     Each request is for one still-pending archive object belonging to this
@@ -505,6 +506,8 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
     durable per-object evidence.
     """
     ready: dict[int, datetime | None] = {}
+    metrics: dict[str, float | int] = {"requests": 0, "throttle_retries": 0, "elapsed_seconds": 0.0}
+    started_at = time.monotonic()
 
     def check(obj: ObjectRecord) -> tuple[int, datetime | None] | None:
         arguments = {"Bucket": source.s3_bucket, "Key": obj.object_key}
@@ -515,16 +518,50 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
             return obj.id, restore_expiry_from_head_response(response)
         return None
 
-    for start in range(0, len(archives), RESTORE_POLL_HEAD_BATCH_SIZE):
-        batch = archives[start:start + RESTORE_POLL_HEAD_BATCH_SIZE]
-        with ThreadPoolExecutor(max_workers=min(RESTORE_POLL_HEAD_CONCURRENCY, len(batch)),
-                                thread_name_prefix="s3-oci-restore-poll") as executor:
-            futures = [executor.submit(check, obj) for obj in batch]
-            for future in as_completed(futures):
-                result = future.result()
-                if result:
-                    ready[result[0]] = result[1]
-    return ready
+    try:
+        for start in range(0, len(archives), RESTORE_POLL_HEAD_BATCH_SIZE):
+            batch = archives[start:start + RESTORE_POLL_HEAD_BATCH_SIZE]
+            for second_start in range(0, len(batch), RESTORE_POLL_HEAD_REQUESTS_PER_SECOND):
+                second_batch = batch[second_start:second_start + RESTORE_POLL_HEAD_REQUESTS_PER_SECOND]
+                second_started_at = time.monotonic()
+                with ThreadPoolExecutor(max_workers=min(RESTORE_POLL_HEAD_CONCURRENCY, len(second_batch)),
+                                        thread_name_prefix="s3-oci-restore-poll") as executor:
+                    futures = [executor.submit(check, obj) for obj in second_batch]
+                    for future in as_completed(futures):
+                        metrics["requests"] = int(metrics["requests"]) + 1
+                        try:
+                            result = future.result()
+                        except ClientError as error:
+                            code = str((error.response or {}).get("Error", {}).get("Code", ""))
+                            if code in TRANSIENT_AWS_CODES:
+                                metrics["throttle_retries"] = int(metrics["throttle_retries"]) + 1
+                            raise
+                        if result:
+                            ready[result[0]] = result[1]
+                # This is an explicit start-rate ceiling in addition to SDK
+                # retries and concurrency. It protects S3 and makes API cost
+                # and load predictable for large waves.
+                has_next = second_start + RESTORE_POLL_HEAD_REQUESTS_PER_SECOND < len(batch) or start + len(batch) < len(archives)
+                remaining = 1.0 - (time.monotonic() - second_started_at)
+                if has_next and remaining > 0:
+                    time.sleep(remaining)
+    except Exception as error:
+        metrics["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+        setattr(error, "raijin_restore_poll_metrics", metrics)
+        raise
+    metrics["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+    return ready, metrics
+
+
+def persist_restore_poll_metrics(wave: Wave, metrics: dict[str, float | int]) -> None:
+    """Persist request/load evidence regardless of a successful poll outcome."""
+    requests = int(metrics.get("requests", 0) or 0)
+    elapsed = float(metrics.get("elapsed_seconds", 0) or 0)
+    throttles = int(metrics.get("throttle_retries", 0) or 0)
+    wave.availability_head_requests = int(wave.availability_head_requests or 0) + requests
+    wave.availability_poll_elapsed_seconds = float(wave.availability_poll_elapsed_seconds or 0) + elapsed
+    wave.availability_throttle_retries = int(wave.availability_throttle_retries or 0) + throttles
+    wave.last_availability_poll_objects, wave.last_availability_poll_seconds = requests, elapsed
 
 
 def archive_objects(session, wave_id: int) -> list[ObjectRecord]:
@@ -687,12 +724,12 @@ def poll_restore(session, task: Task, settings) -> None:
         attempt = restore_attempt_for_job(session, wave, source)
         job = s3control.describe_job(AccountId=account_id, JobId=wave.batch_job_id)["Job"]
         attempt.job_status = wave.batch_job_status = job.get("Status")
-        wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
         if job["Status"] not in {"Complete", "Completed"}:
             if job["Status"] in {"Failed", "Cancelled", "Canceled"}:
                 fail_restore_attempt(session, task, wave, attempt, f"Batch job {wave.batch_job_id} ended as {job['Status']}")
                 return
             wave.status = "RESTORING"
+            wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
             session.commit()
             retry(session, task, f"Batch job status is {job['Status']}", min(1800, 300 + wave.poll_count * 60))
             return
@@ -715,6 +752,7 @@ def poll_restore(session, task: Task, settings) -> None:
             raise RuntimeError(f"S3 Batch completion-report processing failed: {summary}") from error
         if not report_available:
             wave.status = "RESTORE_REQUESTED"
+            wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
             session.commit()
             retry(session, task, "Batch job accepted all objects; waiting for completion report evidence", 60)
             return
@@ -737,7 +775,14 @@ def poll_restore(session, task: Task, settings) -> None:
     # polling response needed to decide readiness. No inferred restore time is
     # stored: restored_at remains the Raijin observation timestamp only.
     poll_method = "HeadObject (pending wave objects)"
-    ready_expiries = restored_pending_archives_from_head(s3, source, pending_archives)
+    try:
+        ready_expiries, poll_metrics = restored_pending_archives_from_head(s3, source, pending_archives)
+    except Exception as error:
+        persist_restore_poll_metrics(wave, getattr(error, "raijin_restore_poll_metrics", {}))
+        wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
+        session.commit()
+        raise
+    persist_restore_poll_metrics(wave, poll_metrics)
     availability_observed_at = utcnow()
     for obj in objects:
         if obj.storage_class not in ARCHIVE_CLASSES or obj.id in ready_expiries:
@@ -765,6 +810,7 @@ def poll_restore(session, task: Task, settings) -> None:
             wave.restore_tier,
             partial_availability=bool(ready_for_transfer),
             transfer_strategy=source.transfer_strategy,
+            pending_objects=int(pending),
         )
         retry(session, task, f"{pending} object(s) still unavailable after restore; checked with {poll_method}; next availability poll in {delay // 60} minutes", delay)
         return

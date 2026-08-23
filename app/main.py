@@ -42,7 +42,8 @@ def utcnow() -> datetime:
 
 def restore_availability_poll_delay_seconds(accepted_at: datetime | None, now: datetime,
                                             restore_tier: str, partial_availability: bool = False,
-                                            transfer_strategy: str = "AFTER_ALL_RESTORED") -> int:
+                                            transfer_strategy: str = "AFTER_ALL_RESTORED",
+                                            pending_objects: int = 0) -> int:
     """Choose a low-cost polling cadence after AWS accepted a restore request.
 
     Batch execution is polled closely only until its per-object acceptance
@@ -53,7 +54,16 @@ def restore_availability_poll_delay_seconds(accepted_at: datetime | None, now: d
     minutes because it cannot transfer before the whole wave is ready.
     """
     if partial_availability:
-        return 5 * 60 if transfer_strategy == "AS_OBJECTS_AVAILABLE" else 30 * 60
+        if transfer_strategy != "AS_OBJECTS_AVAILABLE":
+            return 30 * 60
+        # Early release should be responsive without turning a large wave into
+        # an expensive HEAD storm. The next interval grows with the remaining
+        # set, and falls naturally as objects become available.
+        if pending_objects <= 5_000:
+            return 5 * 60
+        if pending_objects <= 50_000:
+            return 10 * 60
+        return 30 * 60
     expected_window = {
         "BULK": 48 * 60 * 60,
         "STANDARD": 12 * 60 * 60,
@@ -323,6 +333,11 @@ class Wave(Base):
     manifest_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     poll_count: Mapped[int] = mapped_column(Integer, default=0)
+    availability_head_requests: Mapped[int] = mapped_column(BigInteger, default=0)
+    availability_poll_elapsed_seconds: Mapped[float] = mapped_column(Float, default=0)
+    availability_throttle_retries: Mapped[int] = mapped_column(Integer, default=0)
+    last_availability_poll_objects: Mapped[int] = mapped_column(Integer, default=0)
+    last_availability_poll_seconds: Mapped[float] = mapped_column(Float, default=0)
     planner_mode: Mapped[str] = mapped_column(String(32), default="MANUAL")
     predicted_transfer_seconds: Mapped[float] = mapped_column(Float, default=0)
     prediction_samples: Mapped[int] = mapped_column(Integer, default=0)
@@ -657,7 +672,7 @@ def create_schema() -> None:
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
-    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
@@ -1475,7 +1490,16 @@ def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Sessio
             attempt.completed_at if attempt else None, now, wave.restore_tier,
             partial_availability=bool(timing["available_objects"] and timing["pending_objects"]),
             transfer_strategy=getattr(getattr(wave, "source", None), "transfer_strategy", "AFTER_ALL_RESTORED"),
+            pending_objects=int(timing["pending_objects"] or 0),
         ) if task.kind == "POLL_RESTORE" and attempt and attempt.completed_at else None,
+        "availability_polling": {
+            "method": "HeadObject (pending wave objects)",
+            "head_requests": int(getattr(wave, "availability_head_requests", 0) or 0),
+            "elapsed_seconds": round(float(getattr(wave, "availability_poll_elapsed_seconds", 0) or 0), 2),
+            "throttle_retries": int(getattr(wave, "availability_throttle_retries", 0) or 0),
+            "last_checked_objects": int(getattr(wave, "last_availability_poll_objects", 0) or 0),
+            "last_elapsed_seconds": round(float(getattr(wave, "last_availability_poll_seconds", 0) or 0), 2),
+        },
         **timing,
     }
 
@@ -2474,6 +2498,9 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
         wave = session.get(Wave, wave_id)
         wave.status, wave.batch_job_id, wave.batch_job_status, wave.manifest_key, wave.manifest_etag = "READY_FOR_RESTORE", None, None, None, None
         wave.last_poll_at, wave.poll_count = None, 0
+        wave.availability_head_requests, wave.availability_poll_elapsed_seconds = 0, 0
+        wave.availability_throttle_retries = 0
+        wave.last_availability_poll_objects, wave.last_availability_poll_seconds = 0, 0
         record_event(session, "DESTINATION_DIVERGENCE_REOPENED_WAVE", f"Wave reopened after OCI destination validation; {affected_objects} object(s) require reprocessing", source_id=source.id, wave_id=wave.id)
     record_event(session, "DESTINATION_VALIDATED", f"OCI destination reconciliation: {len(missing)} missing, {len(mismatched)} size mismatch(es), {len(metadata_mismatched)} metadata mismatch(es), {len(extras)} extra object(s)", source_id=source.id)
     session.commit()
@@ -3073,7 +3100,13 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                                   "created_at": attempt.created_at, "completed_at": attempt.completed_at}
                                  for attempt in attempts],
             "restore_timing": timing,
-            "polling": {"state": latest_poll.state if latest_poll else None, "error": latest_poll.error if latest_poll else None},
+            "polling": {"state": latest_poll.state if latest_poll else None, "error": latest_poll.error if latest_poll else None,
+                        "method": "HeadObject (pending wave objects)",
+                        "head_requests": int(wave.availability_head_requests or 0),
+                        "elapsed_seconds": round(float(wave.availability_poll_elapsed_seconds or 0), 2),
+                        "throttle_retries": int(wave.availability_throttle_retries or 0),
+                        "last_checked_objects": int(wave.last_availability_poll_objects or 0),
+                        "last_elapsed_seconds": round(float(wave.last_availability_poll_seconds or 0), 2)},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in tasks]}
 
@@ -3212,6 +3245,9 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
         obj.state, obj.restored_at = ObjectState.WAVE_ASSIGNED, None
     wave.status, wave.batch_job_id, wave.batch_job_status = "READY_FOR_RESTORE", None, None
     wave.manifest_key, wave.manifest_etag, wave.last_poll_at, wave.poll_count = None, None, None, 0
+    wave.availability_head_requests, wave.availability_poll_elapsed_seconds = 0, 0
+    wave.availability_throttle_retries = 0
+    wave.last_availability_poll_objects, wave.last_availability_poll_seconds = 0, 0
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
     record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}' by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
