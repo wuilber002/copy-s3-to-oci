@@ -260,6 +260,18 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     assert payload.target_transfer_seconds == 3600
 
 
+def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    frontend = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert '@app.get("/api/flight-board")' in source
+    assert '@app.get("/api/flight-board/availability")' in source
+    assert 'Wave.planner_mode == "DYNAMIC"' in source
+    assert '"QUEUE"' in source and '"RESTORE"' in source and '"TRANSFER"' in source
+    assert 'id="flight-board-button"' in frontend
+    assert 'function showFlightBoard()' in frontend
+    assert 'flight-board-legend' in frontend
+
+
 def test_dynamic_prediction_prefers_p75_history_then_conservative_link_model():
     settings = type("Settings", (), {"multipart_part_size_mib": 64, "max_throughput_mbps": 1000, "transfer_workers": 4})()
     obj = type("Object", (), {"size_bytes": 512 * 1024})()

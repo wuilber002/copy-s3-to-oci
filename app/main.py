@@ -1571,6 +1571,99 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
     return {"waves": waves, "generated_at": now}
 
 
+@app.get("/api/flight-board/availability")
+def flight_board_availability(session: Session = Depends(get_session)) -> dict:
+    """Cheap indicator used to show the dynamic-pipeline flight-board button."""
+    dynamic_waves = session.scalar(select(func.count(Wave.id)).where(Wave.planner_mode == "DYNAMIC")) or 0
+    return {"available": bool(dynamic_waves), "waves": int(dynamic_waves)}
+
+
+@app.get("/api/flight-board")
+def flight_board(session: Session = Depends(get_session)) -> dict:
+    """Return local-only planned and actual phases for dynamic migration waves."""
+    now = utcnow()
+    rows = list(session.execute(
+        select(Wave, Source.name).join(Source).where(Wave.planner_mode == "DYNAMIC")
+        .order_by(Wave.planned_transfer_start_at.nulls_last(), Wave.id).limit(500)
+    ))
+    wave_ids = [wave.id for wave, _source_name in rows]
+    if not wave_ids:
+        return {"waves": [], "generated_at": now, "truncated": False}
+    object_times = {
+        wave_id: {"restore_requested_at": requested, "first_available_at": first_available,
+                  "last_available_at": last_available, "transfer_started_at": transfer_started,
+                  "transfer_completed_at": transfer_completed}
+        for wave_id, requested, first_available, last_available, transfer_started, transfer_completed in session.execute(
+            select(ObjectRecord.wave_id, func.min(ObjectRecord.restore_requested_at),
+                   func.min(ObjectRecord.restored_at), func.max(ObjectRecord.restored_at),
+                   func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at))
+            .where(ObjectRecord.wave_id.in_(wave_ids)).group_by(ObjectRecord.wave_id)
+        )
+    }
+    latest_tasks: dict[int, Task] = {}
+    for task in session.scalars(select(Task).where(Task.wave_id.in_(wave_ids)).order_by(Task.wave_id, Task.id.desc())):
+        latest_tasks.setdefault(task.wave_id, task)
+
+    def phase(kind: str, start: datetime | None, end: datetime | None, *, planned: bool = False) -> dict | None:
+        if not start or not end or end <= start:
+            return None
+        return {"kind": kind, "start_at": start, "end_at": end, "planned": planned}
+
+    board_waves = []
+    for wave, source_name in rows:
+        times = object_times.get(wave.id, {})
+        request_at = times.get("restore_requested_at")
+        available_at = times.get("last_available_at")
+        transfer_started_at = times.get("transfer_started_at")
+        transfer_completed_at = times.get("transfer_completed_at")
+        task = latest_tasks.get(wave.id)
+        phases = []
+        queue_end = request_at or wave.planned_restore_at
+        queued = phase("QUEUE", wave.created_at, queue_end, planned=not bool(request_at))
+        if queued:
+            phases.append(queued)
+        restore_start = request_at or wave.planned_restore_at
+        if request_at:
+            restore_end = available_at or transfer_started_at or now
+        else:
+            restore_end = wave.planned_transfer_start_at
+        restore = phase("RESTORE", restore_start, restore_end, planned=not bool(request_at))
+        if restore:
+            phases.append(restore)
+        transfer_start = transfer_started_at or wave.planned_transfer_start_at
+        if transfer_started_at:
+            transfer_end = transfer_completed_at or now
+        elif transfer_start:
+            transfer_end = transfer_start + timedelta(seconds=max(1, int(wave.predicted_transfer_seconds or 0)))
+        else:
+            transfer_end = None
+        transfer = phase("TRANSFER", transfer_start, transfer_end, planned=not bool(transfer_started_at))
+        if transfer:
+            phases.append(transfer)
+        status = wave.status
+        if transfer_started_at and not transfer_completed_at:
+            status = "TRANSFERRING"
+        elif request_at and not available_at:
+            status = "RESTORING"
+        elif available_at and not transfer_started_at:
+            status = "RESTORED"
+        board_waves.append({
+            "wave_id": wave.id, "wave_name": wave.name, "source_name": source_name,
+            "status": status, "task_state": task.state if task else None,
+            "started_at": request_at or transfer_started_at,
+            "completed_at": transfer_completed_at if status in {"COMPLETED", "VERIFIED", "TRANSFERRED"} else None,
+            "planned_restore_at": wave.planned_restore_at,
+            "planned_transfer_start_at": wave.planned_transfer_start_at,
+            "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
+            "phases": phases,
+        })
+    timeline_points = [point for wave in board_waves for phase_item in wave["phases"] for point in (phase_item["start_at"], phase_item["end_at"])]
+    return {"waves": board_waves, "generated_at": now,
+            "timeline_start_at": min(timeline_points) if timeline_points else now,
+            "timeline_end_at": max(timeline_points) if timeline_points else now + timedelta(hours=1),
+            "truncated": len(rows) >= 500}
+
+
 @app.get("/api/deep-audits")
 def deep_audits(session: Session = Depends(get_session)) -> dict:
     """Progress of explicitly approved full OCI rereads."""
