@@ -100,6 +100,9 @@ class Source(Base):
     aws_bucket_region: Mapped[str | None] = mapped_column(String(64), nullable=True)
     aws_connection_id: Mapped[int | None] = mapped_column(ForeignKey("aws_connections.id"), nullable=True, index=True)
     destination_bucket: Mapped[str] = mapped_column(String(255))
+    # The conservative default is durable and explicit. The governance worker
+    # will later interpret AS_OBJECTS_AVAILABLE without changing source history.
+    transfer_strategy: Mapped[str] = mapped_column(String(32), default="AFTER_ALL_RESTORED")
     status: Mapped[str] = mapped_column(String(32), default="CONFIGURED")
     discovery_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # ``discovery_elapsed_seconds`` is durable work time, rather than wall-clock
@@ -426,10 +429,15 @@ class SourceCreate(BaseModel):
     aws_region: str
     aws_connection_id: int | None = None
     destination_bucket: str
+    transfer_strategy: str = Field(default="AFTER_ALL_RESTORED", pattern="^(AFTER_ALL_RESTORED|AS_OBJECTS_AVAILABLE)$")
 
 
 class SourceUpdate(SourceCreate):
     pass
+
+
+class SourceTransferStrategyUpdate(BaseModel):
+    transfer_strategy: str = Field(pattern="^(AFTER_ALL_RESTORED|AS_OBJECTS_AVAILABLE)$")
 
 
 class LegacySourceConnectionMigration(BaseModel):
@@ -619,7 +627,7 @@ def create_schema() -> None:
         "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
         "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
@@ -1401,6 +1409,7 @@ def restore_timing(session: Session, wave_id: int) -> dict:
         ).where(ObjectRecord.wave_id == wave_id, ObjectRecord.restore_requested_at.is_not(None))
     ).one()
     requested_objects, available_objects = int(requested_objects or 0), int(available_objects or 0)
+    availability_span_seconds = max(0, int((last_available_at - first_available_at).total_seconds())) if first_available_at and last_available_at else None
     return {
         "requested_at": requested_at,
         "first_available_at": first_available_at,
@@ -1410,6 +1419,11 @@ def restore_timing(session: Session, wave_id: int) -> dict:
         "available_objects": available_objects,
         "pending_objects": max(0, requested_objects - available_objects),
         "restore_elapsed_seconds": max(0, int((last_available_at - requested_at).total_seconds())) if requested_at and last_available_at else None,
+        # This is the average interval between consecutive availability events,
+        # not the Batch job duration. It becomes meaningful after at least two
+        # objects are visible as restored.
+        "average_availability_interval_seconds": round(availability_span_seconds / (available_objects - 1), 2)
+        if availability_span_seconds is not None and available_objects > 1 else None,
     }
 
 
@@ -1846,7 +1860,7 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
             return "AWAITING_INTEGRITY_VERIFICATION"
         return "IN_PROGRESS" if total else "NOT_STARTED"
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
-             "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "status": s.status,
+             "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "transfer_strategy": s.transfer_strategy, "status": s.status,
              "aws_bucket_region": s.aws_bucket_region,
              "aws_connection_id": s.aws_connection_id,
              "aws_connection_label": s.aws_connection.label if s.aws_connection else "Unassigned AWS connection",
@@ -1905,6 +1919,19 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
+
+
+@app.patch("/api/sources/{source_id}/transfer-strategy")
+def update_source_transfer_strategy(source_id: int, payload: SourceTransferStrategyUpdate,
+                                    session: Session = Depends(get_session)) -> dict:
+    """Update the durable transfer-release policy without editing source identity."""
+    source = active_source_or_409(session, source_id)
+    source.transfer_strategy = payload.transfer_strategy
+    record_event(session, "SOURCE_TRANSFER_STRATEGY_UPDATED",
+                 f"Source '{source.name}' transfer strategy set to {payload.transfer_strategy}",
+                 source_id=source.id)
+    session.commit()
+    return {"id": source.id, "transfer_strategy": source.transfer_strategy}
 
 
 def aws_bucket_region_from_connection(connection: AwsConnection, bucket: str) -> str:
@@ -2982,7 +3009,25 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
     latest_poll = session.scalar(
         select(Task).where(Task.wave_id == wave_id, Task.kind == "POLL_RESTORE").order_by(Task.id.desc())
     )
+    transfer_started_at, transfer_completed_at, transferred_files, transferred_bytes, failed_objects = session.execute(
+        select(
+            func.min(ObjectRecord.transfer_started_at),
+            func.max(ObjectRecord.transferred_at),
+            func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), ObjectRecord.size_bytes), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.FAILED, 1), else_=0)), 0),
+        ).where(ObjectRecord.wave_id == wave_id)
+    ).one()
+    now = utcnow()
+    transfer_elapsed_seconds = max(0, int(((transfer_completed_at or now) - transfer_started_at).total_seconds())) if transfer_started_at else None
+    failed_tasks = sum(1 for task in tasks if task.state == TaskState.FAILED)
+    timing = restore_timing(session, wave_id)
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
+            "summary": {"transfer_elapsed_seconds": transfer_elapsed_seconds,
+                        "transfer_started_at": transfer_started_at, "transfer_completed_at": transfer_completed_at,
+                        "transferred_files": int(transferred_files or 0), "transferred_bytes": int(transferred_bytes or 0),
+                        "failed_objects": int(failed_objects or 0), "failed_tasks": failed_tasks,
+                        "failures_or_errors": int(failed_objects or 0) + failed_tasks},
             "batch": {"job_id": wave.batch_job_id, "status": wave.batch_job_status, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
             "restore_attempts": [{"id": attempt.id, "job_id": attempt.job_id, "region": attempt.aws_region, "status": attempt.job_status,
                                   "expected": attempt.expected_objects, "succeeded": attempt.succeeded_objects, "failed": attempt.failed_objects,
@@ -2992,7 +3037,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                                   "failure_summary": attempt.failure_summary,
                                   "created_at": attempt.created_at, "completed_at": attempt.completed_at}
                                  for attempt in attempts],
-            "restore_timing": restore_timing(session, wave_id),
+            "restore_timing": timing,
             "polling": {"state": latest_poll.state if latest_poll else None, "error": latest_poll.error if latest_poll else None},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "tasks": [{"id": t.id, "kind": t.kind, "state": t.state, "attempts": t.attempts, "error": t.error} for t in tasks]}

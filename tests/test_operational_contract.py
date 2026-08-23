@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, validate_restore_preflight
 
 
@@ -30,6 +30,14 @@ def test_source_model_has_a_durable_discovery_page_checkpoint():
     assert "DISCOVERY_CHECKPOINT_PAGES = 10" in worker
     assert "session.bulk_insert_mappings(ObjectRecord, pending_rows)" in worker
     assert "Atomically persist a bounded discovery batch" in worker
+
+
+def test_source_transfer_strategy_is_durable_and_only_accepts_known_modes():
+    assert "transfer_strategy" in Source.__table__.columns
+    assert SourceTransferStrategyUpdate(transfer_strategy="AFTER_ALL_RESTORED").transfer_strategy == "AFTER_ALL_RESTORED"
+    assert SourceTransferStrategyUpdate(transfer_strategy="AS_OBJECTS_AVAILABLE").transfer_strategy == "AS_OBJECTS_AVAILABLE"
+    with pytest.raises(ValidationError):
+        SourceTransferStrategyUpdate(transfer_strategy="anything")
 
 
 def test_remote_discovery_has_a_durable_observable_queue_and_adaptive_throttle():
