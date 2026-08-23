@@ -123,11 +123,9 @@ def test_postgres_recovery_tool_requires_an_explicit_backup_and_confirmation():
     assert "pg_restore" in script
 
 
-def test_restore_poll_prefers_targeted_head_only_for_small_wave_subsets():
+def test_restore_poll_is_targeted_to_pending_wave_objects():
     assert should_poll_restore_with_head(10, 1_000)
-    assert not should_poll_restore_with_head(11, 1_000)
     assert should_poll_restore_with_head(10_000, 1_000_000)
-    assert not should_poll_restore_with_head(10_001, 1_000_000)
     assert restored_from_head_response({"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'})
     assert not restored_from_head_response({"Restore": 'ongoing-request="true"'})
     assert restore_expiry_from_head_response({"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'}).isoformat() == "2026-08-22T00:00:00+00:00"
@@ -308,6 +306,7 @@ def test_restore_availability_polling_starts_at_two_hours_then_converges_to_thir
     assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=24), "BULK") == 3600
     assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=36), "BULK") == 1800
     assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=2), "BULK", partial_availability=True) == 1800
+    assert restore_availability_poll_delay_seconds(accepted, accepted + timedelta(hours=2), "BULK", partial_availability=True, transfer_strategy="AS_OBJECTS_AVAILABLE") == 300
 
 
 def test_aws_connection_secret_schema_requires_matching_account_role_arns():

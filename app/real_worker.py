@@ -13,7 +13,6 @@ import gzip
 import hashlib
 import io
 import json
-import math
 import os
 import re
 import socket
@@ -43,11 +42,13 @@ WORKER_ROLE = os.getenv("RAIJIN_WORKER_ROLE", "all").strip().lower()
 GOVERNANCE_TASK_KINDS = frozenset({"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE"})
 TRANSFER_TASK_KINDS = frozenset({"TRANSFER_WAVE"})
 ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS", "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS"}
-# A ListObjectsV2 page contains up to 1,000 objects.  A LIST request is
-# usually about 12.5x the unit price of a HEAD/GET request, so use targeted
-# HeadObject checks only when the archive subset is materially smaller than
-# the source scan.  The conservative factor of 10 also minimizes requests.
-RESTORE_POLL_HEAD_TO_LIST_RATIO = 10
+# Restore status is not queryable by an arbitrary set of object keys through
+# ListObjectsV2. Poll only objects assigned to the wave with HeadObject rather
+# than repeatedly scanning a full source prefix that may contain many other
+# waves. Requests are bounded concurrently to preserve predictable pressure
+# on S3 and the VM; this changes speed, not the number of billed HEAD calls.
+RESTORE_POLL_HEAD_CONCURRENCY = 16
+RESTORE_POLL_HEAD_BATCH_SIZE = 1_000
 # A discovery response contains at most 1,000 S3 keys.  Persisting each
 # response separately is very safe, but it turns a 100-million-object bucket
 # into 100,000 PostgreSQL commits.  Commit a bounded group atomically instead:
@@ -491,9 +492,39 @@ def restore_expiry_from_head_response(response: dict):
 
 
 def should_poll_restore_with_head(wave_archive_objects: int, source_objects: int) -> bool:
-    """Choose the cheaper, lower-request restore readiness strategy."""
-    list_pages = max(1, math.ceil(max(0, source_objects) / 1000))
-    return wave_archive_objects <= list_pages * RESTORE_POLL_HEAD_TO_LIST_RATIO
+    """Compatibility helper: availability polling is now always wave-scoped."""
+    return True
+
+
+def restored_pending_archives_from_head(s3, source: Source, archives: list[ObjectRecord]) -> dict[int, datetime | None]:
+    """Return only wave objects observed as restored by bounded HeadObject calls.
+
+    Each request is for one still-pending archive object belonging to this
+    wave. S3 has no multi-key HeadObject API and ListObjectsV2 only supports a
+    prefix, so this avoids scanning unrelated source objects while retaining
+    durable per-object evidence.
+    """
+    ready: dict[int, datetime | None] = {}
+
+    def check(obj: ObjectRecord) -> tuple[int, datetime | None] | None:
+        arguments = {"Bucket": source.s3_bucket, "Key": obj.object_key}
+        if obj.version_id:
+            arguments["VersionId"] = obj.version_id
+        response = s3.head_object(**arguments)
+        if restored_from_head_response(response):
+            return obj.id, restore_expiry_from_head_response(response)
+        return None
+
+    for start in range(0, len(archives), RESTORE_POLL_HEAD_BATCH_SIZE):
+        batch = archives[start:start + RESTORE_POLL_HEAD_BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=min(RESTORE_POLL_HEAD_CONCURRENCY, len(batch)),
+                                thread_name_prefix="s3-oci-restore-poll") as executor:
+            futures = [executor.submit(check, obj) for obj in batch]
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    ready[result[0]] = result[1]
+    return ready
 
 
 def archive_objects(session, wave_id: int) -> list[ObjectRecord]:
@@ -699,36 +730,21 @@ def poll_restore(session, task: Task, settings) -> None:
         event(session, "RESTORE_REQUEST_ACCEPTED", f"Batch job {wave.batch_job_id} accepted all {attempt.expected_objects} archive restore request(s) with per-object evidence", source_id=source.id, wave_id=wave.id)
         session.commit()
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
-    archives = [obj for obj in objects if obj.storage_class in ARCHIVE_CLASSES]
-    source_object_count = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source.id)) or 0
-    # The availability/expiry values are collected from the same polling
-    # response already needed to decide readiness.  This adds no AWS requests.
-    ready_expiries: dict[str, object] = {}
-    if should_poll_restore_with_head(len(archives), int(source_object_count)):
-        poll_method = "HeadObject"
-        for obj in archives:
-            arguments = {"Bucket": source.s3_bucket, "Key": obj.object_key}
-            if obj.version_id:
-                arguments["VersionId"] = obj.version_id
-            response = s3.head_object(**arguments)
-            if restored_from_head_response(response):
-                ready_expiries[obj.object_key] = restore_expiry_from_head_response(response)
-    else:
-        poll_method = "ListObjectsV2"
-        for page in s3.get_paginator("list_objects_v2").paginate(
-            Bucket=source.s3_bucket, Prefix=source.s3_prefix, OptionalObjectAttributes=["RestoreStatus"]
-        ):
-            for item in page.get("Contents", []):
-                restore = item.get("RestoreStatus", {})
-                if restore and not restore.get("IsRestoreInProgress") and restore.get("RestoreExpiryDate"):
-                    expiry = restore["RestoreExpiryDate"]
-                    ready_expiries[item["Key"]] = expiry.astimezone(timezone.utc) if getattr(expiry, "tzinfo", None) else expiry.replace(tzinfo=timezone.utc)
+    pending_archives = [obj for obj in objects if obj.storage_class in ARCHIVE_CLASSES and obj.state in {
+        ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING,
+    }]
+    # The availability/expiry values are collected from the same targeted
+    # polling response needed to decide readiness. No inferred restore time is
+    # stored: restored_at remains the Raijin observation timestamp only.
+    poll_method = "HeadObject (pending wave objects)"
+    ready_expiries = restored_pending_archives_from_head(s3, source, pending_archives)
+    availability_observed_at = utcnow()
     for obj in objects:
-        if obj.storage_class not in ARCHIVE_CLASSES or obj.object_key in ready_expiries:
+        if obj.storage_class not in ARCHIVE_CLASSES or obj.id in ready_expiries:
             if obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING, ObjectState.WAVE_ASSIGNED}:
-                obj.state, obj.restored_at = ObjectState.RESTORED, obj.restored_at or utcnow()
+                obj.state, obj.restored_at = ObjectState.RESTORED, obj.restored_at or availability_observed_at
                 if obj.storage_class in ARCHIVE_CLASSES:
-                    obj.restore_expires_at = ready_expiries.get(obj.object_key)
+                    obj.restore_expires_at = ready_expiries.get(obj.id)
         elif obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED}:
             obj.state = ObjectState.RESTORING
     pending = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_([ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING]))) or 0
@@ -748,11 +764,12 @@ def poll_restore(session, task: Task, settings) -> None:
             utcnow(),
             wave.restore_tier,
             partial_availability=bool(ready_for_transfer),
+            transfer_strategy=source.transfer_strategy,
         )
         retry(session, task, f"{pending} object(s) still unavailable after restore; checked with {poll_method}; next availability poll in {delay // 60} minutes", delay)
         return
     wave.status = "RESTORED"
-    expiries = [expiry for expiry in ready_expiries.values() if expiry]
+    expiries = [obj.restore_expires_at for obj in objects if obj.restore_expires_at]
     expiry_text = f"; earliest temporary-copy expiry {min(expiries).isoformat()}" if expiries else ""
     event(session, "RESTORE_AVAILABLE", f"All wave objects are available for transfer; readiness checked with {poll_method}{expiry_text}", source_id=source.id, wave_id=wave.id)
     ensure_transfer_task(session, wave)

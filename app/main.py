@@ -41,16 +41,19 @@ def utcnow() -> datetime:
 
 
 def restore_availability_poll_delay_seconds(accepted_at: datetime | None, now: datetime,
-                                            restore_tier: str, partial_availability: bool = False) -> int:
+                                            restore_tier: str, partial_availability: bool = False,
+                                            transfer_strategy: str = "AFTER_ALL_RESTORED") -> int:
     """Choose a low-cost polling cadence after AWS accepted a restore request.
 
     Batch execution is polled closely only until its per-object acceptance
     report exists.  Availability then starts at two hours and becomes more
-    frequent only near the service window.  Once any object is available,
-    thirty minutes lets an early-transfer source release the next set promptly.
+    frequent only near the service window. Once some objects are available,
+    an early-transfer source checks every five minutes so it can release the
+    next objects promptly. The conservative strategy still waits thirty
+    minutes because it cannot transfer before the whole wave is ready.
     """
     if partial_availability:
-        return 30 * 60
+        return 5 * 60 if transfer_strategy == "AS_OBJECTS_AVAILABLE" else 30 * 60
     expected_window = {
         "BULK": 48 * 60 * 60,
         "STANDARD": 12 * 60 * 60,
@@ -1057,7 +1060,6 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     for obj in objects:
         effective_part = max(part_bytes, math.ceil(int(obj.size_bytes or 0) / 10000))
         oci_put_operations += 1 if obj.size_bytes <= 16 * 1024**2 else math.ceil(obj.size_bytes / effective_part) + 2
-    source_pages = math.ceil(source_objects / 1000) if source_objects else 0
     wave_pages = math.ceil(len(objects) / 1000) if objects else 0
     components: list[dict] = []
     missing: list[str] = []
@@ -1083,7 +1085,7 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
         add("batch_job", "S3 Batch Operations job", 1, "job", "aws_batch_job_usd")
         add("batch_objects", "S3 Batch Operations object tasks", len(archived), "objects", "aws_batch_object_usd_per_1000", 1000)
         add("manifest_put", "S3 manifest write", 1, "requests", "aws_s3_put_list_usd_per_1000", 1000)
-        add("restore_polling", "S3 restore polling ListObjectsV2 pages", source_pages * pricing.expected_restore_poll_cycles, "requests", "aws_s3_put_list_usd_per_1000", 1000)
+        add("restore_polling", "S3 restore availability checks (HeadObject)", len(archived) * pricing.expected_restore_poll_cycles, "requests", "aws_s3_get_usd_per_1000", 1000)
         add("restore_temp", "Temporary S3 Standard restored copy", (glacier_gib + deep_gib) * wave.restore_days / 30, "GiB-month", "aws_restore_temp_standard_usd_per_gib_month")
         retrieval_field = "aws_glacier_bulk_retrieval_usd_per_gib" if wave.restore_tier == "BULK" else "aws_glacier_standard_retrieval_usd_per_gib"
         add("glacier_retrieval", f"S3 Glacier {wave.restore_tier} retrieval", glacier_gib, "GiB", retrieval_field)
@@ -1472,6 +1474,7 @@ def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Sessio
         "availability_poll_interval_seconds": restore_availability_poll_delay_seconds(
             attempt.completed_at if attempt else None, now, wave.restore_tier,
             partial_availability=bool(timing["available_objects"] and timing["pending_objects"]),
+            transfer_strategy=getattr(getattr(wave, "source", None), "transfer_strategy", "AFTER_ALL_RESTORED"),
         ) if task.kind == "POLL_RESTORE" and attempt and attempt.completed_at else None,
         **timing,
     }

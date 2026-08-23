@@ -72,8 +72,10 @@ componentes; eles não são interpretados como custo zero.
 
 - Job e tarefas de S3 Batch Operations para objetos arquivados;
 - escrita do manifesto e páginas `ListObjectsV2` do discovery;
-- polling de restore. O cálculo usa o número de páginas da origem multiplicado
-  pelos ciclos de polling configurados na tabela de tarifas;
+- polling de restore. O cálculo usa o número de objetos arquivados da wave
+  multiplicado pelos ciclos de polling configurados na tabela de tarifas; cada
+  verificação é um `HeadObject` direcionado ao objeto pendente e usa a tarifa
+  S3 GET/other requests;
 - retrieval de `GLACIER` e `DEEP_ARCHIVE`, separado por tier `BULK` ou
   `STANDARD`;
 - cópia temporária restaurada em S3 Standard durante os dias de retenção;
