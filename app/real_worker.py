@@ -31,7 +31,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
-    Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_due_global_aws_pricing, runtime_settings, utcnow,
+    Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_due_global_aws_pricing, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -743,7 +743,13 @@ def poll_restore(session, task: Task, settings) -> None:
             ensure_transfer_task(session, wave)
             event(session, "RESTORE_PARTIALLY_AVAILABLE", f"{ready_for_transfer} restored object(s) released for transfer while {pending} remain unavailable", source_id=source.id, wave_id=wave.id)
         session.commit()
-        retry(session, task, f"{pending} object(s) still unavailable after restore; checked with {poll_method}", min(1800, 300 + wave.poll_count * 60))
+        delay = restore_availability_poll_delay_seconds(
+            attempt.completed_at if wave.batch_job_id else None,
+            utcnow(),
+            wave.restore_tier,
+            partial_availability=bool(ready_for_transfer),
+        )
+        retry(session, task, f"{pending} object(s) still unavailable after restore; checked with {poll_method}; next availability poll in {delay // 60} minutes", delay)
         return
     wave.status = "RESTORED"
     expiries = [expiry for expiry in ready_expiries.values() if expiry]

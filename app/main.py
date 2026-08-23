@@ -40,6 +40,30 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def restore_availability_poll_delay_seconds(accepted_at: datetime | None, now: datetime,
+                                            restore_tier: str, partial_availability: bool = False) -> int:
+    """Choose a low-cost polling cadence after AWS accepted a restore request.
+
+    Batch execution is polled closely only until its per-object acceptance
+    report exists.  Availability then starts at two hours and becomes more
+    frequent only near the service window.  Once any object is available,
+    thirty minutes lets an early-transfer source release the next set promptly.
+    """
+    if partial_availability:
+        return 30 * 60
+    expected_window = {
+        "BULK": 48 * 60 * 60,
+        "STANDARD": 12 * 60 * 60,
+        "EXPEDITED": 30 * 60,
+    }.get(str(restore_tier).upper(), 48 * 60 * 60)
+    elapsed = max(0, (now - accepted_at).total_seconds()) if accepted_at else 0
+    if elapsed < expected_window * 0.5:
+        return 2 * 60 * 60
+    if elapsed < expected_window * 0.75:
+        return 60 * 60
+    return 30 * 60
+
+
 def read_secret(path: str) -> str:
     with open(path, "r", encoding="utf-8") as secret_file:
         return secret_file.read().strip()
@@ -1429,6 +1453,14 @@ def restore_timing(session: Session, wave_id: int) -> dict:
 
 def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Session | None = None) -> dict:
     """Safe, local-only restore diagnostics used by the dashboard queue API."""
+    attempt = session.scalar(select(RestoreAttempt).where(
+        RestoreAttempt.wave_id == wave.id
+    ).order_by(RestoreAttempt.id.desc()).limit(1)) if session is not None else None
+    timing = restore_timing(session, wave.id) if session is not None else {
+        "requested_at": None, "first_available_at": None, "last_available_at": None,
+        "earliest_expiry_at": None, "requested_objects": 0, "available_objects": 0,
+        "pending_objects": 0, "restore_elapsed_seconds": None,
+    }
     return {
         "batch_job_id": wave.batch_job_id,
         "batch_status": wave.batch_job_status,
@@ -1437,11 +1469,11 @@ def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Sessio
         "next_attempt_at": task.available_at if task.state == TaskState.READY else None,
         "waiting_seconds": max(0, int((now - task.created_at).total_seconds())) if task.kind in {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE"} else 0,
         "last_error": task.error,
-        **(restore_timing(session, wave.id) if session is not None else {
-            "requested_at": None, "first_available_at": None, "last_available_at": None,
-            "earliest_expiry_at": None, "requested_objects": 0, "available_objects": 0,
-            "pending_objects": 0, "restore_elapsed_seconds": None,
-        }),
+        "availability_poll_interval_seconds": restore_availability_poll_delay_seconds(
+            attempt.completed_at if attempt else None, now, wave.restore_tier,
+            partial_availability=bool(timing["available_objects"] and timing["pending_objects"]),
+        ) if task.kind == "POLL_RESTORE" and attempt and attempt.completed_at else None,
+        **timing,
     }
 
 
