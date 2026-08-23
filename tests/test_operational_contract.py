@@ -14,7 +14,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 from datetime import datetime, timezone
 
 from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
-from app.real_worker import restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, validate_restore_preflight
+from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -38,6 +38,19 @@ def test_source_transfer_strategy_is_durable_and_only_accepts_known_modes():
     assert SourceTransferStrategyUpdate(transfer_strategy="AS_OBJECTS_AVAILABLE").transfer_strategy == "AS_OBJECTS_AVAILABLE"
     with pytest.raises(ValidationError):
         SourceTransferStrategyUpdate(transfer_strategy="anything")
+
+
+def test_governance_and_transfer_workers_claim_disjoint_durable_responsibilities():
+    assert GOVERNANCE_TASK_KINDS == {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE"}
+    assert TRANSFER_TASK_KINDS == {"TRANSFER_WAVE"}
+    assert GOVERNANCE_TASK_KINDS.isdisjoint(TRANSFER_TASK_KINDS)
+    assert task_kinds_for_role("governance") == GOVERNANCE_TASK_KINDS
+    assert task_kinds_for_role("transfer") == TRANSFER_TASK_KINDS
+    assert task_kinds_for_role("all") is None
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "def ensure_transfer_task" in worker
+    assert "RESTORE_PARTIALLY_AVAILABLE" in worker
+    assert "PARTIAL_TRANSFER_COMPLETED" in worker
 
 
 def test_remote_discovery_has_a_durable_observable_queue_and_adaptive_throttle():

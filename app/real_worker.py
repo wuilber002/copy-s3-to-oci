@@ -37,6 +37,11 @@ from app.main import (
 # The bootstrap supplies a stable identity for the one real worker on the VM.
 # Keep the hostname fallback for local development/tests that do not use it.
 WORKER_ID = os.getenv("RAIJIN_WORKER_ID", f"aws-oci-worker-{socket.gethostname()}")
+# The two production workers share PostgreSQL's durable queue but never claim
+# each other's responsibility. ``all`` preserves a simple local invocation.
+WORKER_ROLE = os.getenv("RAIJIN_WORKER_ROLE", "all").strip().lower()
+GOVERNANCE_TASK_KINDS = frozenset({"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE"})
+TRANSFER_TASK_KINDS = frozenset({"TRANSFER_WAVE"})
 ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS", "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS"}
 # A ListObjectsV2 page contains up to 1,000 objects.  A LIST request is
 # usually about 12.5x the unit price of a HEAD/GET request, so use targeted
@@ -163,7 +168,7 @@ def worker_can_reclaim_lease(task_worker_id: str | None, lease_expires_at, now) 
     return task_worker_id == WORKER_ID or not lease_expires_at or lease_expires_at < now
 
 
-def claim_task(session, lease_seconds: int) -> Task | None:
+def claim_task(session, lease_seconds: int, allowed_kinds: frozenset[str] | None = None) -> Task | None:
     now = utcnow()
     # The worker id is stable for this single-VM architecture.  After a
     # controlled service/VM restart, the replacement process can therefore
@@ -183,6 +188,8 @@ def claim_task(session, lease_seconds: int) -> Task | None:
         Task.lease_expires_at >= now,
     ).limit(1))
     query = select(Task).join(Wave).where(available, Task.available_at <= now, Wave.status != "PAUSED")
+    if allowed_kinds is not None:
+        query = query.where(Task.kind.in_(allowed_kinds))
     if live_transfer:
         query = query.where(Task.kind != "TRANSFER_WAVE")
     task = session.scalar(query.order_by(Task.available_at, Task.id).with_for_update(skip_locked=True).limit(1))
@@ -191,7 +198,7 @@ def claim_task(session, lease_seconds: int) -> Task | None:
     task.state, task.worker_id = TaskState.RUNNING, WORKER_ID
     task.attempts += 1
     task.lease_expires_at = now + timedelta(seconds=lease_seconds)
-    event(session, "TASK_CLAIMED", f"Task {task.id} claimed by real worker", wave_id=task.wave_id)
+    event(session, "TASK_CLAIMED", f"Task {task.id} claimed by {WORKER_ROLE} worker", wave_id=task.wave_id)
     session.commit()
     return task
 
@@ -226,6 +233,20 @@ def succeed(session, task: Task, next_kind: str | None = None) -> None:
     task.state, task.lease_expires_at, task.error = TaskState.SUCCEEDED, None, None
     event(session, "TASK_SUCCEEDED", f"Real worker completed {task.kind}", wave_id=task.wave_id)
     session.commit()
+
+
+def ensure_transfer_task(session, wave: Wave) -> bool:
+    """Ensure one eligible transfer task exists while restore polling continues."""
+    existing = session.scalar(select(Task.id).where(
+        Task.wave_id == wave.id,
+        Task.kind == "TRANSFER_WAVE",
+        Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+    ).limit(1))
+    if existing:
+        return False
+    session.add(Task(wave_id=wave.id, kind="TRANSFER_WAVE"))
+    event(session, "TRANSFER_RELEASED", "Transfer task released for restored objects", source_id=wave.source_id, wave_id=wave.id)
+    return True
 
 
 def retry(session, task: Task, error: Exception | str, seconds: int | None = None) -> None:
@@ -714,6 +735,13 @@ def poll_restore(session, task: Task, settings) -> None:
     wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
     if pending:
         wave.status = "RESTORING"
+        ready_for_transfer = session.scalar(select(func.count(ObjectRecord.id)).where(
+            ObjectRecord.wave_id == wave.id,
+            ObjectRecord.state == ObjectState.RESTORED,
+        )) or 0
+        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
+            ensure_transfer_task(session, wave)
+            event(session, "RESTORE_PARTIALLY_AVAILABLE", f"{ready_for_transfer} restored object(s) released for transfer while {pending} remain unavailable", source_id=source.id, wave_id=wave.id)
         session.commit()
         retry(session, task, f"{pending} object(s) still unavailable after restore; checked with {poll_method}", min(1800, 300 + wave.poll_count * 60))
         return
@@ -721,7 +749,8 @@ def poll_restore(session, task: Task, settings) -> None:
     expiries = [expiry for expiry in ready_expiries.values() if expiry]
     expiry_text = f"; earliest temporary-copy expiry {min(expiries).isoformat()}" if expiries else ""
     event(session, "RESTORE_AVAILABLE", f"All wave objects are available for transfer; readiness checked with {poll_method}{expiry_text}", source_id=source.id, wave_id=wave.id)
-    succeed(session, task, "TRANSFER_WAVE")
+    ensure_transfer_task(session, wave)
+    succeed(session, task)
 
 
 DIRECT_SHA_LIMIT = 16 * 1024 * 1024
@@ -1041,8 +1070,16 @@ def transfer_wave(session, task: Task, settings) -> None:
         ObjectRecord.wave_id == wave.id,
         or_(ObjectRecord.delivery_integrity_status.is_(None), ObjectRecord.delivery_integrity_status != "OCI_ACCEPTED"),
     )) or 0
-    wave.status = "COMPLETED" if not remaining and not delivery_pending else "TRANSFERRED_WITH_ERRORS"
-    event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed and {delivery_pending} object(s) without OCI cryptographic delivery evidence.", source_id=source.id, wave_id=wave.id)
+    waiting_restore = session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.wave_id == wave.id,
+        ObjectRecord.state.in_([ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING]),
+    )) or 0
+    if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and waiting_restore:
+        wave.status = "RESTORING"
+        event(session, "PARTIAL_TRANSFER_COMPLETED", f"Transferred currently available objects; {waiting_restore} object(s) still await restore.", source_id=source.id, wave_id=wave.id)
+    else:
+        wave.status = "COMPLETED" if not remaining and not delivery_pending else "TRANSFERRED_WITH_ERRORS"
+        event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed and {delivery_pending} object(s) without OCI cryptographic delivery evidence.", source_id=source.id, wave_id=wave.id)
     succeed(session, task)
 
 
@@ -1121,18 +1158,30 @@ def verify_wave(session, task: Task) -> None:
     succeed(session, task)
 
 
-def run_once() -> None:
+def task_kinds_for_role(role: str) -> frozenset[str] | None:
+    if role == "governance":
+        return GOVERNANCE_TASK_KINDS
+    if role == "transfer":
+        return TRANSFER_TASK_KINDS
+    if role == "all":
+        return None
+    raise RuntimeError("RAIJIN_WORKER_ROLE must be governance, transfer, or all")
+
+
+def run_once(role: str = WORKER_ROLE) -> None:
     with SessionLocal() as session:
         settings = runtime_settings(session)
-        refresh_due_global_aws_pricing(session)
         if not settings.real_worker_enabled:
             return
+        allowed_task_kinds = task_kinds_for_role(role)
+        if role in {"governance", "all"}:
+            refresh_due_global_aws_pricing(session)
         # There is exactly one real worker per VM.  If it was interrupted while
         # discovery was running, its page checkpoint is already committed. Make
         # the source eligible again instead of leaving it permanently stuck in
         # DISCOVERING.  The unfinished active slice is intentionally not added
         # to elapsed time because a power loss makes its exact end unknowable.
-        interrupted = list(session.scalars(select(Source).where(Source.status == "DISCOVERING")))
+        interrupted = list(session.scalars(select(Source).where(Source.status == "DISCOVERING"))) if role in {"governance", "all"} else []
         for pending_source in interrupted:
             pending_source.status = "DISCOVERY_QUEUED"
             pending_source.discovery_started_at = None
@@ -1150,7 +1199,7 @@ def run_once() -> None:
             session.commit()
         # Upgrade compatibility: sources queued by releases before the
         # discovery queue existed become visible jobs on the next worker loop.
-        legacy_queued = list(session.scalars(select(Source).where(Source.status == "DISCOVERY_QUEUED")))
+        legacy_queued = list(session.scalars(select(Source).where(Source.status == "DISCOVERY_QUEUED"))) if role in {"governance", "all"} else []
         for queued_source in legacy_queued:
             exists = session.scalar(select(DiscoveryJob.id).where(
                 DiscoveryJob.source_id == queued_source.id,
@@ -1160,7 +1209,7 @@ def run_once() -> None:
                 session.add(DiscoveryJob(source_id=queued_source.id))
         if legacy_queued:
             session.commit()
-        discovery_job = claim_discovery_job(session, settings.task_lease_seconds)
+        discovery_job = claim_discovery_job(session, settings.task_lease_seconds) if role in {"governance", "all"} else None
         if discovery_job:
             source = session.get(Source, discovery_job.source_id)
             if not source or source.status != "DISCOVERY_QUEUED":
@@ -1183,7 +1232,7 @@ def run_once() -> None:
                 discovery_job.state, discovery_job.error, discovery_job.lease_expires_at, discovery_job.completed_at = TaskState.FAILED, source.discovery_error, None, finished_at
                 event(session, "DISCOVERY_FAILED", source.discovery_error, source_id=source.id); session.commit()
             return
-        task = claim_task(session, settings.task_lease_seconds)
+        task = claim_task(session, settings.task_lease_seconds, allowed_task_kinds)
         if not task: return
         try:
             if task.kind == "SUBMIT_BATCH_RESTORE": submit_restore(session, task, settings)

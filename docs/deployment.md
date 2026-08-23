@@ -50,7 +50,7 @@ Os formulários e indicadores principais possuem ícones `i` de ajuda contextual
 
 A navegação separa claramente os dois contextos: **Status** contém apenas saúde global, observabilidade e prontidão de integrações; **Queue** é a console de acompanhamento da migração, com atividade, fila durável de transferência, workers e auditorias profundas. A atualização automática configurável atua na tela Queue.
 
-Os parâmetros operacionais são persistidos no PostgreSQL. O **worker AWS/OCI real** é um container separado da API e fica inerte por padrão; somente depois da habilitação explícita ele assume discovery e tarefas duráveis de restore, polling e transferência. O worker de simulação é uma ferramenta de teste e nunca chama AWS ou OCI.
+Os parâmetros operacionais são persistidos no PostgreSQL. Dois containers reais ficam separados da API e inertes por padrão: o **worker de governança** assume discovery, restores Batch, polling, agendamento e auditorias; o **worker de transferência** assume somente cópia e retomada multipart. Ambos usam leases na mesma fila PostgreSQL e só operam após a habilitação explícita. O worker de simulação é uma ferramenta de teste e nunca chama AWS ou OCI.
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 

@@ -37,7 +37,7 @@ if [[ ! -s "$secret_root/postgres_password" ]]; then
 fi
 
 podman network exists s3-oci-migration 2>/dev/null || podman network create s3-oci-migration
-podman rm -f s3-oci-app s3-oci-postgres s3-oci-real-worker 2>/dev/null || true
+podman rm -f s3-oci-app s3-oci-postgres s3-oci-governance-worker s3-oci-transfer-worker s3-oci-real-worker 2>/dev/null || true
 
 podman run -d --name s3-oci-postgres --replace --restart unless-stopped \
   --network s3-oci-migration --network-alias postgres \
@@ -89,11 +89,25 @@ if [[ "$app_ready" != true ]]; then
   exit 1
 fi
 
-# Kept separate from the API: cloud calls are made only by this durable worker.
-# It remains idle until the operator explicitly enables it in the web console.
-podman run -d --name s3-oci-real-worker --replace --restart unless-stopped \
+# Kept separate from the API: governance owns discovery, Batch Operations,
+# restore polling and deep audits. It remains idle until explicitly enabled.
+podman run -d --name s3-oci-governance-worker --replace --restart unless-stopped \
   --network s3-oci-migration \
-  -e RAIJIN_WORKER_ID=raijin-real-worker-vm \
+  -e RAIJIN_WORKER_ID=raijin-governance-worker-vm \
+  -e RAIJIN_WORKER_ROLE=governance \
+  -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
+  -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
+  -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
+  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
+  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,z" \
+  localhost/s3-oci-migration:latest python3 -m app.real_worker
+
+# Transfer owns only file copy and multipart resume. A long object cannot
+# delay a restore poll, discovery checkpoint or scheduler decision.
+podman run -d --name s3-oci-transfer-worker --replace --restart unless-stopped \
+  --network s3-oci-migration \
+  -e RAIJIN_WORKER_ID=raijin-transfer-worker-vm \
+  -e RAIJIN_WORKER_ROLE=transfer \
   -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
@@ -111,7 +125,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/s3-oci-migration/release/scripts/bootstrap.sh
-ExecStop=/usr/bin/podman stop -t 30 s3-oci-app s3-oci-real-worker s3-oci-postgres
+ExecStop=/usr/bin/podman stop -t 30 s3-oci-app s3-oci-governance-worker s3-oci-transfer-worker s3-oci-postgres
 
 [Install]
 WantedBy=multi-user.target
