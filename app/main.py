@@ -718,9 +718,8 @@ class AutomaticWaveCreate(BaseModel):
 
 
 class DynamicWaveCreate(BaseModel):
-    """Create static waves packed by byte, object-count and predicted duration."""
+    """Create static waves packed by byte, object-count and a derived duration limit."""
     max_bytes: int = Field(gt=0, le=10 * 1024**4)
-    target_transfer_seconds: int = Field(ge=300, le=7 * 24 * 3600)
     max_objects: int = Field(ge=1, le=500000)
     restore_days: int = Field(ge=1, le=30)
     restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
@@ -753,7 +752,6 @@ class RuntimeSettingsUpdate(BaseModel):
     cost_estimation_enabled: bool = False
     cost_pricing_auto_refresh_enabled: bool = True
     cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
-    dynamic_wave_target_seconds: int = Field(default=12 * 3600, ge=300, le=7 * 24 * 3600)
     dynamic_wave_max_objects: int = Field(default=50000, ge=1, le=500000)
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
     dynamic_restore_horizon_waves: int = Field(default=2, ge=1, le=20)
@@ -1030,7 +1028,6 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "cost_pricing_refresh_days": settings.cost_pricing_refresh_days,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
             "activity_refresh_seconds": settings.activity_refresh_seconds,
-            "dynamic_wave_target_seconds": settings.dynamic_wave_target_seconds,
             "dynamic_wave_max_objects": settings.dynamic_wave_max_objects,
             "dynamic_restore_safety_seconds": settings.dynamic_restore_safety_seconds,
             "dynamic_restore_horizon_waves": settings.dynamic_restore_horizon_waves,
@@ -3311,6 +3308,19 @@ def predict_object_transfer_seconds(obj: ObjectRecord, settings: RuntimeSettings
     return max(.25, seconds), 0
 
 
+def automatic_dynamic_duration_limit(restore_days: int) -> tuple[int, int]:
+    """Derive a safe copy window from the requested restored-copy retention.
+
+    S3 Batch restore retention is specified in whole days.  We plan against
+    its guaranteed lower bound and reserve the larger of eight hours or 25%
+    for throughput variance, retries and a recoverable VM interruption.  The
+    operator never supplies this value: retention is the operational contract.
+    """
+    retention_seconds = restore_days * 24 * 3600
+    reserve_seconds = max(8 * 3600, math.ceil(retention_seconds * .25))
+    return max(300, retention_seconds - reserve_seconds), reserve_seconds
+
+
 def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_transfer_seconds: int,
                       max_objects: int, prefix: str = "") -> dict:
     """Build, but do not persist, deterministic groups for the dynamic planner."""
@@ -3580,11 +3590,12 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
 
 @app.get("/api/sources/{source_id}/waves/dynamic-preview")
 def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1024**4),
-                          target_transfer_seconds: int = Query(ge=300, le=7 * 24 * 3600),
                           max_objects: int = Query(ge=1, le=500000), prefix: str = Query(default="", max_length=1024),
+                          restore_days: int = Query(ge=1, le=30),
                           restore_tier: str = Query(default="BULK", pattern="^(BULK|STANDARD)$"),
                           session: Session = Depends(get_session)) -> dict:
     active_source_or_409(session, source_id)
+    target_transfer_seconds, reserve_seconds = automatic_dynamic_duration_limit(restore_days)
     result = dynamic_wave_plan(session, source_id, max_bytes, target_transfer_seconds, max_objects, prefix)
     plans = result["waves"]
     for plan in plans:
@@ -3595,6 +3606,8 @@ def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1
     return {
         "objects": sum(plan["object_count"] for plan in plans), "bytes": sum(plan["bytes"] for plan in plans),
         "estimated_waves": len(plans), "target_transfer_seconds": target_transfer_seconds,
+        "automatic_duration_reserve_seconds": reserve_seconds,
+        "restore_retention_seconds": restore_days * 24 * 3600,
         "max_objects": max_objects, "profiles": result["profiles"],
         "historical_samples": sum(value["samples"] for value in result["profiles"].values()),
         "forecast": {"pipeline_completion_at": (times[-1][1] + timedelta(seconds=plans[-1]["predicted_transfer_seconds"])) if times else utcnow(),
@@ -3613,12 +3626,13 @@ def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1
 @app.post("/api/sources/{source_id}/waves/dynamic", status_code=201)
 def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Session = Depends(get_session)) -> dict:
     source = active_source_or_409(session, source_id)
-    result = dynamic_wave_plan(session, source_id, payload.max_bytes, payload.target_transfer_seconds, payload.max_objects, payload.prefix)
+    target_transfer_seconds, reserve_seconds = automatic_dynamic_duration_limit(payload.restore_days)
+    result = dynamic_wave_plan(session, source_id, payload.max_bytes, target_transfer_seconds, payload.max_objects, payload.prefix)
     plans = result["waves"]
     if not plans:
         raise HTTPException(status_code=409, detail="No discovered objects match this dynamic-wave selection")
     if len(plans) > 10000:
-        raise HTTPException(status_code=422, detail="Dynamic plan exceeds the safety limit of 10000 waves. Increase the target size, time, or object limit.")
+        raise HTTPException(status_code=422, detail="Dynamic plan exceeds the safety limit of 10000 waves. Increase the data or object limit, or choose a longer restore retention.")
     for plan in plans:
         plan["restore_tier"] = payload.restore_tier
     if payload.schedule_restores and not result["settings"].dynamic_pipeline_enabled:
@@ -3628,7 +3642,7 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
     historical_samples = sum(value["samples"] for value in result["profiles"].values())
     run = DynamicPipelineRun(
         source_id=source.id, status="SCHEDULED" if schedule_restores else "PLANNED",
-        target_max_bytes=payload.max_bytes, target_transfer_seconds=payload.target_transfer_seconds,
+        target_max_bytes=payload.max_bytes, target_transfer_seconds=target_transfer_seconds,
         max_objects=payload.max_objects, restore_safety_seconds=result["settings"].dynamic_restore_safety_seconds,
         restore_days=payload.restore_days, restore_tier=payload.restore_tier,
         transfer_strategy=source.transfer_strategy, scheduled_restores=schedule_restores,
@@ -3654,7 +3668,7 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
                          source_id=source.id, wave_id=wave.id)
         created.append(wave)
     record_event(session, "DYNAMIC_WAVES_CREATED",
-                 f"Dynamic pipeline run {run.id} created {len(created)} wave(s); historical samples: {historical_samples}; restore scheduling {'enabled' if schedule_restores else 'not enabled'}",
+                 f"Dynamic pipeline run {run.id} created {len(created)} wave(s); automatic copy limit {target_transfer_seconds}s with {reserve_seconds}s retention reserve; historical samples: {historical_samples}; restore scheduling {'enabled' if schedule_restores else 'not enabled'}",
                  source_id=source.id)
     if schedule_restores:
         release_dynamic_restore_horizon(session, result["settings"])

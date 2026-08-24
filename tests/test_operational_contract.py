@@ -15,7 +15,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, Task, TaskState, Wave, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, Task, TaskState, Wave, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -324,9 +324,11 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     assert {"planner_mode", "pipeline_run_id", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
     assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "restore_horizon_waves", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
     assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves", "dynamic_pipeline_enabled"} <= set(RuntimeSettings.__table__.columns.keys())
-    payload = DynamicWaveCreate(max_bytes=1024, target_transfer_seconds=3600, max_objects=10,
+    payload = DynamicWaveCreate(max_bytes=1024, max_objects=10,
                                 restore_days=3, restore_tier="BULK")
-    assert payload.target_transfer_seconds == 3600
+    assert payload.restore_days == 3
+    assert automatic_dynamic_duration_limit(1) == (16 * 3600, 8 * 3600)
+    assert automatic_dynamic_duration_limit(2) == (36 * 3600, 12 * 3600)
 
 
 def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
