@@ -13,6 +13,14 @@ de fazer** e **como ela organiza a operação**.
   Secrets OCI com JSON versionado e um rótulo local imutável.
 - Vincula várias fontes S3 a uma conexão AWS; cada conexão usa seu bucket de
   controle e prefixos gerados pelo RAIJIN para não misturar manifestos.
+- Permite vários prefixes independentes em uma única source, mas impede que
+  fontes ativas do mesmo bucket tenham escopos iguais ou sobrepostos. A regra
+  usa a semântica literal do S3 (`app/` também cobre `app/images/`) e evita
+  discovery, restore e transferência duplicados. Sources arquivadas não
+  bloqueiam um novo cadastro.
+- Oferece **Modo de laboratório** como exceção explícita para testes
+  controlados de escopos sobrepostos; enquanto ativo, a console mantém um
+  banner vermelho persistente e registra a exceção no histórico operacional.
 - Descobre objetos por API S3 paginada, com checkpoint, retomada, limitação de
   requisições por conexão e acompanhamento em fila durável.
 - Importa CSV/GZIP ou `manifest.json` do S3 Inventory para evitar chamadas de
@@ -93,6 +101,8 @@ recuperação de leases, Secrets, pré-check e tarifas públicas.
 
 1. Cadastre uma conexão AWS baseada em um Secret OCI compatível.
 2. Cadastre a source, selecionando a conexão e o bucket OCI de destino.
+   Prefixes pertencentes à mesma source podem ser informados em conjunto; não
+   crie sources ativas que se cruzem no mesmo bucket.
 3. Execute discovery por API ou importe o S3 Inventory.
 4. Revise inventário, estimativas e crie waves manualmente ou pelo pipeline
    dinâmico.

@@ -15,7 +15,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -59,6 +59,26 @@ def test_source_scope_supports_multiple_non_overlapping_prefixes():
         assert source_key_in_scope(source, "Smoke_test/file.bin")
         assert source_key_in_scope(source, "Operational_test/file.bin")
         assert not source_key_in_scope(source, "Resilience_test/file.bin")
+
+
+def test_active_sources_cannot_silently_share_an_s3_prefix_scope():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        parent = Source(name="parent", s3_bucket="shared", aws_region="us-east-1", destination_bucket="destination")
+        child = Source(name="child", s3_bucket="shared", aws_region="us-east-1", destination_bucket="destination")
+        archived = Source(name="archived", s3_bucket="shared", aws_region="us-east-1", destination_bucket="destination", archived_at=datetime.now(timezone.utc))
+        session.add_all([parent, child, archived]); session.flush()
+        session.add_all([
+            SourcePrefix(id=20, source_id=parent.id, prefix="app/"),
+            SourcePrefix(id=21, source_id=child.id, prefix="other/"),
+            SourcePrefix(id=22, source_id=archived.id, prefix="app/images/"),
+        ])
+        session.flush()
+        conflicts = active_source_scope_conflicts(session, "shared", ["app/images/archives/"], child.id)
+        assert [(item["source_name"], item["existing_prefix"]) for item in conflicts] == [("parent", "app/")]
+        assert not active_source_scope_conflicts(session, "shared", ["unrelated/"], child.id)
 
 
 def test_transfer_strategy_locks_when_a_wave_enters_the_pipeline():
@@ -346,6 +366,8 @@ def test_multipart_size_runtime_setting_has_safe_bounds():
     }
     assert RuntimeSettingsUpdate(**payload).multipart_part_size_mib == 64
     assert RuntimeSettingsUpdate(**payload).cost_estimation_enabled is False
+    assert RuntimeSettingsUpdate(**payload).laboratory_mode_enabled is False
+    assert "laboratory_mode_enabled" in RuntimeSettings.__table__.columns
     with pytest.raises(ValidationError):
         RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 15}))
     with pytest.raises(ValidationError):

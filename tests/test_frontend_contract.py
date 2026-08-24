@@ -175,6 +175,14 @@ def test_all_confirmation_questions_use_the_raijin_modal_instead_of_browser_conf
     assert page.count("await ask(") >= 14
 
 
+def test_laboratory_mode_and_discovery_origin_are_visible_and_explicit():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="set-laboratory-mode"' in page
+    assert 'id="laboratory-mode-banner"' in page
+    assert "syncLaboratoryModeBanner" in page
+    assert "Discovery: ${escape(discoveryModeLabel(discovery.mode))}" in page
+
+
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="cost-pricing-modal"' in page

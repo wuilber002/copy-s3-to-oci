@@ -623,6 +623,9 @@ class RuntimeSettings(Base):
     dynamic_restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=6 * 3600)
     dynamic_restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=2)
     dynamic_pipeline_enabled: Mapped[bool] = mapped_column(default=False)
+    # A deliberate, highly visible exception for demonstrations and controlled
+    # validation.  Production keeps source S3 scopes mutually exclusive.
+    laboratory_mode_enabled: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -666,6 +669,44 @@ def source_prefix_values(source: Source) -> list[str]:
 
 def source_key_in_scope(source: Source, object_key: str) -> bool:
     return any(not prefix or object_key.startswith(prefix) for prefix in source_prefix_values(source))
+
+
+def s3_prefixes_overlap(left: str, right: str) -> bool:
+    """Whether two normalized S3 prefix scopes can address the same key."""
+    return not left or not right or left.startswith(right) or right.startswith(left)
+
+
+def active_source_scope_conflicts(session: Session, bucket: str, prefixes: list[str],
+                                  exclude_source_id: int | None = None) -> list[dict]:
+    """Find active sources whose S3 scope intersects the requested scope.
+
+    S3 has no folder boundary: ``app`` also includes ``app-images``.  The
+    comparison intentionally follows S3's literal prefix semantics instead of
+    inventing path semantics, so no object can be discovered twice unnoticed.
+    """
+    query = select(Source).where(Source.s3_bucket == bucket, Source.archived_at.is_(None))
+    if exclude_source_id is not None:
+        query = query.where(Source.id != exclude_source_id)
+    conflicts: list[dict] = []
+    for source in session.scalars(query):
+        for requested in prefixes:
+            for existing in source_prefix_values(source):
+                if s3_prefixes_overlap(requested, existing):
+                    conflicts.append({"source_id": source.id, "source_name": source.name,
+                                      "requested_prefix": requested, "existing_prefix": existing})
+    return conflicts
+
+
+def require_non_overlapping_source_scope(session: Session, source: Source) -> None:
+    """Block new operational work for an ambiguous active source scope."""
+    conflicts = active_source_scope_conflicts(session, source.s3_bucket, source_prefix_values(source), source.id)
+    if conflicts and not runtime_settings(session).laboratory_mode_enabled:
+        names = ", ".join(sorted({item["source_name"] for item in conflicts}))
+        raise HTTPException(
+            status_code=409,
+            detail=(f"S3 scope overlaps active source(s): {names}. Archive the conflicting source or enable "
+                    "Laboratory mode only for a controlled test."),
+        )
 
 
 class SourceCreate(BaseModel):
@@ -806,6 +847,7 @@ class RuntimeSettingsUpdate(BaseModel):
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
     dynamic_restore_horizon_waves: int = Field(default=2, ge=1, le=20)
     dynamic_pipeline_enabled: bool = False
+    laboratory_mode_enabled: bool = False
 
 
 class ActivityRefreshSettingsUpdate(BaseModel):
@@ -890,6 +932,7 @@ def create_schema() -> None:
         "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
         "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2",
         "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "laboratory_mode_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
@@ -1086,6 +1129,7 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "dynamic_restore_safety_seconds": settings.dynamic_restore_safety_seconds,
             "dynamic_restore_horizon_waves": settings.dynamic_restore_horizon_waves,
             "dynamic_pipeline_enabled": settings.dynamic_pipeline_enabled,
+            "laboratory_mode_enabled": settings.laboratory_mode_enabled,
             "updated_at": settings.updated_at}
 
 
@@ -2430,7 +2474,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
                                         "missing": s.destination_missing_count, "size_mismatches": s.destination_size_mismatch_count},
              "migration_status": migration_status(s), "can_delete": not source_has_executed_wave(session, s.id),
-             "transfer_strategy_locked": s.id in strategy_locked_ids}
+             "transfer_strategy_locked": s.id in strategy_locked_ids,
+             "scope_conflicts": active_source_scope_conflicts(session, s.s3_bucket, source_prefix_values(s), s.id)}
             for s in sources]
 
 
@@ -2449,6 +2494,12 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
         if payload.aws_region != connection.default_region:
             raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
     prefixes = normalize_source_prefixes(payload.s3_prefixes, payload.s3_prefix)
+    conflicts = active_source_scope_conflicts(session, payload.s3_bucket, prefixes)
+    if conflicts and not runtime_settings(session).laboratory_mode_enabled:
+        names = ", ".join(sorted({item["source_name"] for item in conflicts}))
+        raise HTTPException(status_code=409, detail=(
+            f"S3 prefix scope overlaps active source(s): {names}. Archive the conflicting source or remove the overlapping prefix."
+        ))
     source_data = payload.model_dump(exclude={"s3_prefixes"})
     source_data["s3_prefix"] = prefixes[0]
     source = Source(**source_data)
@@ -2456,6 +2507,8 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
     session.flush()
     session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
     record_event(session, "SOURCE_CREATED", f"Source '{source.name}' configured", source_id=source.id)
+    if conflicts:
+        record_event(session, "SOURCE_SCOPE_OVERLAP_ALLOWED", f"Laboratory mode allowed S3 scope overlap with {', '.join(sorted({item['source_name'] for item in conflicts}))}", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
 
@@ -2479,12 +2532,20 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
         if payload.aws_region != connection.default_region:
             raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
     prefixes = normalize_source_prefixes(payload.s3_prefixes, payload.s3_prefix)
+    conflicts = active_source_scope_conflicts(session, payload.s3_bucket, prefixes, source_id)
+    if conflicts and not runtime_settings(session).laboratory_mode_enabled:
+        names = ", ".join(sorted({item["source_name"] for item in conflicts}))
+        raise HTTPException(status_code=409, detail=(
+            f"S3 prefix scope overlaps active source(s): {names}. Archive the conflicting source or remove the overlapping prefix."
+        ))
     for field, value in payload.model_dump(exclude={"s3_prefixes"}).items():
         setattr(source, field, value)
     source.s3_prefix = prefixes[0]
     session.query(SourcePrefix).filter(SourcePrefix.source_id == source.id).delete(synchronize_session=False)
     session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
+    if conflicts:
+        record_event(session, "SOURCE_SCOPE_OVERLAP_ALLOWED", f"Laboratory mode allowed S3 scope overlap with {', '.join(sorted({item['source_name'] for item in conflicts}))}", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
 
@@ -2755,6 +2816,7 @@ def archive_source(source_id: int, session: Session = Depends(get_session)) -> d
 @app.post("/api/sources/{source_id}/inventory/import", status_code=201)
 def import_inventory(source_id: int, payload: InventoryImport, session: Session = Depends(get_session)) -> dict:
     source = active_source_or_409(session, source_id)
+    require_non_overlapping_source_scope(session, source)
     inserted = skipped_out_of_scope = 0
     for item in payload.items:
         if not source_key_in_scope(source, item.object_key):
@@ -2795,6 +2857,7 @@ def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...)
     file be parsed in bounded batches directly on the VM.
     """
     source = active_source_or_409(session, source_id)
+    require_non_overlapping_source_scope(session, source)
     if not rediscovery and session.scalar(select(Wave.id).where(Wave.source_id == source_id)):
         raise HTTPException(status_code=409, detail="Inventory file import is immutable after waves are created")
     if not rediscovery and session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source_id).limit(1)):
@@ -2887,6 +2950,7 @@ def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...)
 
 def queue_discovery(source: Source, session: Session, *, mode: str = "REMOTE_LIST", manifest_uri: str | None = None,
                     rediscovery: bool = False, justification: str | None = None) -> DiscoveryJob:
+    require_non_overlapping_source_scope(session, source)
     if source.status == "DISCOVERING":
         raise HTTPException(status_code=409, detail="Discovery already running for this source")
     if not rediscovery and session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source.id)):
@@ -3535,6 +3599,7 @@ def preview_automatic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 *
 @app.post("/api/sources/{source_id}/waves", status_code=201)
 def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(get_session)) -> dict:
     source = active_source_or_409(session, source_id)
+    require_non_overlapping_source_scope(session, source)
     if session.scalar(select(Wave).where(Wave.source_id == source_id, Wave.name == payload.name)):
         raise HTTPException(status_code=409, detail="Wave name already exists for this source")
     objects, oversized = next_wave_objects(session, source_id, payload.max_bytes)
@@ -3550,6 +3615,7 @@ def create_wave(source_id: int, payload: WaveCreate, session: Session = Depends(
 @app.post("/api/sources/{source_id}/waves/automatic", status_code=201)
 def create_automatic_waves(source_id: int, payload: AutomaticWaveCreate, session: Session = Depends(get_session)) -> dict:
     source = active_source_or_409(session, source_id)
+    require_non_overlapping_source_scope(session, source)
     preview = preview_automatic_waves(source_id, payload.max_bytes, payload.prefix, session)
     if not preview["objects"]:
         raise HTTPException(status_code=409, detail="No discovered objects match this automatic-wave selection")
@@ -3730,6 +3796,7 @@ def preview_dynamic_waves(source_id: int, prefix: str = Query(default="", max_le
 @app.post("/api/sources/{source_id}/waves/dynamic", status_code=201)
 def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Session = Depends(get_session)) -> dict:
     source = active_source_or_409(session, source_id)
+    require_non_overlapping_source_scope(session, source)
     target_transfer_seconds, reserve_seconds = automatic_dynamic_duration_limit(payload.restore_days)
     result = dynamic_wave_plan(session, source_id, DYNAMIC_PLATFORM_MAX_BYTES, target_transfer_seconds,
                                DYNAMIC_PLATFORM_MAX_OBJECTS, payload.prefix)
