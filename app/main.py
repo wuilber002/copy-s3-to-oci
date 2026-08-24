@@ -33,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
 from sqlalchemy.engine import URL
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
 
 
@@ -2603,22 +2604,51 @@ def active_source_or_409(session: Session, source_id: int) -> Source:
     return source
 
 
+def delete_unexecuted_source_data(session: Session, source_id: int) -> dict[str, int]:
+    """Delete an unexecuted source in foreign-key-safe dependency order.
+
+    A source that has never executed a wave is a preview/plan, not audit
+    evidence.  It is therefore removable together with its durable discovery
+    queue entries, planned waves and local observations.  The explicit order
+    also makes this safe for PostgreSQL installations that enforce every FK.
+    """
+    wave_ids = list(session.scalars(select(Wave.id).where(Wave.source_id == source_id)))
+    attempt_ids = list(session.scalars(select(RestoreAttempt.id).where(RestoreAttempt.wave_id.in_(wave_ids)))) if wave_ids else []
+    deleted: dict[str, int] = {}
+    deleted["events"] = session.query(Event).filter(
+        (Event.source_id == source_id) | (Event.wave_id.in_(wave_ids) if wave_ids else False)
+    ).delete(synchronize_session=False)
+    if attempt_ids:
+        deleted["restore_results"] = session.query(RestoreObjectResult).filter(RestoreObjectResult.attempt_id.in_(attempt_ids)).delete(synchronize_session=False)
+        deleted["restore_attempts"] = session.query(RestoreAttempt).filter(RestoreAttempt.id.in_(attempt_ids)).delete(synchronize_session=False)
+    else:
+        deleted["restore_results"], deleted["restore_attempts"] = 0, 0
+    deleted["tasks"] = session.query(Task).filter(Task.wave_id.in_(wave_ids)).delete(synchronize_session=False) if wave_ids else 0
+    # Changes may point at a successor object revision, so they must be
+    # removed before the inventory objects themselves.
+    deleted["discovery_changes"] = session.query(DiscoveryChange).filter(DiscoveryChange.source_id == source_id).delete(synchronize_session=False)
+    deleted["objects"] = session.query(ObjectRecord).filter(ObjectRecord.source_id == source_id).delete(synchronize_session=False)
+    deleted["waves"] = session.query(Wave).filter(Wave.source_id == source_id).delete(synchronize_session=False)
+    deleted["pipeline_runs"] = session.query(DynamicPipelineRun).filter(DynamicPipelineRun.source_id == source_id).delete(synchronize_session=False)
+    deleted["discovery_jobs"] = session.query(DiscoveryJob).filter(DiscoveryJob.source_id == source_id).delete(synchronize_session=False)
+    return deleted
+
+
 @app.delete("/api/sources/{source_id}")
 def delete_source(source_id: int, session: Session = Depends(get_session)) -> dict:
     source = source_or_404(session, source_id)
     if source_has_executed_wave(session, source_id):
         raise HTTPException(status_code=409, detail="This source has an executed wave and must be archived, not deleted")
-    wave_ids = list(session.scalars(select(Wave.id).where(Wave.source_id == source_id)))
-    if wave_ids:
-        session.query(Event).filter((Event.source_id == source_id) | (Event.wave_id.in_(wave_ids))).delete(synchronize_session=False)
-        session.query(Task).filter(Task.wave_id.in_(wave_ids)).delete(synchronize_session=False)
-    else:
-        session.query(Event).filter(Event.source_id == source_id).delete(synchronize_session=False)
-    session.query(ObjectRecord).filter(ObjectRecord.source_id == source_id).delete(synchronize_session=False)
-    session.query(Wave).filter(Wave.source_id == source_id).delete(synchronize_session=False)
-    session.delete(source)
-    session.commit()
-    return {"id": source_id, "deleted": True}
+    try:
+        deleted = delete_unexecuted_source_data(session, source_id)
+        session.delete(source)
+        session.commit()
+    except IntegrityError as error:
+        session.rollback()
+        # Do not expose a raw database exception to the browser.  The source
+        # remains untouched because the transaction was rolled back.
+        raise HTTPException(status_code=409, detail="The source could not be deleted because it still has protected operational records. Refresh the source and archive it if a wave was executed.") from error
+    return {"id": source_id, "deleted": True, "removed": deleted}
 
 
 @app.post("/api/sources/{source_id}/archive")

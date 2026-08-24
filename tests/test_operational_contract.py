@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import sessionmaker
 
 
 _password = Path("/tmp/raijin-test-password-contract")
@@ -13,7 +15,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, Task, TaskState, Wave, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -89,6 +91,38 @@ def test_modified_source_reprocessing_creates_an_eligible_successor_revision():
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     assert "Preparar nova transferência" in page
     assert "reprocessModifiedDiscoveryObjects" in page
+
+
+def test_deleting_an_unexecuted_source_removes_all_derived_records_in_order():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(name="delete-preview", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        session.add(source); session.flush()
+        # SQLite only auto-increments an exact INTEGER primary key; production
+        # uses PostgreSQL sequences for these BIGINT identifiers.
+        job = DiscoveryJob(id=100, source_id=source.id)
+        run = DynamicPipelineRun(id=101, source_id=source.id)
+        session.add_all([job, run]); session.flush()
+        wave = Wave(id=102, source_id=source.id, pipeline_run_id=run.id, name="planned", max_bytes=1, restore_days=1, restore_tier="BULK")
+        session.add(wave); session.flush()
+        obj = ObjectRecord(id=103, source_id=source.id, object_key="key", size_bytes=1, wave_id=wave.id, state=ObjectState.WAVE_ASSIGNED)
+        session.add(obj); session.flush()
+        attempt = RestoreAttempt(id=104, wave_id=wave.id, aws_region="us-east-1")
+        session.add(attempt); session.flush()
+        session.add_all([
+            RestoreObjectResult(id=105, attempt_id=attempt.id, object_id=obj.id), Task(id=106, wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"),
+            DiscoveryChange(id=107, source_id=source.id, discovery_job_id=job.id, object_key="key"),
+            Event(id=108, source_id=source.id, wave_id=wave.id, kind="TEST", message="preview"),
+        ])
+        session.commit()
+        deleted = delete_unexecuted_source_data(session, source.id)
+        session.delete(source); session.commit()
+        assert deleted["discovery_jobs"] == 1
+        assert deleted["objects"] == 1
+        assert session.scalar(select(Source.id).where(Source.id == source.id)) is None
+        assert session.scalar(select(DiscoveryJob.id).where(DiscoveryJob.source_id == source.id)) is None
 
 
 def test_frontend_marks_rediscovery_as_a_controlled_operation():
