@@ -29,7 +29,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy import func, or_, select
 
 from app.main import (
-    AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows,
+    AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows, source_key_in_scope, source_prefix_values,
     DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
 )
 
@@ -369,7 +369,7 @@ def import_s3_inventory_manifest(session, source: Source, settings, job: Discove
                     continue
                 processed_since_checkpoint += 1
                 key = unquote((row.get("Key") or "").strip())
-                if key and (not source.s3_prefix or key.startswith(source.s3_prefix)):
+                if key and source_key_in_scope(source, key):
                     try:
                         size = int(row.get("Size") or 0)
                     except ValueError:
@@ -409,6 +409,8 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
     s3, _, _ = aws_clients(settings, source.aws_region, source)
     inserted = 0
     continuation_token = source.discovery_continuation_token
+    prefixes = source_prefix_values(source)
+    prefix_index = min(max(0, int(source.discovery_prefix_index or 0)), len(prefixes))
     pending_rows: list[dict] = []
     pending_pages = 0
     pending_token = continuation_token
@@ -433,14 +435,15 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
         source.discovery_pages_completed += pending_pages
         source.discovery_objects_inserted += (inserted - source.discovery_objects_inserted) if job and job.is_rediscovery else len(pending_rows)
         source.discovery_continuation_token = pending_token
+        source.discovery_prefix_index = prefix_index
         if job:
             job.lease_expires_at = utcnow() + timedelta(seconds=max(settings.task_lease_seconds, 300))
         session.commit()
         pending_rows.clear()
         pending_pages = 0
 
-    while True:
-        request = {"Bucket": source.s3_bucket, "Prefix": source.s3_prefix, "MaxKeys": DISCOVERY_MAX_KEYS}
+    while prefix_index < len(prefixes):
+        request = {"Bucket": source.s3_bucket, "Prefix": prefixes[prefix_index], "MaxKeys": DISCOVERY_MAX_KEYS}
         if continuation_token:
             request["ContinuationToken"] = continuation_token
         throttle_attempt = 0
@@ -473,15 +476,16 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
         } for item in items)
         pending_pages += 1
         continuation_token = page.get("NextContinuationToken")
+        if not continuation_token:
+            prefix_index += 1
         pending_token = continuation_token
         if pending_pages >= DISCOVERY_CHECKPOINT_PAGES or not continuation_token:
             checkpoint_batch()
-        if not continuation_token:
-            break
     finished_at = utcnow()
     if source.discovery_started_at:
         source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
     source.discovery_started_at = None
+    source.discovery_continuation_token, source.discovery_prefix_index = None, 0
     source.status, source.discovery_completed_at = "DISCOVERED", finished_at
     source.last_discovery_mode, source.discovery_generation = "REMOTE_LIST", int(source.discovery_generation or 0) + 1
     if job:

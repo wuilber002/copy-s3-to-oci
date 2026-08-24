@@ -31,7 +31,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, case, create_engine, func, inspect, or_, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
@@ -135,6 +135,8 @@ class Source(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(128), unique=True)
     s3_bucket: Mapped[str] = mapped_column(String(255))
+    # Kept as the canonical first prefix for compatibility with prior reports.
+    # New sources use the normalized ``source_prefixes`` table below.
     s3_prefix: Mapped[str] = mapped_column(String(1024), default="")
     aws_region: Mapped[str] = mapped_column(String(64))
     aws_bucket_region: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -156,6 +158,8 @@ class Source(Base):
     # is deliberately an AWS continuation token, not a key, so S3 remains the
     # authority on the exact next page after an interrupted discovery.
     discovery_continuation_token: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # A multi-prefix scan resumes both its S3 token and the prefix being read.
+    discovery_prefix_index: Mapped[int] = mapped_column(Integer, default=0)
     discovery_pages_completed: Mapped[int] = mapped_column(Integer, default=0)
     discovery_objects_inserted: Mapped[int] = mapped_column(BigInteger, default=0)
     # The data origin is operational evidence, not presentation-only state.
@@ -174,6 +178,7 @@ class Source(Base):
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="source")
     waves: Mapped[list[Wave]] = relationship(back_populates="source")
     aws_connection: Mapped["AwsConnection | None"] = relationship(back_populates="sources")
+    prefixes: Mapped[list["SourcePrefix"]] = relationship(back_populates="source", cascade="all, delete-orphan")
 
 
 class AwsConnection(Base):
@@ -621,10 +626,56 @@ class RuntimeSettings(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
+class SourcePrefix(Base):
+    """One durable S3 prefix belonging to a source migration scope."""
+    __tablename__ = "source_prefixes"
+    __table_args__ = (UniqueConstraint("source_id", "prefix", name="uq_source_prefixes_source_prefix"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
+    prefix: Mapped[str] = mapped_column(String(1024), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    source: Mapped[Source] = relationship(back_populates="prefixes")
+
+
+def normalize_source_prefixes(prefixes: list[str] | None, legacy_prefix: str = "") -> list[str]:
+    """Return a stable, non-overlapping source scope.
+
+    Multiple prefixes are a union, never an instruction to repeatedly scan the
+    same key.  Reject overlapping values inside one source because that would
+    duplicate discovery, restore and transfer work.  Different test sources
+    may intentionally overlap; the UI makes that operational risk explicit.
+    """
+    values = prefixes if prefixes else [legacy_prefix]
+    normalized = sorted({str(value or "").strip().lstrip("/") for value in values})
+    if not normalized:
+        return [""]
+    if "" in normalized and len(normalized) > 1:
+        raise HTTPException(status_code=422, detail="A whole-bucket scope cannot be combined with other S3 prefixes")
+    for index, prefix in enumerate(normalized):
+        for other in normalized[index + 1:]:
+            if other.startswith(prefix):
+                raise HTTPException(status_code=422, detail=f"Overlapping S3 prefixes are not allowed in the same source: '{prefix}' and '{other}'")
+    return normalized
+
+
+def source_prefix_values(source: Source) -> list[str]:
+    values = [row.prefix for row in source.prefixes]
+    return normalize_source_prefixes(values, source.s3_prefix)
+
+
+def source_key_in_scope(source: Source, object_key: str) -> bool:
+    return any(not prefix or object_key.startswith(prefix) for prefix in source_prefix_values(source))
+
+
 class SourceCreate(BaseModel):
     name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$")
     s3_bucket: str
+    # ``s3_prefix`` remains accepted for API compatibility; new callers use
+    # the normalized list and may provide as many independent prefixes as
+    # needed for one source scope.
     s3_prefix: str = ""
+    s3_prefixes: list[str] = Field(default_factory=list, max_length=1000)
     aws_region: str
     aws_connection_id: int | None = None
     destination_bucket: str
@@ -840,7 +891,7 @@ def create_schema() -> None:
         "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2",
         "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
@@ -933,6 +984,11 @@ def create_schema() -> None:
     # run per source. Their existing plans, object timestamps and task/event
     # history remain authoritative; this only creates the missing grouping.
     with SessionLocal() as session:
+        # Existing single-prefix sources are adopted as a one-row normalized
+        # scope without changing their source identity or audit records.
+        for source in session.scalars(select(Source)):
+            if not source.prefixes:
+                session.add(SourcePrefix(source_id=source.id, prefix=source.s3_prefix or ""))
         legacy_source_ids = list(session.scalars(select(Wave.source_id).where(
             Wave.planner_mode == "DYNAMIC", Wave.pipeline_run_id.is_(None)
         ).distinct()))
@@ -2361,6 +2417,7 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
             return "AWAITING_INTEGRITY_VERIFICATION"
         return "IN_PROGRESS" if total else "NOT_STARTED"
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
+             "s3_prefixes": source_prefix_values(s),
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "transfer_strategy": s.transfer_strategy, "status": s.status,
              "aws_bucket_region": s.aws_bucket_region,
              "aws_connection_id": s.aws_connection_id,
@@ -2391,9 +2448,13 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
             raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by new sources")
         if payload.aws_region != connection.default_region:
             raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
-    source = Source(**payload.model_dump())
+    prefixes = normalize_source_prefixes(payload.s3_prefixes, payload.s3_prefix)
+    source_data = payload.model_dump(exclude={"s3_prefixes"})
+    source_data["s3_prefix"] = prefixes[0]
+    source = Source(**source_data)
     session.add(source)
     session.flush()
+    session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
     record_event(session, "SOURCE_CREATED", f"Source '{source.name}' configured", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
@@ -2417,8 +2478,12 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
             raise HTTPException(status_code=409, detail="Archived AWS connections cannot be used by sources")
         if payload.aws_region != connection.default_region:
             raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
-    for field, value in payload.model_dump().items():
+    prefixes = normalize_source_prefixes(payload.s3_prefixes, payload.s3_prefix)
+    for field, value in payload.model_dump(exclude={"s3_prefixes"}).items():
         setattr(source, field, value)
+    source.s3_prefix = prefixes[0]
+    session.query(SourcePrefix).filter(SourcePrefix.source_id == source.id).delete(synchronize_session=False)
+    session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
@@ -2689,9 +2754,12 @@ def archive_source(source_id: int, session: Session = Depends(get_session)) -> d
 
 @app.post("/api/sources/{source_id}/inventory/import", status_code=201)
 def import_inventory(source_id: int, payload: InventoryImport, session: Session = Depends(get_session)) -> dict:
-    active_source_or_409(session, source_id)
-    inserted = 0
+    source = active_source_or_409(session, source_id)
+    inserted = skipped_out_of_scope = 0
     for item in payload.items:
+        if not source_key_in_scope(source, item.object_key):
+            skipped_out_of_scope += 1
+            continue
         duplicate = session.scalar(select(ObjectRecord.id).where(
             ObjectRecord.source_id == source_id,
             ObjectRecord.object_key == item.object_key,
@@ -2701,9 +2769,10 @@ def import_inventory(source_id: int, payload: InventoryImport, session: Session 
             continue
         session.add(ObjectRecord(source_id=source_id, **item.model_dump()))
         inserted += 1
-    record_event(session, "INVENTORY_IMPORTED", f"Imported {inserted} inventory record(s); skipped {len(payload.items) - inserted} duplicate(s)", source_id=source_id)
+    duplicates = len(payload.items) - inserted - skipped_out_of_scope
+    record_event(session, "INVENTORY_IMPORTED", f"Imported {inserted} inventory record(s); skipped {duplicates} duplicate(s) and {skipped_out_of_scope} out-of-scope record(s)", source_id=source_id)
     session.commit()
-    return {"inserted": inserted, "skipped_duplicates": len(payload.items) - inserted}
+    return {"inserted": inserted, "skipped_duplicates": duplicates, "skipped_out_of_scope": skipped_out_of_scope}
 
 
 def inventory_file_value(row: dict[str, str], *names: str) -> str | None:
@@ -2749,6 +2818,8 @@ def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...)
             size = inventory_file_value(row, "size_bytes", "size")
             if not key or size is None:
                 raise HTTPException(status_code=422, detail=f"Inventory row {line_number} requires object_key/Key and size_bytes/Size")
+            if not source_key_in_scope(source, key):
+                continue
             try:
                 size_bytes = int(size)
             except ValueError as error:
@@ -2841,6 +2912,7 @@ def queue_discovery(source: Source, session: Session, *, mode: str = "REMOTE_LIS
     source.discovery_error = None
     if not resume:
         source.discovery_continuation_token = None
+        source.discovery_prefix_index = 0
         source.discovery_pages_completed = 0
         source.discovery_objects_inserted = 0
         source.discovery_started_at = None
@@ -3025,7 +3097,7 @@ def source_report(source_id: int, session: Session = Depends(get_session)) -> di
                       "restore": timing, "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
                       "planned_restore_at": wave.planned_restore_at, "planned_transfer_start_at": wave.planned_transfer_start_at})
     return {"source": {"id": source.id, "name": source.name, "s3_bucket": source.s3_bucket,
-                        "s3_prefix": source.s3_prefix, "aws_region": source.aws_region,
+                        "s3_prefix": source.s3_prefix, "s3_prefixes": source_prefix_values(source), "aws_region": source.aws_region,
                         "destination_bucket": source.destination_bucket, "transfer_strategy": source.transfer_strategy},
             "generated_at": utcnow(), "waves": items}
 
@@ -3082,17 +3154,18 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
             raise RuntimeError("OCI namespace is not configured")
         client = oci.object_storage.ObjectStorageClient({}, signer=oci.auth.signers.InstancePrincipalsSecurityTokenSigner())
         found: dict[str, int] = {}
-        start = None
-        while True:
-            arguments = {"prefix": source.s3_prefix, "limit": 1000, "fields": "name,size"}
-            if start:
-                arguments["start"] = start
-            response = client.list_objects(namespace, source.destination_bucket, **arguments).data
-            for item in response.objects:
-                found[item.name] = int(item.size)
-            start = response.next_start_with
-            if not start:
-                break
+        for prefix in source_prefix_values(source):
+            start = None
+            while True:
+                arguments = {"prefix": prefix, "limit": 1000, "fields": "name,size"}
+                if start:
+                    arguments["start"] = start
+                response = client.list_objects(namespace, source.destination_bucket, **arguments).data
+                for item in response.objects:
+                    found[item.name] = int(item.size)
+                start = response.next_start_with
+                if not start:
+                    break
     except Exception as error:
         source.destination_validation_at, source.destination_validation_status = utcnow(), "FAILED"
         record_event(session, "DESTINATION_VALIDATION_FAILED", f"OCI destination validation failed: {type(error).__name__}", source_id=source.id)
