@@ -50,6 +50,9 @@ Ela não executa chamadas AWS ou OCI a partir do navegador. O container **Worker
 
 Consulte [arquitetura](docs/architecture.md), [deploy](docs/deployment.md), [IAM AWS](docs/aws-setup.md), [IAM OCI](docs/oci-iam.md), [conexões AWS](docs/aws-connections.md), [estimativas de custo](docs/cost-estimates.md), [plano de validação](docs/validation-test-plan.md), [teste de objetos grandes](docs/large-object-test-runbook.md), [recuperação](docs/recovery-runbook.md) e [cleanup controlado de testes](docs/test-cleanup.md).
 
+Para uma visão consolidada e mantida das capacidades e do modo de operação da
+plataforma, consulte [Capacidades e operação do RAIJIN](docs/capabilities.md).
+
 ## Uso da console web
 
 Crie um túnel SSH até a VM e mantenha o terminal aberto:
