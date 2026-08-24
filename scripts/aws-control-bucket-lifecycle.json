@@ -1,0 +1,11 @@
+{
+  "Rules": [
+    {
+      "ID": "raijin-control-artifacts-retention",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "raijin/"},
+      "Expiration": {"Days": 90},
+      "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}
+    }
+  ]
+}

@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, CostPricing, CostPricingUpdate, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, CostPricing, CostPricingUpdate, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -215,7 +215,7 @@ def test_source_creation_and_region_sync_require_the_connection_region():
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):
     class Data:
         def __getitem__(self, key):
-            return {"tasks": {"failed": 2, "retrying": 3, "stale_leases": 4}, "transfers": {"active_multipart_checkpoints": 5, "stalled": 6}, "events": {"failures_last_24h": 7}, "disk": {"free_bytes": 8}}[key]
+            return {"tasks": {"failed": 2, "retrying": 3, "stale_leases": 4}, "transfers": {"active_multipart_checkpoints": 5, "stalled": 6}, "events": {"failures_last_24h": 7}, "restore_expiry": {"at_risk": 9, "waves": []}, "disk": {"free_bytes": 8}}[key]
 
     monkeypatch.setattr("app.main.observability", lambda _session: Data())
     response = prometheus_metrics(object())
@@ -226,6 +226,7 @@ def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):
     assert "raijin_stale_task_leases 4" in body
     assert "raijin_stalled_transfers 6" in body
     assert "raijin_failures_last_24h 7" in body
+    assert "raijin_restore_expiry_risk_waves 9" in body
 
 
 def test_destination_provenance_requires_s3_etag_and_last_modified_when_known():
@@ -301,6 +302,25 @@ def test_dynamic_scheduler_uses_a_durable_restore_horizon_and_not_all_jobs_at_on
     assert "restore_horizon_waves" in source
     assert "release_dynamic_restore_horizon(session, result[\"settings\"])" in source
     assert "release_dynamic_restore_horizon(session, settings)" in worker
+
+
+def test_dynamic_replan_preserves_submitted_waves_and_exposes_forecast():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "def replan_dynamic_pipeline" in source
+    assert 'Task.kind == "SUBMIT_BATCH_RESTORE"' in source
+    assert 'if wave.status != "RESTORE_SCHEDULED" or has_batch_task:' in source
+    assert '"pipeline_completion_at"' in source
+    assert "replan_dynamic_pipeline(session, settings)" in worker
+
+
+def test_connection_api_limits_are_durable_and_used_by_workers():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert {"discovery_requests_per_second", "restore_poll_requests_per_second", "restore_poll_concurrency"} <= set(AwsConnection.__table__.columns.keys())
+    assert "/operational-limits" in source
+    assert 'getattr(connection, "discovery_requests_per_second"' in worker
+    assert 'getattr(connection, "restore_poll_requests_per_second"' in worker
 
 
 def test_restore_completion_evidence_is_idempotent_and_request_metrics_are_durable():

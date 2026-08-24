@@ -178,6 +178,11 @@ class AwsConnection(Base):
     aws_account_id: Mapped[str] = mapped_column(String(12), index=True)
     default_region: Mapped[str] = mapped_column(String(64))
     control_bucket: Mapped[str] = mapped_column(String(255))
+    # Per-account ceilings keep one aggressive source from surprising a
+    # customer with request bursts.  They affect future API calls only.
+    discovery_requests_per_second: Mapped[int] = mapped_column(Integer, default=10)
+    restore_poll_requests_per_second: Mapped[int] = mapped_column(Integer, default=10)
+    restore_poll_concurrency: Mapped[int] = mapped_column(Integer, default=10)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     sources: Mapped[list["Source"]] = relationship(back_populates="aws_connection")
@@ -547,6 +552,12 @@ class CostPricingUpdate(BaseModel):
     oci_storage_usd_per_gib_month: float | None = Field(default=None, ge=0)
 
 
+class AwsConnectionOperationalLimitsUpdate(BaseModel):
+    discovery_requests_per_second: int = Field(default=10, ge=1, le=100)
+    restore_poll_requests_per_second: int = Field(default=10, ge=1, le=100)
+    restore_poll_concurrency: int = Field(default=10, ge=1, le=64)
+
+
 class InventoryItem(BaseModel):
     object_key: str
     size_bytes: int = Field(ge=0)
@@ -711,6 +722,7 @@ def create_schema() -> None:
     existing_bucket_columns = {column["name"] for column in inspect(engine).get_columns("oci_bucket_cache")}
     existing_cost_pricing_columns = {column["name"] for column in inspect(engine).get_columns("cost_pricing")}
     existing_discovery_job_columns = {column["name"] for column in inspect(engine).get_columns("discovery_jobs")}
+    existing_connection_columns = {column["name"] for column in inspect(engine).get_columns("aws_connections")}
     existing_run_columns = {column["name"] for column in inspect(engine).get_columns("dynamic_pipeline_runs")}
     existing_restore_attempt_columns = {column["name"] for column in inspect(engine).get_columns("restore_attempts")}
     with engine.begin() as connection:
@@ -745,6 +757,13 @@ def create_schema() -> None:
         for column, sql_type in wave_columns.items():
             if column not in existing_wave_columns:
                 connection.execute(text(f"ALTER TABLE waves ADD COLUMN {column} {sql_type}"))
+        for column, sql_type in {
+            "discovery_requests_per_second": "INTEGER NOT NULL DEFAULT 10",
+            "restore_poll_requests_per_second": "INTEGER NOT NULL DEFAULT 10",
+            "restore_poll_concurrency": "INTEGER NOT NULL DEFAULT 10",
+        }.items():
+            if column not in existing_connection_columns:
+                connection.execute(text(f"ALTER TABLE aws_connections ADD COLUMN {column} {sql_type}"))
         for column, sql_type in {"restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2"}.items():
             if column not in existing_run_columns:
                 connection.execute(text(f"ALTER TABLE dynamic_pipeline_runs ADD COLUMN {column} {sql_type}"))
@@ -941,6 +960,9 @@ def connection_summary(session: Session, connection: AwsConnection) -> dict:
     return {"id": connection.id, "label": connection.label, "secret_ocid": connection.secret_ocid,
             "aws_account_id": connection.aws_account_id, "default_region": connection.default_region,
             "control_bucket": connection.control_bucket, "archived_at": connection.archived_at,
+            "operational_limits": {"discovery_requests_per_second": connection.discovery_requests_per_second,
+                                   "restore_poll_requests_per_second": connection.restore_poll_requests_per_second,
+                                   "restore_poll_concurrency": connection.restore_poll_concurrency},
             "created_at": connection.created_at, "sources": int(sources)}
 
 
@@ -1280,11 +1302,31 @@ def observability(session: Session = Depends(get_session)) -> dict:
         ObjectRecord.state == ObjectState.TRANSFERRING,
         ObjectRecord.transfer_progress_at.is_not(None), ObjectRecord.transfer_progress_at < stale_cutoff,
     )) or 0
+    expiry_risks = []
+    expiry_rows = session.execute(
+        select(Wave, Source.name, func.min(ObjectRecord.restore_expires_at),
+               func.count(ObjectRecord.id),
+               func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0))
+        .join(Source, Source.id == Wave.source_id).join(ObjectRecord, ObjectRecord.wave_id == Wave.id)
+        .where(ObjectRecord.restore_expires_at.is_not(None), Source.archived_at.is_(None))
+        .group_by(Wave.id, Source.name)
+    )
+    for wave, source_name, expiry, total, done in expiry_rows:
+        if not expiry or int(done or 0) >= int(total or 0):
+            continue
+        remaining_ratio = max(0.0, 1 - (int(done or 0) / max(1, int(total or 0))))
+        predicted_remaining = max(300, int(float(wave.predicted_transfer_seconds or 0) * remaining_ratio))
+        safe_finish_at = now + timedelta(seconds=predicted_remaining + 3600)
+        if expiry <= safe_finish_at:
+            expiry_risks.append({"wave_id": wave.id, "wave_name": wave.name, "source_name": source_name,
+                                 "expires_at": expiry, "predicted_remaining_seconds": predicted_remaining,
+                                 "severity": "EXPIRED" if expiry <= now else "AT_RISK"})
     volume = shutil.disk_usage("/")
     return {
         "generated_at": now, "tasks": {"failed": int(failed_tasks), "retrying": int(retrying_tasks), "stale_leases": int(stale_leases)},
         "transfers": {"active_multipart_checkpoints": int(active_multipart), "stalled": int(stalled_transfers)},
         "events": {"failures_last_24h": int(recent_failures)},
+        "restore_expiry": {"at_risk": len(expiry_risks), "waves": expiry_risks[:20]},
         "disk": {"free_bytes": volume.free, "used_percent": round(volume.used * 100 / volume.total, 2)},
     }
 
@@ -1312,6 +1354,9 @@ def prometheus_metrics(session: Session = Depends(get_session)) -> Response:
         "# HELP raijin_failures_last_24h Persisted migration failures during the previous 24 hours.",
         "# TYPE raijin_failures_last_24h gauge",
         f"raijin_failures_last_24h {data['events']['failures_last_24h']}",
+        "# HELP raijin_restore_expiry_risk_waves Waves predicted not to finish before a temporary restore copy expires.",
+        "# TYPE raijin_restore_expiry_risk_waves gauge",
+        f"raijin_restore_expiry_risk_waves {data['restore_expiry']['at_risk']}",
         "# HELP raijin_disk_free_bytes Free bytes on the persistent VM volume.",
         "# TYPE raijin_disk_free_bytes gauge",
         f"raijin_disk_free_bytes {data['disk']['free_bytes']}",
@@ -2070,6 +2115,24 @@ def update_cost_pricing(connection_id: int, payload: CostPricingUpdate, session:
     return pricing_dict(pricing)
 
 
+@app.get("/api/aws-connections/{connection_id}/operational-limits")
+def get_aws_connection_operational_limits(connection_id: int, session: Session = Depends(get_session)) -> dict:
+    connection = connection_or_404(session, connection_id)
+    return connection_summary(session, connection)["operational_limits"]
+
+
+@app.put("/api/aws-connections/{connection_id}/operational-limits")
+def update_aws_connection_operational_limits(connection_id: int, payload: AwsConnectionOperationalLimitsUpdate,
+                                             session: Session = Depends(get_session)) -> dict:
+    connection = connection_or_404(session, connection_id)
+    for field, value in payload.model_dump().items():
+        setattr(connection, field, value)
+    record_event(session, "AWS_CONNECTION_LIMITS_UPDATED",
+                 f"API limits updated for AWS connection '{connection.label}': discovery {connection.discovery_requests_per_second}/s, restore polling {connection.restore_poll_requests_per_second}/s with concurrency {connection.restore_poll_concurrency}")
+    session.commit()
+    return connection_summary(session, connection)["operational_limits"]
+
+
 @app.get("/api/global-aws-pricing")
 def get_global_aws_pricing(session: Session = Depends(get_session)) -> list[dict]:
     regions = active_pricing_regions(session)
@@ -2630,6 +2693,43 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
                           "can_resume": bool(source.discovery_continuation_token)}}
 
 
+@app.get("/api/sources/{source_id}/report")
+def source_report(source_id: int, session: Session = Depends(get_session)) -> dict:
+    """Consolidated local report; never contacts AWS or OCI."""
+    source = source_or_404(session, source_id)
+    waves = list(session.scalars(select(Wave).where(Wave.source_id == source.id).order_by(Wave.id)))
+    items = []
+    for wave in waves:
+        total, bytes_total, transferred, transferred_bytes, failed = session.execute(select(
+            func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), 1), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]), ObjectRecord.size_bytes), else_=0)), 0),
+            func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.FAILED, 1), else_=0)), 0),
+        ).where(ObjectRecord.wave_id == wave.id)).one()
+        timing = restore_timing(session, wave.id)
+        items.append({"wave_id": wave.id, "wave_name": wave.name, "status": wave.status,
+                      "objects": int(total), "bytes": int(bytes_total), "transferred_objects": int(transferred),
+                      "transferred_bytes": int(transferred_bytes), "failed_objects": int(failed),
+                      "restore": timing, "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
+                      "planned_restore_at": wave.planned_restore_at, "planned_transfer_start_at": wave.planned_transfer_start_at})
+    return {"source": {"id": source.id, "name": source.name, "s3_bucket": source.s3_bucket,
+                        "s3_prefix": source.s3_prefix, "aws_region": source.aws_region,
+                        "destination_bucket": source.destination_bucket, "transfer_strategy": source.transfer_strategy},
+            "generated_at": utcnow(), "waves": items}
+
+
+@app.get("/api/sources/{source_id}/report.csv")
+def source_report_csv(source_id: int, session: Session = Depends(get_session)) -> StreamingResponse:
+    report = source_report(source_id, session)
+    content = io.StringIO()
+    writer = csv.writer(content)
+    writer.writerow(["source", "wave_id", "wave_name", "status", "objects", "bytes", "transferred_objects", "transferred_bytes", "failed_objects", "restore_requested_at", "first_available_at", "all_available_at", "restore_elapsed_seconds", "predicted_transfer_seconds"])
+    for wave in report["waves"]:
+        timing = wave["restore"]
+        writer.writerow([report["source"]["name"], wave["wave_id"], wave["wave_name"], wave["status"], wave["objects"], wave["bytes"], wave["transferred_objects"], wave["transferred_bytes"], wave["failed_objects"], timing["requested_at"], timing["first_available_at"], timing["last_available_at"], timing["restore_elapsed_seconds"], wave["predicted_transfer_seconds"]])
+    return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="source-{source_id}-report.csv"'})
+
+
 @app.get("/api/discovery-queue")
 def discovery_queue(limit: int = 100, session: Session = Depends(get_session)) -> list[dict]:
     """Local-only observability for durable remote-discovery work."""
@@ -3136,6 +3236,58 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
     return released
 
 
+def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: datetime | None = None) -> int:
+    """Adapt only unsubmitted dynamic waves to durable observed timings.
+
+    Restore requests, active waves and their audit record are immutable.  The
+    recalculation only moves a future `RESTORE_SCHEDULED` wave that has no
+    Batch task yet, using completed transfer wall time whenever it exists.
+    """
+    now = now or utcnow()
+    changed = 0
+    runs = list(session.scalars(select(DynamicPipelineRun).where(
+        DynamicPipelineRun.scheduled_restores.is_(True),
+        DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
+    )))
+    for run in runs:
+        run_changed = False
+        waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
+            Wave.planned_transfer_start_at, Wave.id
+        )))
+        cursor: datetime | None = None
+        for wave in waves:
+            actual_start, actual_end = session.execute(select(
+                func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at)
+            ).where(ObjectRecord.wave_id == wave.id)).one()
+            planned_start = wave.planned_transfer_start_at or now
+            duration_seconds = max(1, int(wave.predicted_transfer_seconds or 1))
+            if actual_start and actual_end and actual_end >= actual_start:
+                duration_seconds = max(1, int((actual_end - actual_start).total_seconds()))
+            start = max(planned_start, cursor) if cursor else planned_start
+            if actual_end:
+                cursor = max(start, actual_end)
+            else:
+                cursor = start + timedelta(seconds=duration_seconds)
+            has_batch_task = session.scalar(select(Task.id).where(
+                Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
+            ).limit(1)) is not None
+            if wave.status != "RESTORE_SCHEDULED" or has_batch_task:
+                continue
+            restore_lead = (48 if wave.restore_tier == "BULK" else 12) * 3600 + int(run.restore_safety_seconds or settings.dynamic_restore_safety_seconds)
+            new_restore_at = max(now, start - timedelta(seconds=restore_lead))
+            shifted = abs((wave.planned_transfer_start_at - start).total_seconds()) if wave.planned_transfer_start_at else float("inf")
+            if shifted >= 60:
+                wave.planned_transfer_start_at, wave.planned_restore_at = start, new_restore_at
+                changed += 1
+                run_changed = True
+        if run_changed:
+            run.planner_version = "v2-adaptive"
+    if changed:
+        record_event(session, "DYNAMIC_PIPELINE_REPLANNED",
+                     f"Adapted {changed} unsubmitted dynamic wave schedule(s) from observed transfer timings")
+    return changed
+
+
 @app.get("/api/sources/{source_id}/waves/dynamic-preview")
 def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1024**4),
                           target_transfer_seconds: int = Query(ge=300, le=7 * 24 * 3600),
@@ -3148,11 +3300,17 @@ def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1
     for plan in plans:
         plan["restore_tier"] = restore_tier
     times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
+    total_predicted_seconds = sum(int(plan["predicted_transfer_seconds"]) for plan in plans)
+    historical_waves = sum(1 for plan in plans if plan["prediction_samples"] > 0)
     return {
         "objects": sum(plan["object_count"] for plan in plans), "bytes": sum(plan["bytes"] for plan in plans),
         "estimated_waves": len(plans), "target_transfer_seconds": target_transfer_seconds,
         "max_objects": max_objects, "profiles": result["profiles"],
         "historical_samples": sum(value["samples"] for value in result["profiles"].values()),
+        "forecast": {"pipeline_completion_at": (times[-1][1] + timedelta(seconds=plans[-1]["predicted_transfer_seconds"])) if times else utcnow(),
+                     "total_predicted_transfer_seconds": total_predicted_seconds,
+                     "restore_horizon_waves": result["settings"].dynamic_restore_horizon_waves,
+                     "historical_waves": historical_waves, "cold_start_waves": len(plans) - historical_waves},
         "waves": [{"objects": plan["object_count"], "bytes": plan["bytes"],
                     "predicted_transfer_seconds": plan["predicted_transfer_seconds"],
                     "prediction_samples": plan["prediction_samples"], "exclusive": plan["exclusive"],

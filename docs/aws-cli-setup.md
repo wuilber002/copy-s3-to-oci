@@ -62,6 +62,18 @@ aws s3api put-bucket-encryption \
 
 Se `create-bucket` retornar `OperationAborted`, aguarde alguns segundos e execute novamente o mesmo comando. Não altere nomes ou policies enquanto a operação anterior estiver em andamento.
 
+### Retenção dos artefatos de controle
+
+O bucket de controle guarda manifests e relatórios de restauração necessários para auditoria e retomada. Aplique uma regra de ciclo de vida para evitar acúmulo indefinido, ajustando os 90 dias ao período de retenção aprovado pelo cliente. O arquivo versionado [`scripts/aws-control-bucket-lifecycle.json`](../scripts/aws-control-bucket-lifecycle.json) também aborta uploads multipart de artefatos que tenham ficado incompletos após sete dias.
+
+```bash
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$CONTROL_BUCKET" \
+  --lifecycle-configuration file://scripts/aws-control-bucket-lifecycle.json
+```
+
+Para usar este comando, a identidade administrativa precisa de `s3:PutLifecycleConfiguration` no bucket de controle. A role de migração do Raijin não recebe essa permissão.
+
 ## 2. Criar o usuário de bootstrap e a access key
 
 O usuário não recebe acesso direto aos objetos. Ele apenas assume a role de migração. A saída de `create-access-key` contém a única cópia da secret access key: copie os dois valores diretamente para as Secrets OCI e não os grave em arquivo ou no repositório.

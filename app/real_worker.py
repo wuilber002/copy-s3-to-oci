@@ -30,7 +30,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
-    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
+    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -406,6 +406,8 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
     pending_pages = 0
     pending_token = continuation_token
     next_request_at = 0.0
+    connection = source.aws_connection
+    request_interval = 1.0 / max(1, int(getattr(connection, "discovery_requests_per_second", 10) or 10))
 
     def checkpoint_batch() -> None:
         """Atomically persist a bounded discovery batch and its S3 cursor."""
@@ -437,7 +439,7 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
                 time.sleep(wait)
             try:
                 page = s3.list_objects_v2(**request)
-                next_request_at = time.monotonic() + DISCOVERY_REQUEST_INTERVAL_SECONDS
+                next_request_at = time.monotonic() + request_interval
                 break
             except ClientError as error:
                 code = (error.response.get("Error") or {}).get("Code")
@@ -447,7 +449,7 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
                 # Do not checkpoint ahead of S3. The next request keeps the
                 # same continuation token, so this retry cannot skip keys.
                 time.sleep(min(30, 2 ** throttle_attempt))
-                next_request_at = time.monotonic() + DISCOVERY_REQUEST_INTERVAL_SECONDS
+                next_request_at = time.monotonic() + request_interval
         items = page.get("Contents", [])
         pending_rows.extend({
             "source_id": source.id,
@@ -508,6 +510,9 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
     ready: dict[int, datetime | None] = {}
     metrics: dict[str, float | int] = {"requests": 0, "throttle_retries": 0, "elapsed_seconds": 0.0}
     started_at = time.monotonic()
+    connection = source.aws_connection
+    requests_per_second = max(1, int(getattr(connection, "restore_poll_requests_per_second", RESTORE_POLL_HEAD_REQUESTS_PER_SECOND) or RESTORE_POLL_HEAD_REQUESTS_PER_SECOND))
+    concurrency = max(1, int(getattr(connection, "restore_poll_concurrency", RESTORE_POLL_HEAD_CONCURRENCY) or RESTORE_POLL_HEAD_CONCURRENCY))
 
     def check(obj: ObjectRecord) -> tuple[int, datetime | None] | None:
         arguments = {"Bucket": source.s3_bucket, "Key": obj.object_key}
@@ -521,10 +526,10 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
     try:
         for start in range(0, len(archives), RESTORE_POLL_HEAD_BATCH_SIZE):
             batch = archives[start:start + RESTORE_POLL_HEAD_BATCH_SIZE]
-            for second_start in range(0, len(batch), RESTORE_POLL_HEAD_REQUESTS_PER_SECOND):
-                second_batch = batch[second_start:second_start + RESTORE_POLL_HEAD_REQUESTS_PER_SECOND]
+            for second_start in range(0, len(batch), requests_per_second):
+                second_batch = batch[second_start:second_start + requests_per_second]
                 second_started_at = time.monotonic()
-                with ThreadPoolExecutor(max_workers=min(RESTORE_POLL_HEAD_CONCURRENCY, len(second_batch)),
+                with ThreadPoolExecutor(max_workers=min(concurrency, len(second_batch)),
                                         thread_name_prefix="s3-oci-restore-poll") as executor:
                     futures = [executor.submit(check, obj) for obj in second_batch]
                     for future in as_completed(futures):
@@ -541,7 +546,7 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
                 # This is an explicit start-rate ceiling in addition to SDK
                 # retries and concurrency. It protects S3 and makes API cost
                 # and load predictable for large waves.
-                has_next = second_start + RESTORE_POLL_HEAD_REQUESTS_PER_SECOND < len(batch) or start + len(batch) < len(archives)
+                has_next = second_start + requests_per_second < len(batch) or start + len(batch) < len(archives)
                 remaining = 1.0 - (time.monotonic() - second_started_at)
                 if has_next and remaining > 0:
                     time.sleep(remaining)
@@ -1264,6 +1269,7 @@ def run_once(role: str = WORKER_ROLE) -> None:
         if role in {"governance", "all"}:
             refresh_due_global_aws_pricing(session)
             if settings.dynamic_pipeline_enabled:
+                replan_dynamic_pipeline(session, settings)
                 release_dynamic_restore_horizon(session, settings)
                 session.commit()
         # There is exactly one real worker per VM.  If it was interrupted while

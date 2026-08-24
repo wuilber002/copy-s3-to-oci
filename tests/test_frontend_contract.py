@@ -43,6 +43,13 @@ def test_registered_aws_connection_secrets_are_disabled_in_the_registration_form
     assert "registeredBySecret" in page
     assert "Secret já cadastrado na conexão" in page
     assert "id=\"aws-connection-register\"" in page
+
+
+def test_connection_api_limits_are_configurable_in_the_interface():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="aws-connection-limits-modal"' in page
+    assert "editAwsConnectionLimits" in page
+    assert "Limites API" in page
     assert "updateAwsConnectionRegistrationState" in page
 
 
