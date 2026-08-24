@@ -88,6 +88,8 @@ password = read_secret(os.environ["POSTGRES_PASSWORD_FILE"])
 database_url = database_url.replace("migration@", f"migration:{password}@")
 platform_status_file = os.environ.get("PLATFORM_STATUS_FILE", "/run/platform-status/status.json")
 oci_runtime_config_file = os.environ.get("OCI_RUNTIME_CONFIG_FILE", "/run/oci-runtime/oci-runtime.json")
+DYNAMIC_PLATFORM_MAX_BYTES = 10 * 1024**4
+DYNAMIC_PLATFORM_MAX_OBJECTS = 500_000
 engine = create_engine(database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine)
 
@@ -719,8 +721,6 @@ class AutomaticWaveCreate(BaseModel):
 
 class DynamicWaveCreate(BaseModel):
     """Create static waves packed by byte, object-count and a derived duration limit."""
-    max_bytes: int = Field(gt=0, le=10 * 1024**4)
-    max_objects: int = Field(ge=1, le=500000)
     restore_days: int = Field(ge=1, le=30)
     restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
     prefix: str = Field(default="", max_length=1024)
@@ -752,7 +752,6 @@ class RuntimeSettingsUpdate(BaseModel):
     cost_estimation_enabled: bool = False
     cost_pricing_auto_refresh_enabled: bool = True
     cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
-    dynamic_wave_max_objects: int = Field(default=50000, ge=1, le=500000)
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
     dynamic_restore_horizon_waves: int = Field(default=2, ge=1, le=20)
     dynamic_pipeline_enabled: bool = False
@@ -1028,7 +1027,6 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "cost_pricing_refresh_days": settings.cost_pricing_refresh_days,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
             "activity_refresh_seconds": settings.activity_refresh_seconds,
-            "dynamic_wave_max_objects": settings.dynamic_wave_max_objects,
             "dynamic_restore_safety_seconds": settings.dynamic_restore_safety_seconds,
             "dynamic_restore_horizon_waves": settings.dynamic_restore_horizon_waves,
             "dynamic_pipeline_enabled": settings.dynamic_pipeline_enabled,
@@ -3589,14 +3587,14 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
 
 
 @app.get("/api/sources/{source_id}/waves/dynamic-preview")
-def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1024**4),
-                          max_objects: int = Query(ge=1, le=500000), prefix: str = Query(default="", max_length=1024),
+def preview_dynamic_waves(source_id: int, prefix: str = Query(default="", max_length=1024),
                           restore_days: int = Query(ge=1, le=30),
                           restore_tier: str = Query(default="BULK", pattern="^(BULK|STANDARD)$"),
                           session: Session = Depends(get_session)) -> dict:
     active_source_or_409(session, source_id)
     target_transfer_seconds, reserve_seconds = automatic_dynamic_duration_limit(restore_days)
-    result = dynamic_wave_plan(session, source_id, max_bytes, target_transfer_seconds, max_objects, prefix)
+    result = dynamic_wave_plan(session, source_id, DYNAMIC_PLATFORM_MAX_BYTES, target_transfer_seconds,
+                               DYNAMIC_PLATFORM_MAX_OBJECTS, prefix)
     plans = result["waves"]
     for plan in plans:
         plan["restore_tier"] = restore_tier
@@ -3608,7 +3606,8 @@ def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1
         "estimated_waves": len(plans), "target_transfer_seconds": target_transfer_seconds,
         "automatic_duration_reserve_seconds": reserve_seconds,
         "restore_retention_seconds": restore_days * 24 * 3600,
-        "max_objects": max_objects, "profiles": result["profiles"],
+        "platform_max_bytes": DYNAMIC_PLATFORM_MAX_BYTES,
+        "platform_max_objects": DYNAMIC_PLATFORM_MAX_OBJECTS, "profiles": result["profiles"],
         "historical_samples": sum(value["samples"] for value in result["profiles"].values()),
         "forecast": {"pipeline_completion_at": (times[-1][1] + timedelta(seconds=plans[-1]["predicted_transfer_seconds"])) if times else utcnow(),
                      "total_predicted_transfer_seconds": total_predicted_seconds,
@@ -3627,7 +3626,8 @@ def preview_dynamic_waves(source_id: int, max_bytes: int = Query(gt=0, le=10 * 1
 def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Session = Depends(get_session)) -> dict:
     source = active_source_or_409(session, source_id)
     target_transfer_seconds, reserve_seconds = automatic_dynamic_duration_limit(payload.restore_days)
-    result = dynamic_wave_plan(session, source_id, payload.max_bytes, target_transfer_seconds, payload.max_objects, payload.prefix)
+    result = dynamic_wave_plan(session, source_id, DYNAMIC_PLATFORM_MAX_BYTES, target_transfer_seconds,
+                               DYNAMIC_PLATFORM_MAX_OBJECTS, payload.prefix)
     plans = result["waves"]
     if not plans:
         raise HTTPException(status_code=409, detail="No discovered objects match this dynamic-wave selection")
@@ -3642,8 +3642,8 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
     historical_samples = sum(value["samples"] for value in result["profiles"].values())
     run = DynamicPipelineRun(
         source_id=source.id, status="SCHEDULED" if schedule_restores else "PLANNED",
-        target_max_bytes=payload.max_bytes, target_transfer_seconds=target_transfer_seconds,
-        max_objects=payload.max_objects, restore_safety_seconds=result["settings"].dynamic_restore_safety_seconds,
+        target_max_bytes=DYNAMIC_PLATFORM_MAX_BYTES, target_transfer_seconds=target_transfer_seconds,
+        max_objects=DYNAMIC_PLATFORM_MAX_OBJECTS, restore_safety_seconds=result["settings"].dynamic_restore_safety_seconds,
         restore_days=payload.restore_days, restore_tier=payload.restore_tier,
         transfer_strategy=source.transfer_strategy, scheduled_restores=schedule_restores,
         restore_horizon_waves=result["settings"].dynamic_restore_horizon_waves,
@@ -3656,7 +3656,7 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
         objects = [obj for obj, _prediction, _samples in plan["objects"]]
         for obj, prediction, _samples in plan["objects"]:
             obj.planned_transfer_seconds = prediction
-        wave = assign_wave(session, source.id, name, payload.max_bytes, payload.restore_days, payload.restore_tier,
+        wave = assign_wave(session, source.id, name, DYNAMIC_PLATFORM_MAX_BYTES, payload.restore_days, payload.restore_tier,
                            objects, plan["exclusive"], planner_mode="DYNAMIC",
                            predicted_transfer_seconds=plan["predicted_transfer_seconds"],
                            prediction_samples=plan["prediction_samples"], planned_restore_at=timing[0],

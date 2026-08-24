@@ -324,8 +324,7 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     assert {"planner_mode", "pipeline_run_id", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
     assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "restore_horizon_waves", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
     assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves", "dynamic_pipeline_enabled"} <= set(RuntimeSettings.__table__.columns.keys())
-    payload = DynamicWaveCreate(max_bytes=1024, max_objects=10,
-                                restore_days=3, restore_tier="BULK")
+    payload = DynamicWaveCreate(restore_days=3, restore_tier="BULK")
     assert payload.restore_days == 3
     assert automatic_dynamic_duration_limit(1) == (16 * 3600, 8 * 3600)
     assert automatic_dynamic_duration_limit(2) == (36 * 3600, 12 * 3600)
