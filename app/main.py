@@ -31,7 +31,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Index, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, and_, case, create_engine, func, inspect, or_, select, text
 from sqlalchemy.engine import URL
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
 
@@ -267,6 +267,12 @@ class ObjectRecord(Base):
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
     source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
+    # A rediscovery can find a new revision of a key that was already
+    # migrated.  Keep the old record immutable as evidence and make the new
+    # revision the only one eligible for subsequent planning.
+    is_current_revision: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    previous_object_id: Mapped[int | None] = mapped_column(ForeignKey("objects.id"), nullable=True, index=True)
+    superseded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     object_key: Mapped[str] = mapped_column(String(2048))
     version_id: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     size_bytes: Mapped[int] = mapped_column(BigInteger)
@@ -492,6 +498,12 @@ class DiscoveryChange(Base):
     current_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     previous_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     current_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    previous_version_id: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    current_version_id: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    previous_last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    current_last_modified: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    reprocessed_object_id: Mapped[int | None] = mapped_column(ForeignKey("objects.id"), nullable=True, index=True)
+    reprocessed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
@@ -521,7 +533,7 @@ def merge_discovery_rows(session: Session, source: Source, rows: list[dict], job
         return 0, 0, 0
     keys = [row["object_key"] for row in rows]
     existing = {obj.object_key: obj for obj in session.scalars(
-        select(ObjectRecord).where(ObjectRecord.source_id == source.id, ObjectRecord.object_key.in_(keys))
+        select(ObjectRecord).where(ObjectRecord.source_id == source.id, ObjectRecord.is_current_revision.is_(True), ObjectRecord.object_key.in_(keys))
     )}
     fresh: list[dict] = []
     new = updated = changed = 0
@@ -547,7 +559,9 @@ def merge_discovery_rows(session: Session, source: Source, rows: list[dict], job
                 session.add(DiscoveryChange(source_id=source.id, discovery_job_id=job.id if job else None,
                                             object_key=row["object_key"], previous_size_bytes=prior.size_bytes,
                                             current_size_bytes=row["size_bytes"], previous_etag=prior.etag,
-                                            current_etag=row.get("etag")))
+                                            current_etag=row.get("etag"), previous_version_id=prior.version_id,
+                                            current_version_id=row.get("version_id"), previous_last_modified=prior.last_modified,
+                                            current_last_modified=row.get("last_modified")))
                 changed += 1
             continue
         # Even when it is still unassigned, retain a concise observation for
@@ -556,7 +570,9 @@ def merge_discovery_rows(session: Session, source: Source, rows: list[dict], job
         session.add(DiscoveryChange(source_id=source.id, discovery_job_id=job.id if job else None,
                                     object_key=row["object_key"], change_type="UPDATED",
                                     previous_size_bytes=prior.size_bytes, current_size_bytes=row["size_bytes"],
-                                    previous_etag=prior.etag, current_etag=row.get("etag")))
+                                    previous_etag=prior.etag, current_etag=row.get("etag"),
+                                    previous_version_id=prior.version_id, current_version_id=row.get("version_id"),
+                                    previous_last_modified=prior.last_modified, current_last_modified=row.get("last_modified")))
         for field in ("size_bytes", "version_id", "etag", "storage_class", "last_modified", "source_checksum", "checksum_algorithm"):
             if field in row and row[field] is not None:
                 setattr(prior, field, row[field])
@@ -774,6 +790,9 @@ def create_schema() -> None:
     # Lightweight additive migrations keep the single-VM deployment upgradeable. No
     # destructive schema operation is performed automatically.
     expected_columns = {
+        "is_current_revision": "BOOLEAN NOT NULL DEFAULT TRUE",
+        "previous_object_id": "BIGINT",
+        "superseded_at": "TIMESTAMP WITH TIME ZONE",
         "source_checksum": "VARCHAR(256)",
         "destination_checksum": "VARCHAR(256)",
         "checksum_algorithm": "VARCHAR(32)",
@@ -836,6 +855,7 @@ def create_schema() -> None:
     existing_connection_columns = {column["name"] for column in inspect(engine).get_columns("aws_connections")}
     existing_run_columns = {column["name"] for column in inspect(engine).get_columns("dynamic_pipeline_runs")}
     existing_restore_attempt_columns = {column["name"] for column in inspect(engine).get_columns("restore_attempts")}
+    existing_discovery_change_columns = {column["name"] for column in inspect(engine).get_columns("discovery_changes")}
     with engine.begin() as connection:
         for column, sql_type in expected_columns.items():
             if column not in existing_columns:
@@ -904,6 +924,13 @@ def create_schema() -> None:
         }.items():
             if column not in existing_discovery_job_columns:
                 connection.execute(text(f"ALTER TABLE discovery_jobs ADD COLUMN {column} {sql_type}"))
+        for column, sql_type in {
+            "previous_version_id": "VARCHAR(1024)", "current_version_id": "VARCHAR(1024)",
+            "previous_last_modified": "TIMESTAMP WITH TIME ZONE", "current_last_modified": "TIMESTAMP WITH TIME ZONE",
+            "reprocessed_object_id": "BIGINT", "reprocessed_at": "TIMESTAMP WITH TIME ZONE",
+        }.items():
+            if column not in existing_discovery_change_columns:
+                connection.execute(text(f"ALTER TABLE discovery_changes ADD COLUMN {column} {sql_type}"))
     # Preserve prior dynamic waves as a single, clearly labelled historical
     # run per source. Their existing plans, object timestamps and task/event
     # history remain authoritative; this only creates the missing grouping.
@@ -2816,10 +2843,11 @@ def request_inventory_manifest_rediscovery(source_id: int, payload: RediscoveryM
 @app.get("/api/sources/{source_id}/summary")
 def source_summary(source_id: int, session: Session = Depends(get_session)) -> dict:
     source_or_404(session, source_id)
-    count, bytes_total = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.source_id == source_id)).one()
+    current = ObjectRecord.is_current_revision.is_(True)
+    count, bytes_total = session.execute(select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(ObjectRecord.source_id == source_id, current)).one()
     states = dict(session.execute(
         select(ObjectRecord.state, func.count(ObjectRecord.id))
-        .where(ObjectRecord.source_id == source_id)
+        .where(ObjectRecord.source_id == source_id, current)
         .group_by(ObjectRecord.state)
     ).all())
     source = source_or_404(session, source_id)
@@ -2827,6 +2855,14 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
         select(DiscoveryChange.change_type, func.count(DiscoveryChange.id))
         .where(DiscoveryChange.source_id == source_id).group_by(DiscoveryChange.change_type)
     ).all())
+    newest_pending_change = session.scalar(select(func.max(DiscoveryChange.detected_at)).where(
+        DiscoveryChange.source_id == source_id, DiscoveryChange.change_type == "MODIFIED",
+        DiscoveryChange.reprocessed_object_id.is_(None)
+    ))
+    pending_modified_changes = session.scalar(select(func.count(DiscoveryChange.id)).where(
+        DiscoveryChange.source_id == source_id, DiscoveryChange.change_type == "MODIFIED",
+        DiscoveryChange.reprocessed_object_id.is_(None)
+    )) or 0
     # This deliberately excludes time spent waiting in the durable queue.  If a
     # discovery is currently being processed, include only its active slice.
     discovery_duration_seconds = float(source.discovery_elapsed_seconds or 0)
@@ -2838,14 +2874,15 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
     return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states, "migration_status": migration_status,
             "destination_validation": {"status": source.destination_validation_status, "at": source.destination_validation_at,
                                        "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count,
-                                       "metadata_mismatches": source.destination_metadata_mismatch_count, "extras": source.destination_extra_count},
+                                       "metadata_mismatches": source.destination_metadata_mismatch_count, "extras": source.destination_extra_count,
+                                       "current_for_modified_changes": bool(newest_pending_change and source.destination_validation_at and source.destination_validation_at >= newest_pending_change)},
             "discovery": {"status": source.status, "requested_at": source.discovery_requested_at,
                           "completed_at": source.discovery_completed_at, "error": source.discovery_error,
                           "duration_seconds": int(discovery_duration_seconds),
                           "pages_completed": source.discovery_pages_completed,
                           "objects_inserted": source.discovery_objects_inserted,
                           "mode": source.last_discovery_mode, "generation": source.discovery_generation,
-                          "changes": change_counts,
+                          "changes": change_counts, "pending_modified_changes": int(pending_modified_changes),
                           "objects_per_second": round(count / discovery_duration_seconds, 2) if discovery_duration_seconds else 0,
                           "pages_per_minute": round(source.discovery_pages_completed * 60 / discovery_duration_seconds, 2) if discovery_duration_seconds else 0,
                           "can_resume": bool(source.discovery_continuation_token)}}
@@ -2860,7 +2897,59 @@ def source_discovery_changes(source_id: int, limit: int = 100, session: Session 
     return [{"id": row.id, "object_key": row.object_key, "type": row.change_type,
              "previous_size_bytes": row.previous_size_bytes, "current_size_bytes": row.current_size_bytes,
              "previous_etag": row.previous_etag, "current_etag": row.current_etag,
-             "detected_at": row.detected_at, "discovery_job_id": row.discovery_job_id} for row in rows]
+             "previous_version_id": row.previous_version_id, "current_version_id": row.current_version_id,
+             "previous_last_modified": row.previous_last_modified, "current_last_modified": row.current_last_modified,
+             "detected_at": row.detected_at, "discovery_job_id": row.discovery_job_id,
+             "reprocessed_object_id": row.reprocessed_object_id, "reprocessed_at": row.reprocessed_at} for row in rows]
+
+
+@app.post("/api/sources/{source_id}/discovery-changes/reprocess-modified")
+def reprocess_modified_discovery_objects(source_id: int, session: Session = Depends(get_session)) -> dict:
+    """Create eligible successor records without mutating migrated evidence.
+
+    The operator must first reconcile OCI after the latest rediscovery.  A
+    clean reconciliation proves the original version remains auditable before
+    the new source revision is scheduled to overwrite that destination key.
+    """
+    source = active_source_or_409(session, source_id)
+    changes = list(session.scalars(select(DiscoveryChange).where(
+        DiscoveryChange.source_id == source.id, DiscoveryChange.change_type == "MODIFIED",
+        DiscoveryChange.reprocessed_object_id.is_(None)
+    ).order_by(DiscoveryChange.detected_at, DiscoveryChange.id)))
+    if not changes:
+        raise HTTPException(status_code=409, detail="No modified source objects are awaiting reprocessing")
+    latest_change = max(change.detected_at for change in changes)
+    if source.destination_validation_status != "VALID" or not source.destination_validation_at or source.destination_validation_at < latest_change:
+        raise HTTPException(status_code=409, detail="Run Validate OCI destination after the latest rediscovery and resolve any divergence before reprocessing modified objects")
+    created = 0
+    for change in changes:
+        prior = session.scalar(select(ObjectRecord).where(
+            ObjectRecord.source_id == source.id, ObjectRecord.object_key == change.object_key,
+            ObjectRecord.is_current_revision.is_(True)
+        ).order_by(ObjectRecord.id.desc()).limit(1))
+        if not prior:
+            continue
+        # The predecessor is immutable historical evidence.  Its linked wave,
+        # integrity data and timestamps are deliberately retained.
+        prior.is_current_revision, prior.superseded_at = False, utcnow()
+        successor = ObjectRecord(
+            source_id=source.id, previous_object_id=prior.id, object_key=prior.object_key,
+            version_id=change.current_version_id, size_bytes=change.current_size_bytes,
+            etag=change.current_etag, storage_class=prior.storage_class,
+            last_modified=change.current_last_modified, metadata_json=prior.metadata_json,
+            tags_json=prior.tags_json, state=ObjectState.DISCOVERED,
+        )
+        session.add(successor)
+        session.flush()
+        change.reprocessed_object_id, change.reprocessed_at = successor.id, utcnow()
+        created += 1
+    if not created:
+        raise HTTPException(status_code=409, detail="No active source revision could be prepared for reprocessing")
+    record_event(session, "MODIFIED_SOURCE_REPROCESS_QUEUED",
+                 f"Prepared {created} changed source object revision(s) for a new wave after successful OCI destination validation",
+                 source_id=source.id)
+    session.commit()
+    return {"source_id": source.id, "created": created, "status": "DISCOVERED"}
 
 
 @app.get("/api/sources/{source_id}/report")
@@ -2929,7 +3018,7 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
     """Explicit OCI-only final reconciliation against the durable discovery."""
     source = active_source_or_409(session, source_id)
     expected = {obj.object_key: obj for obj in session.scalars(
-        select(ObjectRecord).where(ObjectRecord.source_id == source.id)
+        select(ObjectRecord).where(ObjectRecord.source_id == source.id, ObjectRecord.is_current_revision.is_(True))
     )}
     if not expected:
         raise HTTPException(status_code=409, detail="Run discovery before validating the destination")
@@ -2980,7 +3069,8 @@ def validate_destination(source_id: int, session: Session = Depends(get_session)
     divergent_keys = sorted(set(missing + mismatched + metadata_mismatched))
     for offset in range(0, len(divergent_keys), 1000):
         objects = list(session.scalars(select(ObjectRecord).where(
-            ObjectRecord.source_id == source.id, ObjectRecord.object_key.in_(divergent_keys[offset:offset + 1000])
+            ObjectRecord.source_id == source.id, ObjectRecord.is_current_revision.is_(True),
+            ObjectRecord.object_key.in_(divergent_keys[offset:offset + 1000])
         )))
         for obj in objects:
             obj.integrity_verified_at, obj.destination_checksum, obj.transferred_at = None, None, None
@@ -3019,7 +3109,7 @@ def list_inventory(source_id: int, limit: int = 10, offset: int = 0,
     """
     source_or_404(session, source_id)
     limit = min(max(limit, 1), 1000)
-    filters = [ObjectRecord.source_id == source_id]
+    filters = [ObjectRecord.source_id == source_id, ObjectRecord.is_current_revision.is_(True)]
     if search.strip():
         filters.append(ObjectRecord.object_key.ilike(f"%{search.strip()}%"))
     use_cursor = bool(after_key)
@@ -3094,14 +3184,14 @@ def export_inventory(source_id: int, session: Session = Depends(get_session)) ->
     content = io.StringIO()
     writer = csv.writer(content, lineterminator="\n")
     writer.writerow(["object_key", "version_id", "size_bytes", "etag", "storage_class", "last_modified", "state", "wave_id", "metadata_json", "tags_json"])
-    for obj in session.scalars(select(ObjectRecord).where(ObjectRecord.source_id == source_id).order_by(ObjectRecord.object_key)):
+    for obj in session.scalars(select(ObjectRecord).where(ObjectRecord.source_id == source_id, ObjectRecord.is_current_revision.is_(True)).order_by(ObjectRecord.object_key)):
         writer.writerow([obj.object_key, obj.version_id or "", obj.size_bytes, obj.etag or "", obj.storage_class or "",
                          obj.last_modified.isoformat() if obj.last_modified else "", obj.state, obj.wave_id or "", obj.metadata_json, obj.tags_json])
     return StreamingResponse(iter([content.getvalue()]), media_type="text/csv", headers={"Content-Disposition": f'attachment; filename="source-{source_id}-inventory.csv"'})
 
 
 def discovered_object_filters(source_id: int, prefix: str = "") -> list:
-    filters = [ObjectRecord.source_id == source_id, ObjectRecord.state == ObjectState.DISCOVERED]
+    filters = [ObjectRecord.source_id == source_id, ObjectRecord.is_current_revision.is_(True), ObjectRecord.state == ObjectState.DISCOVERED]
     if prefix.strip():
         filters.append(ObjectRecord.object_key.startswith(prefix.strip()))
     return filters

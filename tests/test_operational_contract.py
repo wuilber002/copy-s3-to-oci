@@ -77,6 +77,20 @@ def test_rediscovery_preserves_migration_evidence_and_requires_a_justification()
     assert "Do not silently repoint" in app_source
 
 
+def test_modified_source_reprocessing_creates_an_eligible_successor_revision():
+    object_columns = set(ObjectRecord.__table__.columns.keys())
+    change_columns = set(DiscoveryChange.__table__.columns.keys())
+    assert {"is_current_revision", "previous_object_id", "superseded_at"} <= object_columns
+    assert {"reprocessed_object_id", "reprocessed_at", "current_version_id", "current_last_modified"} <= change_columns
+    app_source = Path("app/main.py").read_text(encoding="utf-8")
+    assert '@app.post("/api/sources/{source_id}/discovery-changes/reprocess-modified")' in app_source
+    assert "Validate OCI destination after the latest rediscovery" in app_source
+    assert "MODIFIED_SOURCE_REPROCESS_QUEUED" in app_source
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert "Preparar nova transferência" in page
+    assert "reprocessModifiedDiscoveryObjects" in page
+
+
 def test_frontend_marks_rediscovery_as_a_controlled_operation():
     page = Path("app/static/index.html").read_text(encoding="utf-8")
     assert 'id="source-discovery-action"' in page
