@@ -183,6 +183,16 @@ def test_laboratory_mode_and_discovery_origin_are_visible_and_explicit():
     assert "Discovery: ${escape(discoveryModeLabel(discovery.mode))}" in page
 
 
+def test_source_prefixes_use_a_controlled_add_remove_list():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="prefix-input"' in page
+    assert 'id="prefix-list"' in page
+    assert "function addSourcePrefix" in page
+    assert "function removeSourcePrefix" in page
+    assert "sourcePrefixScopesOverlap" in page
+    assert "max-height:11.3rem" in page
+
+
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="cost-pricing-modal"' in page
