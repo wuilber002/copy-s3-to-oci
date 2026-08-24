@@ -2339,6 +2339,10 @@ def delete_aws_connection(connection_id: int, session: Session = Depends(get_ses
 @app.get("/api/sources")
 def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     sources = list(session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id)))
+    strategy_locked_ids = set(session.scalars(select(Wave.source_id).where(
+        Wave.source_id.in_([s.id for s in sources]),
+        Wave.status.not_in(["PLANNED", "DRAFT"]),
+    ).distinct())) if sources else set()
     total_rows = session.execute(
         select(ObjectRecord.source_id, func.count(ObjectRecord.id),
                func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.VERIFIED, 1), else_=0)), 0),
@@ -2368,7 +2372,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "discovery_can_resume": bool(s.discovery_continuation_token), "archived_at": s.archived_at,
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
                                         "missing": s.destination_missing_count, "size_mismatches": s.destination_size_mismatch_count},
-             "migration_status": migration_status(s), "can_delete": not source_has_executed_wave(session, s.id)}
+             "migration_status": migration_status(s), "can_delete": not source_has_executed_wave(session, s.id),
+             "transfer_strategy_locked": s.id in strategy_locked_ids}
             for s in sources]
 
 
@@ -2424,12 +2429,21 @@ def update_source_transfer_strategy(source_id: int, payload: SourceTransferStrat
                                     session: Session = Depends(get_session)) -> dict:
     """Update the durable transfer-release policy without editing source identity."""
     source = active_source_or_409(session, source_id)
+    if source.transfer_strategy == payload.transfer_strategy:
+        return {"id": source.id, "transfer_strategy": source.transfer_strategy,
+                "transfer_strategy_locked": source_transfer_strategy_locked(session, source.id)}
+    if source_transfer_strategy_locked(session, source.id):
+        raise HTTPException(
+            status_code=409,
+            detail="Transfer strategy is locked because at least one wave has entered the migration pipeline",
+        )
     source.transfer_strategy = payload.transfer_strategy
     record_event(session, "SOURCE_TRANSFER_STRATEGY_UPDATED",
                  f"Source '{source.name}' transfer strategy set to {payload.transfer_strategy}",
                  source_id=source.id)
     session.commit()
-    return {"id": source.id, "transfer_strategy": source.transfer_strategy}
+    return {"id": source.id, "transfer_strategy": source.transfer_strategy,
+            "transfer_strategy_locked": False}
 
 
 def aws_bucket_region_from_connection(connection: AwsConnection, bucket: str) -> str:
@@ -2590,6 +2604,20 @@ def source_has_executed_wave(session: Session, source_id: int) -> bool:
         Wave.source_id == source_id, Wave.batch_job_id.is_not(None)
     )) or 0
     return bool(task_was_claimed or progressed_object or submitted_batch)
+
+
+def source_transfer_strategy_locked(session: Session, source_id: int) -> bool:
+    """Return whether a source release strategy is now operationally immutable.
+
+    Planned waves are only local drafts and can still be removed or rebuilt.
+    From ``RESTORE_SCHEDULED`` onwards a wave is part of the restore/transfer
+    pipeline, so changing when objects are released would make worker behavior
+    and the preserved audit trail disagree.
+    """
+    return session.scalar(select(Wave.id).where(
+        Wave.source_id == source_id,
+        Wave.status.not_in(["PLANNED", "DRAFT"]),
+    ).limit(1)) is not None
 
 
 def active_source_or_409(session: Session, source_id: int) -> Source:

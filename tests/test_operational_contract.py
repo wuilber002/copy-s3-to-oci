@@ -15,7 +15,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, Task, TaskState, Wave, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, Task, TaskState, Wave, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -40,6 +40,21 @@ def test_source_transfer_strategy_is_durable_and_only_accepts_known_modes():
     assert SourceTransferStrategyUpdate(transfer_strategy="AS_OBJECTS_AVAILABLE").transfer_strategy == "AS_OBJECTS_AVAILABLE"
     with pytest.raises(ValidationError):
         SourceTransferStrategyUpdate(transfer_strategy="anything")
+
+
+def test_transfer_strategy_locks_when_a_wave_enters_the_pipeline():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(name="strategy-lock", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        session.add(source); session.flush()
+        wave = Wave(id=1, source_id=source.id, name="draft", max_bytes=1, restore_days=1, restore_tier="BULK", status="PLANNED")
+        session.add(wave); session.flush()
+        assert not source_transfer_strategy_locked(session, source.id)
+        wave.status = "RESTORE_SCHEDULED"
+        session.flush()
+        assert source_transfer_strategy_locked(session, source.id)
 
 
 def test_governance_and_transfer_workers_claim_disjoint_durable_responsibilities():
