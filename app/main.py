@@ -550,10 +550,18 @@ def merge_discovery_rows(session: Session, source: Source, rows: list[dict], job
                                             current_etag=row.get("etag")))
                 changed += 1
             continue
+        # Even when it is still unassigned, retain a concise observation for
+        # the operator. The row itself can safely be refreshed because no wave
+        # evidence references it yet.
+        session.add(DiscoveryChange(source_id=source.id, discovery_job_id=job.id if job else None,
+                                    object_key=row["object_key"], change_type="UPDATED",
+                                    previous_size_bytes=prior.size_bytes, current_size_bytes=row["size_bytes"],
+                                    previous_etag=prior.etag, current_etag=row.get("etag")))
         for field in ("size_bytes", "version_id", "etag", "storage_class", "last_modified", "source_checksum", "checksum_algorithm"):
             if field in row and row[field] is not None:
                 setattr(prior, field, row[field])
         updated += 1
+        changed += 1
     if fresh:
         session.bulk_insert_mappings(ObjectRecord, fresh)
     if job:
