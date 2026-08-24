@@ -26,10 +26,12 @@ def test_object_model_contains_durable_multipart_checkpoint_fields():
 
 def test_source_model_has_a_durable_discovery_page_checkpoint():
     columns = Source.__table__.columns
-    assert {"discovery_continuation_token", "discovery_pages_completed", "discovery_objects_inserted", "discovery_started_at", "discovery_elapsed_seconds"} <= set(columns.keys())
+    assert {"discovery_continuation_token", "discovery_prefix_index", "discovery_pages_completed", "discovery_objects_inserted", "discovery_started_at", "discovery_elapsed_seconds"} <= set(columns.keys())
+    assert {"source_id", "prefix"} <= set(SourcePrefix.__table__.columns.keys())
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert 'request["ContinuationToken"] = continuation_token' in worker
     assert "DISCOVERY_CHECKPOINT_PAGES = 10" in worker
+    assert "prefixes = source_prefix_values(source)" in worker
     assert "session.bulk_insert_mappings(ObjectRecord, pending_rows)" in worker
     assert "Atomically persist a bounded discovery batch" in worker
 

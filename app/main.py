@@ -2893,7 +2893,11 @@ def queue_discovery(source: Source, session: Session, *, mode: str = "REMOTE_LIS
         raise HTTPException(status_code=409, detail="Discovery is immutable after waves are created")
     if rediscovery and len((justification or "").strip()) <= 10:
         raise HTTPException(status_code=422, detail="Rediscovery justification must contain more than 10 characters")
-    resume = not rediscovery and mode == "REMOTE_LIST" and source.status == "DISCOVERY_FAILED" and bool(source.discovery_continuation_token)
+    # A multi-prefix scan can have completed a prefix cleanly before a later
+    # prefix fails; in that case the S3 token is empty but the durable prefix
+    # cursor still identifies an exact safe resume point.
+    resume = (not rediscovery and mode == "REMOTE_LIST" and source.status == "DISCOVERY_FAILED"
+              and bool(source.discovery_continuation_token or source.discovery_prefix_index))
     # A remote discovery has one exact S3 continuation cursor.  Mixing it with
     # a previous inventory-file import (or silently starting over on completed
     # rows) makes the origin non-auditable and forces expensive duplicate
