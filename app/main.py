@@ -27,7 +27,7 @@ import shutil
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -155,6 +155,11 @@ class Source(Base):
     discovery_continuation_token: Mapped[str | None] = mapped_column(Text, nullable=True)
     discovery_pages_completed: Mapped[int] = mapped_column(Integer, default=0)
     discovery_objects_inserted: Mapped[int] = mapped_column(BigInteger, default=0)
+    # The data origin is operational evidence, not presentation-only state.
+    # A later controlled rediscovery advances the generation without erasing
+    # the prior inventory or the migration history attached to it.
+    last_discovery_mode: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    discovery_generation: Mapped[int] = mapped_column(Integer, default=0)
     archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     destination_validation_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     destination_validation_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -446,6 +451,11 @@ class DiscoveryJob(Base):
     inventory_manifest_uri: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     inventory_file_index: Mapped[int] = mapped_column(Integer, default=0)
     inventory_rows_completed: Mapped[int] = mapped_column(BigInteger, default=0)
+    is_rediscovery: Mapped[bool] = mapped_column(default=False)
+    justification: Mapped[str | None] = mapped_column(Text, nullable=True)
+    objects_new: Mapped[int] = mapped_column(BigInteger, default=0)
+    objects_updated: Mapped[int] = mapped_column(BigInteger, default=0)
+    objects_changed: Mapped[int] = mapped_column(BigInteger, default=0)
     state: Mapped[str] = mapped_column(String(16), default=TaskState.READY, index=True)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -466,6 +476,91 @@ class Event(Base):
     kind: Mapped[str] = mapped_column(String(64), index=True)
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+class DiscoveryChange(Base):
+    """A durable observation that must not rewrite a migrated object record."""
+    __tablename__ = "discovery_changes"
+    __table_args__ = (Index("ix_discovery_changes_source_detected", "source_id", "detected_at"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
+    discovery_job_id: Mapped[int | None] = mapped_column(ForeignKey("discovery_jobs.id"), nullable=True, index=True)
+    object_key: Mapped[str] = mapped_column(String(2048), index=True)
+    change_type: Mapped[str] = mapped_column(String(32), default="MODIFIED")
+    previous_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    current_size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    previous_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    current_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+
+
+def discovery_row_changed(existing: ObjectRecord, row: dict) -> bool:
+    """Compare only evidence supplied by both discovery methods.
+
+    Inventory exports can omit ETag/LastModified fields; an absent field is not
+    proof that an already tracked object changed.
+    """
+    if int(existing.size_bytes) != int(row["size_bytes"]):
+        return True
+    for field in ("etag", "version_id", "last_modified"):
+        current, incoming = getattr(existing, field), row.get(field)
+        if current is not None and incoming is not None and current != incoming:
+            return True
+    return False
+
+
+def merge_discovery_rows(session: Session, source: Source, rows: list[dict], job: DiscoveryJob | None = None) -> tuple[int, int, int]:
+    """Merge a rediscovery without mutating records already assigned to waves.
+
+    New keys become eligible for subsequent waves. Changed historical keys are
+    recorded separately so the operator can decide how to migrate the new S3
+    revision while the evidence for the previous migration remains intact.
+    """
+    if not rows:
+        return 0, 0, 0
+    keys = [row["object_key"] for row in rows]
+    existing = {obj.object_key: obj for obj in session.scalars(
+        select(ObjectRecord).where(ObjectRecord.source_id == source.id, ObjectRecord.object_key.in_(keys))
+    )}
+    fresh: list[dict] = []
+    new = updated = changed = 0
+    for row in rows:
+        prior = existing.get(row["object_key"])
+        if prior is None:
+            fresh.append(row)
+            new += 1
+            continue
+        if not discovery_row_changed(prior, row):
+            continue
+        # Any wave assignment is audit evidence. Do not silently repoint an
+        # already planned/restored/transferred object to a newer S3 revision.
+        if prior.wave_id is not None or prior.state != ObjectState.DISCOVERED:
+            duplicate = session.scalar(select(DiscoveryChange.id).where(
+                DiscoveryChange.source_id == source.id,
+                DiscoveryChange.object_key == row["object_key"],
+                DiscoveryChange.change_type == "MODIFIED",
+                DiscoveryChange.current_size_bytes == row["size_bytes"],
+                DiscoveryChange.current_etag == row.get("etag"),
+            ).limit(1))
+            if not duplicate:
+                session.add(DiscoveryChange(source_id=source.id, discovery_job_id=job.id if job else None,
+                                            object_key=row["object_key"], previous_size_bytes=prior.size_bytes,
+                                            current_size_bytes=row["size_bytes"], previous_etag=prior.etag,
+                                            current_etag=row.get("etag")))
+                changed += 1
+            continue
+        for field in ("size_bytes", "version_id", "etag", "storage_class", "last_modified", "source_checksum", "checksum_algorithm"):
+            if field in row and row[field] is not None:
+                setattr(prior, field, row[field])
+        updated += 1
+    if fresh:
+        session.bulk_insert_mappings(ObjectRecord, fresh)
+    if job:
+        job.objects_new += new
+        job.objects_updated += updated
+        job.objects_changed += changed
+    return new, updated, changed
 
 
 class RuntimeSettings(Base):
@@ -529,6 +624,14 @@ class AwsConnectionCreate(BaseModel):
 
 class InventoryManifestImport(BaseModel):
     manifest_uri: str = Field(min_length=10, max_length=4096)
+
+
+class RediscoveryRequest(BaseModel):
+    justification: str = Field(min_length=11, max_length=4000)
+
+
+class RediscoveryManifestImport(InventoryManifestImport, RediscoveryRequest):
+    pass
 
 
 class CostPricingUpdate(BaseModel):
@@ -712,7 +815,7 @@ def create_schema() -> None:
         "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2",
         "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
@@ -785,6 +888,11 @@ def create_schema() -> None:
             "inventory_manifest_uri": "VARCHAR(4096)",
             "inventory_file_index": "INTEGER NOT NULL DEFAULT 0",
             "inventory_rows_completed": "BIGINT NOT NULL DEFAULT 0",
+            "is_rediscovery": "BOOLEAN NOT NULL DEFAULT FALSE",
+            "justification": "TEXT",
+            "objects_new": "BIGINT NOT NULL DEFAULT 0",
+            "objects_updated": "BIGINT NOT NULL DEFAULT 0",
+            "objects_changed": "BIGINT NOT NULL DEFAULT 0",
         }.items():
             if column not in existing_discovery_job_columns:
                 connection.execute(text(f"ALTER TABLE discovery_jobs ADD COLUMN {column} {sql_type}"))
@@ -803,8 +911,16 @@ def create_schema() -> None:
                 Wave.source_id == source_id, Wave.planner_mode == "DYNAMIC", Wave.pipeline_run_id.is_(None)
             )):
                 wave.pipeline_run_id = run.id
-        if legacy_source_ids:
-            session.commit()
+        # Backfill the visual/audit origin tag for inventories completed by
+        # releases before discovery provenance was stored on the source.
+        for source in session.scalars(select(Source).where(
+            Source.last_discovery_mode.is_(None), Source.discovery_completed_at.is_not(None)
+        )):
+            latest = session.scalar(select(DiscoveryJob).where(DiscoveryJob.source_id == source.id)
+                                    .order_by(DiscoveryJob.id.desc()).limit(1))
+            source.last_discovery_mode = latest.mode if latest else "LEGACY"
+            source.discovery_generation = max(1, int(source.discovery_generation or 0))
+        session.commit()
 
 
 def get_session() -> Generator[Session, None, None]:
@@ -2217,6 +2333,7 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
              "discovery_error": s.discovery_error, "discovery_pages_completed": s.discovery_pages_completed,
              "discovery_objects_inserted": s.discovery_objects_inserted,
+             "last_discovery_mode": s.last_discovery_mode, "discovery_generation": s.discovery_generation,
              "discovery_can_resume": bool(s.discovery_continuation_token), "archived_at": s.archived_at,
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
                                         "missing": s.destination_missing_count, "size_mismatches": s.destination_size_mismatch_count},
@@ -2512,7 +2629,8 @@ def inventory_file_value(row: dict[str, str], *names: str) -> str | None:
 
 
 @app.post("/api/sources/{source_id}/inventory/upload", status_code=201)
-def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...), session: Session = Depends(get_session)) -> dict:
+def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...), rediscovery: bool = Query(False),
+                          justification: str | None = Form(None), session: Session = Depends(get_session)) -> dict:
     """Import a scalable CSV inventory without calling AWS.
 
     The source must still be pristine.  This avoids a potentially ambiguous
@@ -2520,10 +2638,12 @@ def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...)
     file be parsed in bounded batches directly on the VM.
     """
     source = active_source_or_409(session, source_id)
-    if session.scalar(select(Wave.id).where(Wave.source_id == source_id)):
+    if not rediscovery and session.scalar(select(Wave.id).where(Wave.source_id == source_id)):
         raise HTTPException(status_code=409, detail="Inventory file import is immutable after waves are created")
-    if session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source_id).limit(1)):
+    if not rediscovery and session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source_id).limit(1)):
         raise HTTPException(status_code=409, detail="This source already has inventory records; create a new source or delete the unexecuted discovery first")
+    if rediscovery and len((justification or "").strip()) <= 10:
+        raise HTTPException(status_code=422, detail="Rediscovery justification must contain more than 10 characters")
     filename = inventory_file.filename or "inventory.csv"
     if not filename.lower().endswith((".csv", ".csv.gz", ".gz")):
         raise HTTPException(status_code=422, detail="Inventory file must be CSV UTF-8 or CSV.GZ")
@@ -2565,13 +2685,21 @@ def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...)
                 "state": ObjectState.DISCOVERED,
             })
             if len(pending) >= 5000:
-                session.bulk_insert_mappings(ObjectRecord, pending)
-                inserted += len(pending)
+                if rediscovery:
+                    added, _updated, _changed = merge_discovery_rows(session, source, pending)
+                    inserted += added
+                else:
+                    session.bulk_insert_mappings(ObjectRecord, pending)
+                    inserted += len(pending)
                 pending.clear()
         if pending:
-            session.bulk_insert_mappings(ObjectRecord, pending)
-            inserted += len(pending)
-        if not inserted:
+            if rediscovery:
+                added, _updated, _changed = merge_discovery_rows(session, source, pending)
+                inserted += added
+            else:
+                session.bulk_insert_mappings(ObjectRecord, pending)
+                inserted += len(pending)
+        if not inserted and not rediscovery:
             raise HTTPException(status_code=422, detail="Inventory CSV has no object records")
         source.status = "DISCOVERED"
         source.discovery_requested_at = started
@@ -2582,9 +2710,12 @@ def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...)
         source.discovery_continuation_token = None
         source.discovery_pages_completed = 0
         source.discovery_objects_inserted = inserted
-        record_event(session, "INVENTORY_FILE_IMPORTED", f"Imported {inserted} record(s) from inventory file '{filename}' without AWS discovery", source_id=source_id)
+        source.last_discovery_mode = "INVENTORY_FILE"
+        source.discovery_generation = int(source.discovery_generation or 0) + 1
+        operation = "Rediscovery merged" if rediscovery else "Imported"
+        record_event(session, "INVENTORY_FILE_REDISCOVERED" if rediscovery else "INVENTORY_FILE_IMPORTED", f"{operation} {inserted} new record(s) from inventory file '{filename}' without AWS discovery" + (f"; justification: {(justification or '').strip()}" if rediscovery else ""), source_id=source_id)
         session.commit()
-        return {"source_id": source.id, "status": source.status, "inserted": inserted, "filename": filename}
+        return {"source_id": source.id, "status": source.status, "inserted": inserted, "filename": filename, "rediscovery": rediscovery}
     except HTTPException:
         session.rollback()
         raise
@@ -2595,19 +2726,20 @@ def upload_inventory_file(source_id: int, inventory_file: UploadFile = File(...)
         inventory_file.file.close()
 
 
-@app.post("/api/sources/{source_id}/discovery")
-def request_discovery(source_id: int, session: Session = Depends(get_session)) -> dict:
-    source = active_source_or_409(session, source_id)
+def queue_discovery(source: Source, session: Session, *, mode: str = "REMOTE_LIST", manifest_uri: str | None = None,
+                    rediscovery: bool = False, justification: str | None = None) -> DiscoveryJob:
     if source.status == "DISCOVERING":
         raise HTTPException(status_code=409, detail="Discovery already running for this source")
-    if session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source_id)):
+    if not rediscovery and session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source.id)):
         raise HTTPException(status_code=409, detail="Discovery is immutable after waves are created")
-    resume = source.status == "DISCOVERY_FAILED" and bool(source.discovery_continuation_token)
+    if rediscovery and len((justification or "").strip()) <= 10:
+        raise HTTPException(status_code=422, detail="Rediscovery justification must contain more than 10 characters")
+    resume = not rediscovery and mode == "REMOTE_LIST" and source.status == "DISCOVERY_FAILED" and bool(source.discovery_continuation_token)
     # A remote discovery has one exact S3 continuation cursor.  Mixing it with
     # a previous inventory-file import (or silently starting over on completed
     # rows) makes the origin non-auditable and forces expensive duplicate
     # checks.  A failed remote discovery is the only valid resume case.
-    if not resume and session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source_id).limit(1)):
+    if not rediscovery and not resume and session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source.id).limit(1)):
         raise HTTPException(status_code=409, detail="Remote discovery cannot replace or merge an existing inventory; create a new source or resume the failed remote discovery")
     existing_job = session.scalar(select(DiscoveryJob).where(
         DiscoveryJob.source_id == source.id,
@@ -2625,11 +2757,28 @@ def request_discovery(source_id: int, session: Session = Depends(get_session)) -
         source.discovery_objects_inserted = 0
         source.discovery_started_at = None
         source.discovery_elapsed_seconds = 0
-    job = DiscoveryJob(source_id=source.id)
+    job = DiscoveryJob(source_id=source.id, mode=mode, inventory_manifest_uri=manifest_uri,
+                       is_rediscovery=rediscovery, justification=(justification or "").strip() or None)
     session.add(job)
-    record_event(session, "DISCOVERY_QUEUED", f"AWS discovery job queued {'from its durable checkpoint' if resume else ''} for source '{source.name}'", source_id=source.id)
+    label = "Rediscovery" if rediscovery else "Discovery"
+    record_event(session, "REDISCOVERY_QUEUED" if rediscovery else "DISCOVERY_QUEUED",
+                 f"{label} job queued ({mode}) {'from its durable checkpoint' if resume else ''} for source '{source.name}'" + (f"; justification: {job.justification}" if rediscovery else ""), source_id=source.id)
     session.commit()
-    return {"source_id": source.id, "status": source.status, "job_id": job.id}
+    return job
+
+
+@app.post("/api/sources/{source_id}/discovery")
+def request_discovery(source_id: int, session: Session = Depends(get_session)) -> dict:
+    source = active_source_or_409(session, source_id)
+    job = queue_discovery(source, session)
+    return {"source_id": source.id, "status": source.status, "job_id": job.id, "mode": job.mode}
+
+
+@app.post("/api/sources/{source_id}/rediscovery")
+def request_rediscovery(source_id: int, payload: RediscoveryRequest, session: Session = Depends(get_session)) -> dict:
+    source = active_source_or_409(session, source_id)
+    job = queue_discovery(source, session, rediscovery=True, justification=payload.justification)
+    return {"source_id": source.id, "status": source.status, "job_id": job.id, "mode": job.mode, "rediscovery": True}
 
 
 @app.post("/api/sources/{source_id}/inventory/manifest")
@@ -2640,25 +2789,20 @@ def request_inventory_manifest_import(source_id: int, payload: InventoryManifest
     parsed = urlparse(payload.manifest_uri)
     if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.lstrip("/"):
         raise HTTPException(status_code=422, detail="Manifest URI must use s3://bucket/key")
-    if source.status == "DISCOVERING" or session.scalar(select(Wave.id).where(Wave.source_id == source.id).limit(1)):
-        raise HTTPException(status_code=409, detail="Inventory manifest import is immutable after discovery starts or waves are created")
-    if session.scalar(select(ObjectRecord.id).where(ObjectRecord.source_id == source.id).limit(1)):
-        raise HTTPException(status_code=409, detail="Inventory manifest import cannot merge with an existing inventory; create a new source")
-    queued = session.scalar(select(DiscoveryJob.id).where(
-        DiscoveryJob.source_id == source.id,
-        DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
-    ).limit(1))
-    if queued:
-        raise HTTPException(status_code=409, detail=f"Discovery job {queued} is already queued or running for this source")
-    source.status, source.discovery_requested_at = "DISCOVERY_QUEUED", utcnow()
-    source.discovery_started_at, source.discovery_completed_at, source.discovery_error = None, None, None
-    source.discovery_continuation_token, source.discovery_pages_completed = None, 0
-    source.discovery_objects_inserted, source.discovery_elapsed_seconds = 0, 0
-    job = DiscoveryJob(source_id=source.id, mode="S3_INVENTORY_MANIFEST", inventory_manifest_uri=payload.manifest_uri)
-    session.add(job)
-    record_event(session, "INVENTORY_MANIFEST_QUEUED", f"S3 Inventory manifest import queued from {payload.manifest_uri}", source_id=source.id)
-    session.commit()
+    job = queue_discovery(source, session, mode="S3_INVENTORY_MANIFEST", manifest_uri=payload.manifest_uri)
     return {"source_id": source.id, "status": source.status, "job_id": job.id, "mode": job.mode}
+
+
+@app.post("/api/sources/{source_id}/rediscovery/inventory/manifest")
+def request_inventory_manifest_rediscovery(source_id: int, payload: RediscoveryManifestImport,
+                                            session: Session = Depends(get_session)) -> dict:
+    source = active_source_or_409(session, source_id)
+    parsed = urlparse(payload.manifest_uri)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path.lstrip("/"):
+        raise HTTPException(status_code=422, detail="Manifest URI must use s3://bucket/key")
+    job = queue_discovery(source, session, mode="S3_INVENTORY_MANIFEST", manifest_uri=payload.manifest_uri,
+                          rediscovery=True, justification=payload.justification)
+    return {"source_id": source.id, "status": source.status, "job_id": job.id, "mode": job.mode, "rediscovery": True}
 
 
 @app.get("/api/sources/{source_id}/summary")
@@ -2671,6 +2815,10 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
         .group_by(ObjectRecord.state)
     ).all())
     source = source_or_404(session, source_id)
+    change_counts = dict(session.execute(
+        select(DiscoveryChange.change_type, func.count(DiscoveryChange.id))
+        .where(DiscoveryChange.source_id == source_id).group_by(DiscoveryChange.change_type)
+    ).all())
     # This deliberately excludes time spent waiting in the durable queue.  If a
     # discovery is currently being processed, include only its active slice.
     discovery_duration_seconds = float(source.discovery_elapsed_seconds or 0)
@@ -2688,9 +2836,23 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
                           "duration_seconds": int(discovery_duration_seconds),
                           "pages_completed": source.discovery_pages_completed,
                           "objects_inserted": source.discovery_objects_inserted,
+                          "mode": source.last_discovery_mode, "generation": source.discovery_generation,
+                          "changes": change_counts,
                           "objects_per_second": round(count / discovery_duration_seconds, 2) if discovery_duration_seconds else 0,
                           "pages_per_minute": round(source.discovery_pages_completed * 60 / discovery_duration_seconds, 2) if discovery_duration_seconds else 0,
                           "can_resume": bool(source.discovery_continuation_token)}}
+
+
+@app.get("/api/sources/{source_id}/discovery-changes")
+def source_discovery_changes(source_id: int, limit: int = 100, session: Session = Depends(get_session)) -> list[dict]:
+    """Evidence of source updates detected without rewriting wave history."""
+    source_or_404(session, source_id)
+    rows = session.scalars(select(DiscoveryChange).where(DiscoveryChange.source_id == source_id)
+                           .order_by(DiscoveryChange.detected_at.desc(), DiscoveryChange.id.desc()).limit(min(max(limit, 1), 1000)))
+    return [{"id": row.id, "object_key": row.object_key, "type": row.change_type,
+             "previous_size_bytes": row.previous_size_bytes, "current_size_bytes": row.current_size_bytes,
+             "previous_etag": row.previous_etag, "current_etag": row.current_etag,
+             "detected_at": row.detected_at, "discovery_job_id": row.discovery_job_id} for row in rows]
 
 
 @app.get("/api/sources/{source_id}/report")

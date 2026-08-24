@@ -29,7 +29,7 @@ from botocore.exceptions import ClientError
 from sqlalchemy import func, or_, select
 
 from app.main import (
-    AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState,
+    AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows,
     DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
 )
 
@@ -348,9 +348,14 @@ def import_s3_inventory_manifest(session, source: Source, settings, job: Discove
             if not processed_since_checkpoint:
                 return
             if pending:
-                session.bulk_insert_mappings(ObjectRecord, pending)
-            inserted += len(pending)
-            source.discovery_objects_inserted += len(pending)
+                if job.is_rediscovery:
+                    added, _updated, _changed = merge_discovery_rows(session, source, pending, job)
+                    inserted += added
+                    source.discovery_objects_inserted += added
+                else:
+                    session.bulk_insert_mappings(ObjectRecord, pending)
+                    inserted += len(pending)
+                    source.discovery_objects_inserted += len(pending)
             job.inventory_rows_completed = row_number
             job.lease_expires_at = utcnow() + timedelta(seconds=max(settings.task_lease_seconds, 300))
             session.commit()
@@ -393,8 +398,10 @@ def import_s3_inventory_manifest(session, source: Source, settings, job: Discove
     if source.discovery_started_at:
         source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
     source.discovery_started_at, source.discovery_completed_at, source.status = None, finished_at, "DISCOVERED"
+    source.last_discovery_mode, source.discovery_generation = job.mode, int(source.discovery_generation or 0) + 1
     job.state, job.error, job.lease_expires_at, job.completed_at = TaskState.SUCCEEDED, None, None, finished_at
-    event(session, "INVENTORY_MANIFEST_IMPORTED", f"S3 Inventory manifest imported {inserted} object(s) in this run; {source.discovery_objects_inserted} total object(s) across {source.discovery_pages_completed} shard(s)", source_id=source.id)
+    detail = f"new {job.objects_new}, updated {job.objects_updated}, changed {job.objects_changed}" if job.is_rediscovery else f"{inserted} object(s) in this run"
+    event(session, "INVENTORY_MANIFEST_IMPORTED", f"S3 Inventory manifest import completed: {detail}; {source.discovery_objects_inserted} new object(s) across {source.discovery_pages_completed} shard(s)", source_id=source.id)
     session.commit()
 
 
@@ -417,10 +424,14 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
         if pending_rows:
             # Mappings bypass the ORM identity map, keeping memory bounded even
             # when a bucket contains tens of millions of objects.
-            session.bulk_insert_mappings(ObjectRecord, pending_rows)
-        inserted += len(pending_rows)
+            if job and job.is_rediscovery:
+                added, _updated, _changed = merge_discovery_rows(session, source, pending_rows, job)
+                inserted += added
+            else:
+                session.bulk_insert_mappings(ObjectRecord, pending_rows)
+                inserted += len(pending_rows)
         source.discovery_pages_completed += pending_pages
-        source.discovery_objects_inserted += len(pending_rows)
+        source.discovery_objects_inserted += (inserted - source.discovery_objects_inserted) if job and job.is_rediscovery else len(pending_rows)
         source.discovery_continuation_token = pending_token
         if job:
             job.lease_expires_at = utcnow() + timedelta(seconds=max(settings.task_lease_seconds, 300))
@@ -472,9 +483,11 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
         source.discovery_elapsed_seconds = float(source.discovery_elapsed_seconds or 0) + max(0, (finished_at - source.discovery_started_at).total_seconds())
     source.discovery_started_at = None
     source.status, source.discovery_completed_at = "DISCOVERED", finished_at
+    source.last_discovery_mode, source.discovery_generation = "REMOTE_LIST", int(source.discovery_generation or 0) + 1
     if job:
         job.state, job.error, job.lease_expires_at, job.completed_at = TaskState.SUCCEEDED, None, None, finished_at
-    event(session, "DISCOVERY_COMPLETED", f"Discovery inserted {inserted} object(s) in this run; {source.discovery_objects_inserted} total object(s) across {source.discovery_pages_completed} ListObjectsV2 page(s)", source_id=source.id)
+    detail = f"new {job.objects_new}, updated {job.objects_updated}, changed {job.objects_changed}" if job and job.is_rediscovery else f"inserted {inserted} object(s)"
+    event(session, "DISCOVERY_COMPLETED", f"Remote discovery completed: {detail}; {source.discovery_objects_inserted} new object(s) across {source.discovery_pages_completed} ListObjectsV2 page(s)", source_id=source.id)
     session.commit()
 
 

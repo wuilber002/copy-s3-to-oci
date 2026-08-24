@@ -13,7 +13,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, CostPricing, CostPricingUpdate, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicWaveCreate, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettingsUpdate, Source, SourceTransferStrategyUpdate, TaskState, destination_provenance_matches, dynamic_schedule_times, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -64,6 +64,25 @@ def test_remote_discovery_has_a_durable_observable_queue_and_adaptive_throttle()
     app_source = Path("app/main.py").read_text(encoding="utf-8")
     assert '@app.get("/api/discovery-queue")' in app_source
     assert "Remote discovery cannot replace or merge an existing inventory" in app_source
+
+
+def test_rediscovery_preserves_migration_evidence_and_requires_a_justification():
+    assert {"last_discovery_mode", "discovery_generation"} <= set(Source.__table__.columns.keys())
+    assert {"is_rediscovery", "justification", "objects_new", "objects_updated", "objects_changed"} <= set(DiscoveryJob.__table__.columns.keys())
+    assert {"source_id", "object_key", "change_type", "previous_size_bytes", "current_size_bytes"} <= set(DiscoveryChange.__table__.columns.keys())
+    app_source = Path("app/main.py").read_text(encoding="utf-8")
+    assert '@app.post("/api/sources/{source_id}/rediscovery")' in app_source
+    assert '@app.post("/api/sources/{source_id}/rediscovery/inventory/manifest")' in app_source
+    assert "Rediscovery justification must contain more than 10 characters" in app_source
+    assert "Do not silently repoint" in app_source
+
+
+def test_frontend_marks_rediscovery_as_a_controlled_operation():
+    page = Path("app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="source-discovery-action"' in page
+    assert "Executar re-discovery" in page
+    assert "rediscovery-justification" in page
+    assert "discovery-origin-tag" in page
 
 
 def test_large_inventory_uses_keyset_pagination_and_production_indexes():
