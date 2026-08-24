@@ -82,9 +82,10 @@ de fazer** e **como ela organiza a operação**.
 | **Migrations** | Cadastro e seleção de sources, discovery, inventário, re-discovery, validação OCI, criação e administração de waves. |
 | **Configurações** | Parâmetros operacionais, estratégia de transferência, conexões AWS, Secrets, buckets OCI, tarifas e pré-checks. |
 
-Os controles que iniciam ou alteram processos de maior impacto exibem o ícone
-`i`. O balão de ajuda descreve finalidade, impacto operacional e condição de
-uso, sem exigir que o operador saia da console. Exemplos: discovery,
+Na interface web, os controles que iniciam ou alteram processos de maior
+impacto exibem o ícone circular `i` dentro do próprio controle. O balão de
+ajuda descreve finalidade, impacto operacional e condição de uso, sem exigir
+que o operador saia da console. Exemplos: discovery,
 reconciliação OCI, restores dinâmicos, fila completa, inventário de bordo,
 recuperação de leases, Secrets, pré-check e tarifas públicas.
 
