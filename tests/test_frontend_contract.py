@@ -193,6 +193,14 @@ def test_source_prefixes_use_a_controlled_add_remove_list():
     assert "max-height:11.3rem" in page
 
 
+def test_source_selector_uses_name_only_and_context_tags_are_in_the_heading():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="source-context-tags"' in page
+    assert 'class="source-inventory-heading"' in page
+    assert 'sources.map(x=>`<option value="${x.id}">${escape(x.name)}</option>`)' in page
+    assert "<b>Prefixos S3</b>" in page
+
+
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="cost-pricing-modal"' in page
