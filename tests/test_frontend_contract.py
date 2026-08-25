@@ -106,10 +106,12 @@ def test_wave_report_is_a_scrollable_modal():
 
 def test_discovered_objects_and_source_cost_actions_live_in_the_discovery_summary():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    source_actions = page[page.index('<div class="row source-actions">'):page.index('<div id="source-summary"')]
     assert 'id="discovered-objects-modal"' in page
     assert 'id="inventory-page-size"' in page
     assert "openDiscoveredObjectsModal()" in page
     assert "const actions=$('#source-summary-actions')" in page
+    assert "refreshAll()" not in source_actions
     assert ".source-actions{flex-wrap:nowrap;overflow:visible" in page
     assert ".source-actions .source-combobox{flex:0 0 490px" in page
 
