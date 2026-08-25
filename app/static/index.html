@@ -137,7 +137,7 @@
     <div id="source-exports" class="hint"></div>
   </section>
 
-  <section class="card"><div class="wave-creation-header"><h2>Criar ondas</h2><label class="field"><span class="with-help">Método de criação <span class="help" tabindex="0" data-help="Escolha criar apenas a próxima onda, criar automaticamente todas as ondas pendentes, limitar a criação a um prefixo ou usar criação dinâmica. A criação dinâmica calcula tamanho e quantidade de objetos a partir da retenção de restore, do desempenho previsto e do histórico real.">i</span></span><select id="wave-creation-method" onchange="showWaveCreationMethod()"><option value="manual">Criar uma onda manualmente</option><option value="automatic">Criar todas automaticamente</option><option value="prefix">Criar automaticamente por prefixo</option><option value="dynamic">Criação dinâmica</option></select></label></div>
+  <section class="card"><div class="wave-creation-header"><h2>Criar ondas</h2><select id="wave-creation-method" aria-label="Selecionar tipo de criação de ondas" title="Escolha como as ondas serão criadas" onchange="showWaveCreationMethod()"><option value="manual">Criar uma onda manualmente</option><option value="automatic">Criar todas automaticamente</option><option value="prefix">Criar automaticamente por prefixo</option><option value="dynamic">Criação dinâmica</option></select></div>
     <div id="wave-method-manual" class="wave-method">
     <h3>Onda manual</h3><form id="wave-form" class="grid">
       <label class="field"><span class="with-help">Nome da onda <span class="help" tabindex="0" data-help="Identificador único desta onda dentro da origem. Use um nome que permita reconhecer o lote em relatórios e no processo de aprovação.">i</span></span><input id="wave-name" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,127}" placeholder="Ex.: onda-001"></label>
@@ -151,7 +151,7 @@
     </div>
 
     <div id="wave-method-automatic" class="wave-method hidden">
-    <h3>Ondas automáticas</h3><form id="automatic-wave-form" class="grid">
+    <form id="automatic-wave-form" class="grid">
       <label class="field"><span class="with-help">Tamanho alvo por onda <span class="help" tabindex="0" data-help="Cada onda é preenchida em ordem de chave S3 até este tamanho. A última pode ser menor. Um objeto maior que o alvo é colocado em uma onda exclusiva para não bloquear a migração.">i</span></span><input id="automatic-wave-size" type="number" min="0.001" step="0.001" value="10" onchange="previewAutomaticWaves()" required></label>
       <label class="field"><span>Unidade</span><select id="automatic-wave-unit" onchange="previewAutomaticWaves()"><option value="MB">MB</option><option value="GB">GB</option><option value="TB" selected>TB</option></select></label>
       <label class="field"><span>Retenção do restore (dias)</span><input id="automatic-restore-days" type="number" min="1" max="30" value="7" required></label>
