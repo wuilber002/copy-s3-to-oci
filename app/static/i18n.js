@@ -51,7 +51,7 @@
     'Região AWS': 'AWS region', 'Bucket OCI de destino': 'Destination OCI bucket', 'Cadastrar origem': 'Create source',
     'Fontes e inventário': 'Sources and inventory', 'Executar discovery': 'Run discovery', 'Validar destino OCI': 'Validate OCI destination',
     'Editar origem': 'Edit source', 'Excluir': 'Delete', 'Arquivar': 'Archive', 'Atualizar': 'Refresh',
-    'Cadastre ou selecione uma origem.': 'Create or select a source.', 'Objetos descobertos': 'Discovered objects',
+    'Cadastre ou selecione uma origem.': 'Create or select a source.', 'Objetos descobertos': 'Discovered objects', 'Objetos encontrados no discovery': 'Objects found during discovery',
     'Exibir por página': 'Show per page', 'Buscar chave S3': 'Search S3 key', 'Buscar': 'Search',
     'Criar ondas': 'Create waves', 'Método de criação': 'Creation method',
     'Criar uma onda manualmente': 'Create one wave manually', 'Criar todas automaticamente': 'Create all automatically', 'Criar automaticamente por prefixo': 'Create automatically by prefix',

@@ -96,12 +96,21 @@ def test_aws_connection_configuration_opens_in_a_dismissible_modal():
     assert "ACTIONABLE_FAILED" in page
 
 
-def test_object_detail_is_below_inventory_and_wave_report_is_scrollable_modal():
+def test_wave_report_is_a_scrollable_modal():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="wave-report-modal"' in page
     assert 'id="wave-report-content" class="report-content"' in page
     assert "openModal('#wave-report-modal')" in page
     assert ".report-content{max-height:72vh;overflow:auto" in page
+
+
+def test_discovered_objects_and_source_cost_actions_live_in_the_discovery_summary():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="discovered-objects-modal"' in page
+    assert 'id="inventory-page-size"' in page
+    assert "openDiscoveredObjectsModal()" in page
+    assert "const actions=$('#source-summary-actions')" in page
+    assert ".source-actions .source-combobox{flex:0 0 490px" in page
 
 
 def test_wave_report_distinguishes_aws_batch_evidence_from_raijin_polling():
