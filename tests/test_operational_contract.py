@@ -301,14 +301,10 @@ def test_restore_preflight_blocks_source_region_mismatch_before_batch_submission
         validate_restore_preflight(None, source, Client(), {"control_bucket": "control"})
 
 
-def test_source_region_sync_uses_base_task_update_and_invalidates_old_restore_state():
+def test_obsolete_source_region_sync_endpoint_is_not_exposed():
     source = Path("app/main.py").read_text(encoding="utf-8")
-    start = source.index("def sync_source_aws_region")
-    end = source.index("\n\n@app.post(\"/api/sources/{source_id}/migrate-aws-connection\")", start)
-    handler = source[start:end]
-    assert "Task.id.in_(pending_task_ids)" in handler
-    assert "RESTORE_INVALIDATED_BY_REGION_SYNC" in handler
-    assert "INVALIDATED_REGION_MISMATCH" in handler
+    assert "/sync-aws-region" not in source
+    assert "def sync_source_aws_region" not in source
 
 
 def test_dashboard_keeps_superseded_region_tasks_in_audit_but_not_as_active_alerts():
@@ -347,10 +343,10 @@ def test_restore_polling_uses_the_same_control_prefix_as_submission_and_labels_r
     assert "Raijin polling/report processing failed after AWS accepted" in worker
 
 
-def test_source_creation_and_region_sync_require_the_connection_region():
+def test_source_creation_and_update_require_the_connection_region():
     source = Path("app/main.py").read_text(encoding="utf-8")
     assert source.count("Source AWS region is defined by the selected AWS connection") == 2
-    assert "Source bucket region differs from its AWS connection" in source
+    assert source.count("payload.aws_region != connection.default_region") == 2
 
 
 def test_prometheus_contract_contains_safe_operational_metrics(monkeypatch):

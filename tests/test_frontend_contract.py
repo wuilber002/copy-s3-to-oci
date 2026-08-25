@@ -80,7 +80,8 @@ def test_aws_connection_sync_and_safe_configuration_controls_are_available():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "viewAwsConnectionConfiguration" in page
     assert "syncAwsConnection" in page
-    assert "syncSourceAwsRegion" in page
+    assert "syncSourceAwsRegion" not in page
+    assert "Sincronizar região AWS" not in page
     assert "Campos ocultos" in page
     assert "Tentativas de restore" in page
 
