@@ -411,3 +411,13 @@ def test_operational_top_alerts_are_dismissible_without_removing_the_footer_cond
     assert "if(!activeKeys.has(key))dismissedTopAlerts.delete(key)" in page
     assert "updateOperationalMessages(d,p,o)" in page
     assert "renderTopAlerts(alerts)" in page
+
+
+def test_simulation_admin_page_keeps_the_persistent_operational_footer():
+    simulation = (ROOT / "app/static/simulation.html").read_text(encoding="utf-8")
+
+    assert 'id="operational-statusbar" class="operational-statusbar"' in simulation
+    assert 'id="statusbar-ticker" class="statusbar-ticker idle"' in simulation
+    assert "function updateOperationalMessages(operations,platform,observability)" in simulation
+    assert "async function refreshOperationalMessages()" in simulation
+    assert "setInterval(refreshOperationalMessages,30000)" in simulation

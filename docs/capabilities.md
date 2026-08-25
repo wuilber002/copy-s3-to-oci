@@ -350,6 +350,9 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
   templates, orçamento físico do modo `DATA`, relógio virtual, falhas injetadas,
   evidências, replay e housekeeping. Discovery, estratégia, waves e queue
   permanecem exclusivamente em **Migrations** e **Queue**.
+- A página **Simulation** mantém o mesmo rodapé operacional das demais telas,
+  sem ações contextuais próprias. Condições importantes percorrem o ticker
+  enquanto verdadeiras e são removidas somente após sua resolução.
 - No runtime simulado, endpoints de descoberta/configuração de AWS e OCI reais
   ficam indisponíveis por defesa em profundidade. A aplicação também não recebe
   credenciais de nuvem e usa o PostgreSQL isolado `migration_simulation`.
