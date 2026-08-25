@@ -94,6 +94,11 @@ de fazer** e **como ela organiza a operação**.
 | **Migrations** | Cadastro e seleção de sources, discovery, inventário, re-discovery, validação OCI, criação e administração de waves. |
 | **Configurações** | Parâmetros operacionais, estratégia de transferência, conexões AWS, Secrets, buckets OCI, tarifas e pré-checks. |
 
+Alertas operacionais aparecem no topo para chamar a atenção imediata e podem
+ser dispensados com `×` sem bloquear a console. A mesma condição permanece na
+fila rotativa do rodapé enquanto estiver verdadeira. Um alerta dispensado só
+volta ao topo se a condição for resolvida e ocorrer novamente.
+
 Na interface web, os controles que iniciam ou alteram processos de maior
 impacto exibem o ícone circular `i` dentro do próprio controle. O balão de
 ajuda descreve finalidade, impacto operacional e condição de uso, sem exigir
