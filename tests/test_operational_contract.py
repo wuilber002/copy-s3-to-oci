@@ -15,7 +15,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, list_sources, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -59,6 +59,26 @@ def test_source_scope_supports_multiple_non_overlapping_prefixes():
         assert source_key_in_scope(source, "Smoke_test/file.bin")
         assert source_key_in_scope(source, "Operational_test/file.bin")
         assert not source_key_in_scope(source, "Resilience_test/file.bin")
+
+
+def test_source_selector_exposes_one_operational_status_per_source():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        discovered = Source(id=901, name="discovered", s3_bucket="bucket-1", aws_region="us-east-1", destination_bucket="destination", status="DISCOVERED")
+        queued = Source(id=902, name="queued", s3_bucket="bucket-2", aws_region="us-east-1", destination_bucket="destination", status="DISCOVERED")
+        transferring = Source(id=903, name="transferring", s3_bucket="bucket-3", aws_region="us-east-1", destination_bucket="destination", status="DISCOVERED")
+        restoring = Source(id=904, name="restoring", s3_bucket="bucket-4", aws_region="us-east-1", destination_bucket="destination", status="DISCOVERED")
+        session.add_all([discovered, queued, transferring, restoring]); session.flush()
+        session.add_all([
+            Wave(id=901, source_id=queued.id, name="queued", max_bytes=1, restore_days=1, restore_tier="BULK", status="READY_FOR_RESTORE"),
+            Wave(id=902, source_id=transferring.id, name="transferring", max_bytes=1, restore_days=1, restore_tier="BULK", status="TRANSFERRING"),
+            Wave(id=903, source_id=restoring.id, name="restoring", max_bytes=1, restore_days=1, restore_tier="BULK", status="RESTORING"),
+        ])
+        session.commit()
+        statuses = {row["name"]: row["operational_status"] for row in list_sources(session)}
+        assert statuses == {"discovered": "DISCOVERED", "queued": "QUEUED", "transferring": "TRANSFERRING", "restoring": "RESTORING"}
 
 
 def test_active_sources_cannot_silently_share_an_s3_prefix_scope():

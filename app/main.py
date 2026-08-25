@@ -2439,10 +2439,17 @@ def delete_aws_connection(connection_id: int, session: Session = Depends(get_ses
 @app.get("/api/sources")
 def list_sources(session: Session = Depends(get_session)) -> list[dict]:
     sources = list(session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id)))
+    source_ids = [s.id for s in sources]
     strategy_locked_ids = set(session.scalars(select(Wave.source_id).where(
-        Wave.source_id.in_([s.id for s in sources]),
+        Wave.source_id.in_(source_ids),
         Wave.status.not_in(["PLANNED", "DRAFT"]),
-    ).distinct())) if sources else set()
+    ).distinct())) if source_ids else set()
+    wave_statuses: dict[int, set[str]] = {}
+    if source_ids:
+        for source_id, status in session.execute(
+            select(Wave.source_id, Wave.status).where(Wave.source_id.in_(source_ids))
+        ):
+            wave_statuses.setdefault(source_id, set()).add(str(status))
     total_rows = session.execute(
         select(ObjectRecord.source_id, func.count(ObjectRecord.id),
                func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.VERIFIED, 1), else_=0)), 0),
@@ -2460,6 +2467,26 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
         if source.status == "DISCOVERED" and total and transferred == total:
             return "AWAITING_INTEGRITY_VERIFICATION"
         return "IN_PROGRESS" if total else "NOT_STARTED"
+
+    def operational_status(source: Source) -> str:
+        """Return one stable, operator-facing state for the source selector."""
+        completed = migration_status(source) == "COMPLETED"
+        statuses = wave_statuses.get(source.id, set())
+        if completed:
+            return "COMPLETED"
+        if "TRANSFERRING" in statuses:
+            return "TRANSFERRING"
+        if statuses.intersection({"RESTORING", "RESTORE_REQUESTED", "RESTORE_REQUEST_ACCEPTED"}):
+            return "RESTORING"
+        if statuses.intersection({"RESTORED", "TRANSFERRED", "VERIFICATION_QUEUED", "VERIFICATION_FAILED"}):
+            return "READY_TO_TRANSFER"
+        if statuses:
+            return "QUEUED"
+        if source.status == "DISCOVERING":
+            return "DISCOVERING"
+        if source.status == "DISCOVERED":
+            return "DISCOVERED"
+        return "CONFIGURED"
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
              "s3_prefixes": source_prefix_values(s),
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "transfer_strategy": s.transfer_strategy, "status": s.status,
@@ -2473,7 +2500,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "discovery_can_resume": bool(s.discovery_continuation_token), "archived_at": s.archived_at,
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
                                         "missing": s.destination_missing_count, "size_mismatches": s.destination_size_mismatch_count},
-             "migration_status": migration_status(s), "can_delete": not source_has_executed_wave(session, s.id),
+             "migration_status": migration_status(s), "operational_status": operational_status(s),
+             "can_delete": not source_has_executed_wave(session, s.id),
              "transfer_strategy_locked": s.id in strategy_locked_ids,
              "scope_conflicts": active_source_scope_conflicts(session, s.s3_bucket, source_prefix_values(s), s.id)}
             for s in sources]
