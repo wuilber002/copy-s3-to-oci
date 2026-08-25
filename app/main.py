@@ -2086,6 +2086,15 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         restore = phase("RESTORE", restore_start, restore_end, planned=not bool(request_at))
         if restore:
             phases.append(restore)
+        # While a restore is in progress, preserve both truths on the board:
+        # the solid segment is elapsed/observed time and the striped segment
+        # is the remaining forecast until the planned transfer window.  The
+        # previous rendering stopped the orange bar at ``now`` and left a
+        # misleading empty gap before the planned blue transfer segment.
+        if request_at and not available_at and wave.planned_transfer_start_at:
+            forecast_restore = phase("RESTORE", restore_end, wave.planned_transfer_start_at, planned=True)
+            if forecast_restore:
+                phases.append(forecast_restore)
         transfer_start = transfer_started_at or wave.planned_transfer_start_at
         if transfer_started_at:
             transfer_end = transfer_completed_at or now
@@ -2115,9 +2124,18 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             "phases": phases,
         })
     timeline_points = [point for wave in board_waves for phase_item in wave["phases"] for point in (phase_item["start_at"], phase_item["end_at"])]
+    # Once processing starts, the time origin is immutable: it is the first
+    # observed AWS restore submission for this source/run.  It must not drift
+    # with ``now`` while the modal refreshes.  Sources without a submission
+    # yet continue to use their earliest persisted planning point.
+    submitted_points = [
+        wave["started_at"] for wave in board_waves
+        if wave["started_at"] is not None
+    ]
+    timeline_start = min(submitted_points) if submitted_points else (min(timeline_points) if timeline_points else now)
     return {"waves": board_waves, "generated_at": now, "source_id": source_id,
             "source_name": source_name,
-            "timeline_start_at": min(timeline_points) if timeline_points else now,
+            "timeline_start_at": timeline_start,
             "timeline_end_at": max(timeline_points) if timeline_points else now + timedelta(hours=1),
             "truncated": len(rows) >= 500}
 
