@@ -148,3 +148,16 @@ def test_simulator_foundation_cannot_claim_or_complete_raijin_tasks():
     assert "app.real_worker" not in simulator
     assert "claim_task" not in simulator
     assert "complete_task" not in simulator
+
+
+def test_simulation_guard_exposes_operational_apis_but_blocks_real_cloud_configuration():
+    main = Path("app/main.py").read_text(encoding="utf-8")
+
+    assert "Keep Simulation isolated while exposing the normal Raijin control plane" in main
+    assert 'path == "/api/readiness"' in main
+    assert 'path.startswith("/api/oci/")' in main
+    assert 'path.startswith("/api/aws-secrets")' in main
+    assert 'path.startswith("/api/aws-connections")' in main
+    assert 'path.startswith("/api/global-aws-pricing")' in main
+    assert 'path == "/api/sources" and request.method == "POST"' in main
+    assert "This real-cloud configuration endpoint is unavailable in Simulation mode" in main

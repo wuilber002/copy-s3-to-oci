@@ -772,6 +772,10 @@ def active_source_scope_conflicts(session: Session, bucket: str, prefixes: list[
 
 def require_non_overlapping_source_scope(session: Session, source: Source) -> None:
     """Block new operational work for an ambiguous active source scope."""
+    # Scenario catalogs are isolated by execution. Equal virtual bucket and
+    # prefix labels in different scenarios cannot address the same object.
+    if runtime_context.is_simulation:
+        return
     conflicts = active_source_scope_conflicts(session, source.s3_bucket, source_prefix_values(source), source.id)
     if conflicts and not runtime_settings(session).laboratory_mode_enabled:
         names = ", ".join(sorted({item["source_name"] for item in conflicts}))
@@ -989,10 +993,12 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 @app.middleware("http")
 async def simulation_foundation_guard(request: FastAPIRequest, call_next):
-    """Fail closed until simulated cloud operation ports are implemented.
+    """Keep Simulation isolated while exposing the normal Raijin control plane.
 
-    Health, runtime identity and the static shell remain observable. No current
-    operational API can accidentally reach a real cloud from Simulation mode.
+    Operational APIs work against the isolated simulation database and the
+    simulated cloud backend.  Endpoints whose only purpose is discovering or
+    configuring real AWS/OCI resources remain unavailable as defence in depth;
+    Simulation never receives cloud credentials in the first place.
     """
     from app.runtime_context import mode_switch_requested
     if request.method not in {"GET", "HEAD", "OPTIONS"} and mode_switch_requested() and request.url.path != "/api/runtime/mode":
@@ -1002,16 +1008,25 @@ async def simulation_foundation_guard(request: FastAPIRequest, call_next):
         )
     if runtime_context.is_simulation:
         path = request.url.path
-        allowed = (
-            path in {"/", "/healthz", "/api/runtime", "/api/runtime/mode"}
-            or path.startswith("/static/")
-            or path.startswith("/api/simulation")
+        real_cloud_only = (
+            path == "/api/readiness"
+            or path.startswith("/api/oci/")
+            or path.startswith("/api/aws-secrets")
+            or path.startswith("/api/aws-connections")
+            or path.startswith("/api/global-aws-pricing")
         )
-        if not allowed:
+        # The regular source form creates cloud-backed sources. Simulated
+        # sources are created from immutable scenarios on /simulation.
+        real_source_configuration = (
+            (path == "/api/sources" and request.method == "POST")
+            or (path.startswith("/api/sources/") and request.method == "PUT")
+            or path.endswith("/migrate-aws-connection")
+        )
+        if real_cloud_only or real_source_configuration:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "detail": "Simulation operational APIs are not enabled in this release phase",
+                    "detail": "This real-cloud configuration endpoint is unavailable in Simulation mode",
                     "operation_mode": runtime_context.mode.value,
                 },
             )
@@ -1693,8 +1708,15 @@ def aws_connection_configuration(connection: AwsConnection, secret: dict) -> dic
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
-    page_name = "simulation.html" if runtime_context.is_simulation else "index.html"
-    with open(f"app/static/{page_name}", encoding="utf-8") as page:
+    with open("app/static/index.html", encoding="utf-8") as page:
+        return page.read()
+
+
+@app.get("/simulation", response_class=HTMLResponse)
+def simulation_console() -> str:
+    if runtime_context.is_real:
+        raise HTTPException(status_code=404, detail="Simulation console is available only in Simulation mode")
+    with open("app/static/simulation.html", encoding="utf-8") as page:
         return page.read()
 
 
@@ -3138,7 +3160,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "transfer_strategy": s.transfer_strategy, "status": s.status,
              "aws_bucket_region": s.aws_bucket_region,
              "aws_connection_id": s.aws_connection_id,
-             "aws_connection_label": s.aws_connection.label if s.aws_connection else "Unassigned AWS connection",
+             "aws_connection_label": (s.aws_connection.label if s.aws_connection else
+                                      ("Simulated backend" if runtime_context.is_simulation else "Unassigned AWS connection")),
              "discovery_requested_at": s.discovery_requested_at, "discovery_completed_at": s.discovery_completed_at,
              "discovery_error": s.discovery_error, "discovery_pages_completed": s.discovery_pages_completed,
              "discovery_objects_inserted": s.discovery_objects_inserted,
@@ -3149,7 +3172,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "migration_status": migration_status(s), "operational_status": operational_status(s),
              "can_delete": not source_has_executed_wave(session, s.id),
              "transfer_strategy_locked": s.id in strategy_locked_ids,
-             "scope_conflicts": active_source_scope_conflicts(session, s.s3_bucket, source_prefix_values(s), s.id)}
+             "scope_conflicts": ([] if runtime_context.is_simulation else
+                                 active_source_scope_conflicts(session, s.s3_bucket, source_prefix_values(s), s.id))}
             for s in sources]
 
 

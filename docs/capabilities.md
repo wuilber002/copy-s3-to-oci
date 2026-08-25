@@ -331,6 +331,26 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
   declaradas. Os validadores separados comprovam catálogo e planejamento de
   100 TB lógicos com aproximadamente 640 mil objetos.
 
+### Experiência unificada no modo Simulation
+
+- O modo `SIMULATION` preserva as telas operacionais normais: **Status**,
+  **Queue**, **Migrations** e **Settings**. Sources virtuais, discoveries,
+  waves, filas, relatórios e workers são acompanhados e operados pelos mesmos
+  fluxos usados no modo real.
+- Um banner vermelho permanente identifica o runtime isolado. O botão vermelho
+  **Simulation**, exibido depois da engrenagem de configurações, abre a console
+  administrativa do backend virtual.
+- A página **Simulation** concentra somente a criação imutável de cenários,
+  templates, orçamento físico do modo `DATA`, relógio virtual, falhas injetadas,
+  evidências, replay e housekeeping. Discovery, estratégia, waves e queue
+  permanecem exclusivamente em **Migrations** e **Queue**.
+- No runtime simulado, endpoints de descoberta/configuração de AWS e OCI reais
+  ficam indisponíveis por defesa em profundidade. A aplicação também não recebe
+  credenciais de nuvem e usa o PostgreSQL isolado `migration_simulation`.
+- A troca de modo continua mediada pelo host e é recusada enquanto houver
+  tarefa ou discovery executável. Voltar ao modo `REAL` restaura o banco e as
+  configurações reais sem misturar registros entre os ambientes.
+
 ## Capacidades em evolução
 
 Estas capacidades já têm base implementada, mas devem continuar sendo refinadas

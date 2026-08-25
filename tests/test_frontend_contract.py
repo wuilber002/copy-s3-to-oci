@@ -373,3 +373,23 @@ def test_source_modal_keeps_original_full_width_form_layout():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "#source-modal .modal-panel{width:min(1400px,100%)}" in page
     assert 'id="source-form" class="source-form-layout"' in page
+
+
+def test_simulation_mode_keeps_the_regular_console_and_exposes_a_red_admin_page():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    simulation = (ROOT / "app/static/simulation.html").read_text(encoding="utf-8")
+    main = (ROOT / "app/main.py").read_text(encoding="utf-8")
+
+    assert 'id="simulation-nav" class="simulation-nav hidden"' in page
+    assert 'id="simulation-runtime-banner"' in page
+    assert "location.href='/simulation'" in page
+    assert "with open(\"app/static/index.html\"" in main
+    assert '@app.get("/simulation", response_class=HTMLResponse)' in main
+    assert 'class="simulation-active" href="/simulation">Simulation</a>' in simulation
+    assert 'href="/?view=dashboard">Status</a>' in simulation
+    assert 'href="/?view=queue">Queue</a>' in simulation
+    assert 'href="/?view=migrations">Migrations</a>' in simulation
+    assert "Open in Migrations" in simulation
+    assert '>Discovery</button><button onclick="createWaves' not in simulation
+    assert '>Create dynamic waves</button>' not in simulation
+    assert '>Queue all</button>' not in simulation
