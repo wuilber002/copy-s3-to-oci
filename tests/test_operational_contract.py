@@ -462,11 +462,11 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert '@app.get("/api/flight-board")' in source
     assert '@app.get("/api/flight-board/availability")' in source
     assert 'Wave.planner_mode == "DYNAMIC"' in source
-    assert '"QUEUE"' in source and '"RESTORE"' in source and '"TRANSFER"' in source
+    assert '"QUEUE"' in source and '"RESTORE"' in source and '"READY"' in source and '"TRANSFER"' in source
     assert 'id="flight-board-button"' in frontend
     assert 'function showFlightBoard()' in frontend
     assert 'flight-board-legend' in frontend
-    assert 'forecast_restore = phase("RESTORE", restore_end, wave.planned_transfer_start_at, planned=True)' in source
+    assert 'forecast_restore = phase("RESTORE", restore_end, expected_available_at, planned=True)' in source
     assert 'timeline_start = min(submitted_points)' in source
     assert '#flight-board-modal .modal-panel{width:min(1500px,calc(100vw - 2rem));overflow-x:hidden}' in frontend
     assert '.flight-board-chart{overflow:hidden;max-height:none}' in frontend
@@ -493,7 +493,19 @@ def test_dynamic_schedule_starts_bulk_restore_before_predicted_transfer_window()
     times = dynamic_schedule_times(now, [{"restore_tier": "BULK", "predicted_transfer_seconds": 3600}], 6 * 3600)
     restore_at, transfer_at = times[0]
     assert restore_at == now
-    assert transfer_at == now + __import__("datetime").timedelta(hours=54)
+    assert transfer_at == now + __import__("datetime").timedelta(hours=48)
+
+
+def test_dynamic_schedule_uses_safety_to_advance_later_restore_not_delay_first_wave():
+    now = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    plans = [
+        {"restore_tier": "BULK", "predicted_transfer_seconds": 60 * 3600},
+        {"restore_tier": "BULK", "predicted_transfer_seconds": 3600},
+    ]
+    first, second = dynamic_schedule_times(now, plans, 6 * 3600)
+    assert first == (now, now + __import__("datetime").timedelta(hours=48))
+    assert second[1] == now + __import__("datetime").timedelta(hours=108)
+    assert second[0] == now + __import__("datetime").timedelta(hours=54)
 
 
 def test_dynamic_scheduler_uses_a_durable_restore_horizon_and_not_all_jobs_at_once():

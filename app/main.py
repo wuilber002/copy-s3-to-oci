@@ -1108,6 +1108,43 @@ def create_schema() -> None:
                                     .order_by(DiscoveryJob.id.desc()).limit(1))
             source.last_discovery_mode = latest.mode if latest else "LEGACY"
             source.discovery_generation = max(1, int(source.discovery_generation or 0))
+        # Planner v1/v2 added the operational safety allowance to the first
+        # AWS service window. Correct active forecasts once: the first handoff
+        # is SLA-only, while safety continues to advance only future restore
+        # submissions. Observed restore/task evidence is never rewritten.
+        active_legacy_runs = list(session.scalars(select(DynamicPipelineRun).where(
+            DynamicPipelineRun.scheduled_restores.is_(True),
+            DynamicPipelineRun.planner_version.in_(["v1", "v2-adaptive"]),
+            DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
+        )))
+        migration_now = utcnow()
+        for run in active_legacy_runs:
+            waves = list(session.scalars(select(Wave).where(
+                Wave.pipeline_run_id == run.id
+            ).order_by(Wave.planned_transfer_start_at.nulls_last(), Wave.id)))
+            if not waves:
+                run.planner_version = "v3-service-window"
+                continue
+            first_request_at = session.scalar(select(func.min(ObjectRecord.restore_requested_at)).join(
+                Wave, ObjectRecord.wave_id == Wave.id
+            ).where(Wave.pipeline_run_id == run.id))
+            anchor = first_request_at or waves[0].planned_restore_at or run.created_at or migration_now
+            cursor = anchor + timedelta(seconds=restore_service_window_seconds(waves[0].restore_tier))
+            for wave in waves:
+                wave.planned_transfer_start_at = cursor
+                has_submission = session.scalar(select(Task.id).where(
+                    Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
+                ).limit(1)) is not None
+                if wave.status == "RESTORE_SCHEDULED" and not has_submission:
+                    restore_lead = restore_service_window_seconds(wave.restore_tier) + int(
+                        run.restore_safety_seconds or 0
+                    )
+                    wave.planned_restore_at = max(migration_now, cursor - timedelta(seconds=restore_lead))
+                cursor += timedelta(seconds=max(1, int(wave.predicted_transfer_seconds or 1)))
+            run.planner_version = "v3-service-window"
+            record_event(session, "DYNAMIC_SCHEDULE_SEMANTICS_UPGRADED",
+                         f"Pipeline run {run.id} now separates the AWS service window from operational safety",
+                         source_id=run.source_id)
         session.commit()
 
 
@@ -2079,22 +2116,29 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         if queued:
             phases.append(queued)
         restore_start = request_at or wave.planned_restore_at
+        expected_available_at = (
+            restore_start + timedelta(seconds=restore_service_window_seconds(wave.restore_tier))
+            if restore_start else None
+        )
         if request_at:
             restore_end = available_at or transfer_started_at or now
         else:
-            restore_end = wave.planned_transfer_start_at
+            restore_end = expected_available_at
         restore = phase("RESTORE", restore_start, restore_end, planned=not bool(request_at))
         if restore:
             phases.append(restore)
-        # While a restore is in progress, preserve both truths on the board:
-        # the solid segment is elapsed/observed time and the striped segment
-        # is the remaining forecast until the planned transfer window.  The
-        # previous rendering stopped the orange bar at ``now`` and left a
-        # misleading empty gap before the planned blue transfer segment.
-        if request_at and not available_at and wave.planned_transfer_start_at:
-            forecast_restore = phase("RESTORE", restore_end, wave.planned_transfer_start_at, planned=True)
+        # The orange forecast ends at the tier service window. Safety and
+        # transfer-lane serialization are not restore time. If they create a
+        # gap, expose it separately as readiness/waiting time.
+        if request_at and not available_at and expected_available_at:
+            forecast_restore = phase("RESTORE", restore_end, expected_available_at, planned=True)
             if forecast_restore:
                 phases.append(forecast_restore)
+        ready_start = available_at or expected_available_at
+        if not transfer_started_at and ready_start and wave.planned_transfer_start_at:
+            ready = phase("READY", ready_start, wave.planned_transfer_start_at, planned=not bool(available_at))
+            if ready:
+                phases.append(ready)
         transfer_start = transfer_started_at or wave.planned_transfer_start_at
         if transfer_started_at:
             transfer_end = transfer_completed_at or now
@@ -2119,6 +2163,7 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             "started_at": request_at or transfer_started_at,
             "completed_at": transfer_completed_at if status in {"COMPLETED", "VERIFIED", "TRANSFERRED"} else None,
             "planned_restore_at": wave.planned_restore_at,
+            "expected_restore_available_at": expected_available_at,
             "planned_transfer_start_at": wave.planned_transfer_start_at,
             "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
             "phases": phases,
@@ -3679,21 +3724,25 @@ def create_automatic_waves(source_id: int, payload: AutomaticWaveCreate, session
 
 def dynamic_schedule_times(now: datetime, plans: list[dict], safety_seconds: int) -> list[tuple[datetime, datetime]]:
     """Forecast a single transfer lane with restore requests issued in advance."""
-    # The first transfer cannot begin before the selected restore SLA.  The
-    # former forecast started at ``now + safety``, which displayed an
-    # impossible Bulk transfer window and released every restore immediately.
+    # Safety is an advance-notice allowance for later restore submissions. It
+    # is never added to the AWS service window and must not postpone the first
+    # transfer. Objects observed as available may be copied even earlier.
     first_tier = plans[0].get("restore_tier") if plans else "BULK"
-    first_restore_lead = (48 if first_tier == "BULK" else 12) * 3600 + safety_seconds
-    transfer_start = now + timedelta(seconds=first_restore_lead)
+    transfer_start = now + timedelta(seconds=restore_service_window_seconds(first_tier))
     times: list[tuple[datetime, datetime]] = []
     for plan in plans:
         # BULK maximum latency is 48h; Standard is planned conservatively at
         # 12h. The additional configured safety protects the handoff window.
-        restore_lead = (48 if plan.get("restore_tier") == "BULK" else 12) * 3600 + safety_seconds
+        restore_lead = restore_service_window_seconds(plan.get("restore_tier")) + safety_seconds
         restore_at = max(now, transfer_start - timedelta(seconds=restore_lead))
         times.append((restore_at, transfer_start))
         transfer_start += timedelta(seconds=plan["predicted_transfer_seconds"])
     return times
+
+
+def restore_service_window_seconds(tier: str | None) -> int:
+    """Return the conservative service window used by the local planner."""
+    return (48 if tier == "BULK" else 12) * 3600
 
 
 def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings, now: datetime | None = None) -> int:
@@ -3778,7 +3827,7 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             ).limit(1)) is not None
             if wave.status != "RESTORE_SCHEDULED" or has_batch_task:
                 continue
-            restore_lead = (48 if wave.restore_tier == "BULK" else 12) * 3600 + int(run.restore_safety_seconds or settings.dynamic_restore_safety_seconds)
+            restore_lead = restore_service_window_seconds(wave.restore_tier) + int(run.restore_safety_seconds or settings.dynamic_restore_safety_seconds)
             new_restore_at = max(now, start - timedelta(seconds=restore_lead))
             shifted = abs((wave.planned_transfer_start_at - start).total_seconds()) if wave.planned_transfer_start_at else float("inf")
             if shifted >= 60:
@@ -3849,7 +3898,8 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
     times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
     historical_samples = sum(value["samples"] for value in result["profiles"].values())
     run = DynamicPipelineRun(
-        source_id=source.id, status="SCHEDULED" if schedule_restores else "PLANNED",
+        source_id=source.id, planner_version="v3-service-window",
+        status="SCHEDULED" if schedule_restores else "PLANNED",
         target_max_bytes=DYNAMIC_PLATFORM_MAX_BYTES, target_transfer_seconds=target_transfer_seconds,
         max_objects=DYNAMIC_PLATFORM_MAX_OBJECTS, restore_safety_seconds=result["settings"].dynamic_restore_safety_seconds,
         restore_days=payload.restore_days, restore_tier=payload.restore_tier,
