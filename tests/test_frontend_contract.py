@@ -316,6 +316,10 @@ def test_wave_creation_uses_one_shared_action_for_every_method():
 
 def test_wave_report_explains_restore_failures_and_supports_evidence_recovery():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "function renderWaveReportOverall" in page
+    assert "Status geral:" in page
+    assert "Polling de disponibilidade" in page
+    assert "wave-report-overall" in page
     assert "function renderRestoreDiagnosis" in page
     assert "Status do processamento do restore" in page
     assert "restoreDiagnosisMessage" in page
