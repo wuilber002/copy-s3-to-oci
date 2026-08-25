@@ -167,6 +167,8 @@ externas serão substituídas por implementações simuladas.
   multipart, polling ou auditoria em execução ou aguardando processamento.
 - A interface exibirá um banner permanente e marcará sources, waves, eventos e
   relatórios como `SIMULATED`.
+- Cada execução terá modalidade imutável `CONTROL` ou `DATA`. Para testar outro
+  princípio, o operador clonará o cenário e iniciará uma execução independente.
 
 ### Inventário e buckets virtuais
 
@@ -250,6 +252,9 @@ externas serão substituídas por implementações simuladas.
 - Essa modalidade será executada com volumes físicos representativos menores;
   ela valida streaming e integridade, enquanto a transferência lógica valida
   escalas como 100 TB ou mais.
+- O orçamento físico padrão será de 1 TB decimal, configurável antes da
+  execução e sem limite máximo imposto pelo produto. A console apresentará a
+  estimativa de impacto e pedirá confirmação para valores elevados.
 
 ### Destino OCI virtual e reconciliação
 
@@ -277,6 +282,23 @@ externas serão substituídas por implementações simuladas.
   reais por leases, retries e checkpoints.
 - Relatórios compararão previsão e execução, mostrarão falhas injetadas,
   decisões do scheduler e evidências de que nenhum endpoint real foi chamado.
+- Templates poderão definir perfis conhecidos de restore, rede e falhas. Cada
+  execução receberá uma cópia imutável do template, incluindo seed e regras,
+  para que alterações futuras no modelo não modifiquem testes históricos.
+- A reprodução criará uma nova execução a partir do snapshot persistido e
+  repetirá a mesma sequência até que a evidência deixe de ser necessária.
+
+### Retenção e compatibilidade
+
+- Cenários e evidências poderão ser excluídos manualmente ou pelo housekeeping,
+  cuja retenção padrão será de 60 dias e poderá ser alterada na console.
+- A retenção será contada depois que a execução atingir um estado terminal;
+  trabalhos ativos, templates e registros referenciados não serão apagados.
+- RAIJIN e simulador serão atualizados juntos e aceitarão somente uma versão
+  compatível do contrato interno, validada no startup.
+- O gerador de dados terá versão persistida. Algoritmos antigos permanecerão
+  disponíveis enquanto existirem cenários dependentes; depois disso, seus
+  registros poderão ser limpos e o código será retirado em uma release normal.
 
 ## Capacidades em evolução
 
