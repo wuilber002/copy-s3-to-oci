@@ -233,7 +233,7 @@ def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     assert 'id="wave-cost-modal"' in page
     assert "editCostPricing" in page
     assert "showWaveCost" in page
-    assert "Custo estimado" in page
+    assert "Estimativa de custo" in page
 
 
 def test_cost_estimation_has_a_global_operational_toggle():
@@ -243,6 +243,8 @@ def test_cost_estimation_has_a_global_operational_toggle():
     assert "estimativa de custo está desabilitada" in page
     assert "wave-cost-action" in page
     assert "source-cost-action" in page
+    assert page.count("button.textContent='💰 Estimativa'") == 2
+    assert "button.textContent='💲'" not in page
 
 
 def test_cost_estimation_supports_public_aws_prices_and_per_connection_overrides():
