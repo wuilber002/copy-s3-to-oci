@@ -115,6 +115,8 @@ def test_mode_switch_audits_each_database_with_its_own_role():
     mode_switch = Path("scripts/raijin-mode.sh").read_text(encoding="utf-8")
     assert "database=migration_simulation" in mode_switch
     assert "database_user=migration_simulation" in mode_switch
+    assert "JOIN waves ON waves.id = tasks.wave_id" in mode_switch
+    assert "waves.status <> 'PAUSED'" in mode_switch
 
 
 def test_terraform_creates_distinct_real_and_simulation_database_secrets():

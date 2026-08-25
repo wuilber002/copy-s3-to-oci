@@ -20,7 +20,7 @@ if [[ "$current" == SIMULATION ]]; then
   database_user=migration_simulation
 fi
 active="$(podman exec s3-oci-postgres psql -U "$database_user" -d "$database" -tAc \
-  "SELECT COALESCE((SELECT count(*) FROM tasks WHERE state IN ('READY','RUNNING')),0) + COALESCE((SELECT count(*) FROM discovery_jobs WHERE state IN ('READY','RUNNING')),0)" 2>/dev/null | tr -d '[:space:]')"
+  "SELECT COALESCE((SELECT count(*) FROM tasks JOIN waves ON waves.id = tasks.wave_id WHERE tasks.state IN ('READY','RUNNING') AND waves.status <> 'PAUSED'),0) + COALESCE((SELECT count(*) FROM discovery_jobs WHERE state IN ('READY','RUNNING')),0)" 2>/dev/null | tr -d '[:space:]')"
 if [[ ! "$active" =~ ^[0-9]+$ ]]; then
   echo "Could not prove that the $current durable queues are idle; mode switch refused" >&2
   exit 1
