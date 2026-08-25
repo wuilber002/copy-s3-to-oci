@@ -41,6 +41,10 @@ de fazer** e **como ela organiza a operação**.
   de conclusão persistidos no bucket de controle.
 - Registra tentativa, aceite AWS, Batch job, polling, disponibilidade parcial e
   disponibilidade completa do restore.
+- Importa a evidência individual do completion report e apresenta no relatório
+  da wave o código HTTP/AWS, a quantidade afetada, chaves de exemplo, causa e
+  ação recomendada. `RestoreAlreadyInProgress` é reconhecido como aceite
+  equivalente, sem criar um restore duplicado.
 - Permite duas estratégias: iniciar transferência somente após toda a wave estar
   restaurada ou liberar objetos à medida que se tornam disponíveis.
 - Opera uma wave de transferência por vez, com múltiplos workers para copiar os

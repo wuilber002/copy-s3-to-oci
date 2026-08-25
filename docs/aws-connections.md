@@ -60,26 +60,28 @@ separate connection with a control bucket in that region. Before discovery and
 before every paid Batch restore submission, RAIJIN checks the region returned
 by `HeadBucket` for both the source and the control bucket. A restore is
 blocked unless the connection, actual source bucket and control bucket regions
-are identical. **Sync AWS region** is retained only to diagnose legacy data;
-it refuses a mismatch rather than changing a source away from its connection.
+are identical.
 
 ## Restore evidence and failure handling
 
 Each Batch restore submission creates an immutable local restore attempt with
 the AWS Batch Job ID, region, manifest ETag, expected object count and later
 the completion-report location and ETag. A wave does **not** move to
-`RESTORING` merely because the Batch Job is `Complete`. RAIJIN requires that
-the job counters match the manifest, every task succeeds and the completion
-report is imported per object before it records `RESTORE_REQUEST_ACCEPTED`.
+`RESTORING` merely because the Batch Job is `Complete`. RAIJIN imports the
+completion report per object and classifies its immutable evidence before it
+records `RESTORE_REQUEST_ACCEPTED`.
 
 For each report row, RAIJIN preserves the object/version, task result, HTTP
-status, AWS error code and error message. If the job has failures, the wave is
-placed in `RESTORE_REQUEST_FAILED`; transfer and availability polling stop.
-Some all-failed jobs do not produce a completion report, so RAIJIN persists
-the Batch Job counters and explicitly records the missing evidence rather than
-claiming that a restore is in progress. Reprocessing retains the previous
-attempt for audit and creates a new Batch Job only after the operator has
-corrected the cause.
+status, AWS error code and error message. The wave report groups those results,
+shows counts and sample keys, and gives an operator action. AWS reports
+`RestoreAlreadyInProgress` as a failed Batch task, but the requested state
+already exists; RAIJIN therefore treats it as accepted-equivalent and continues
+availability polling without submitting a duplicate restore. Other error codes
+place the wave in `RESTORE_REQUEST_FAILED` and stop transfer. If historical
+processing failed before importing an available report, the operator can queue
+evidence recovery for the existing Job ID; this does not create a new paid
+Batch job. Reprocessing remains reserved for a genuine cause that requires a
+new submission and preserves the previous attempt for audit.
 
 Only currently compatible Secrets appear in the registration combobox. A
 connection already registered remains in the database if a later Secret version
