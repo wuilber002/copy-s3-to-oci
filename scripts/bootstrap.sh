@@ -7,6 +7,34 @@ secret_root=/etc/s3-oci-migration/secrets
 runtime_root=/run/s3-oci-migration
 mode_control_root=/var/lib/s3-oci-migration/mode-control
 oci_runtime_config=/etc/s3-oci-migration/oci-runtime.json
+bootstrap_complete=false
+
+cleanup_failed_bootstrap() {
+  local exit_status=$?
+  trap - EXIT
+  if (( exit_status == 0 )) || [[ "$bootstrap_complete" == true ]]; then
+    exit "$exit_status"
+  fi
+
+  echo "RAIJIN bootstrap failed; stopping partially started containers" >&2
+  if command -v podman >/dev/null 2>&1; then
+    local containers=(
+      s3-oci-governance-worker
+      s3-oci-transfer-worker
+      s3-oci-app
+      s3-oci-simulator
+      s3-oci-postgres
+    )
+    # Explicit stop overrides each container's restart policy and releases the
+    # systemd service cgroup. Persistent PostgreSQL data remains on the host
+    # volume and the next start can retry safely.
+    podman stop -t 10 --ignore "${containers[@]}" >/dev/null 2>&1 || true
+    podman rm -f --ignore "${containers[@]}" >/dev/null 2>&1 || true
+  fi
+  exit "$exit_status"
+}
+
+trap cleanup_failed_bootstrap EXIT
 
 mkdir -p "$data_root/postgres" "$secret_root" "$runtime_root" "$mode_control_root"
 chmod 700 "$secret_root"
@@ -212,3 +240,6 @@ systemctl enable --now s3-oci-platform-status.timer
 systemctl disable --now s3-oci-simulated-worker.service 2>/dev/null || true
 rm -f /etc/systemd/system/s3-oci-simulated-worker.service /usr/local/sbin/s3-oci-simulated-worker
 systemctl daemon-reload
+
+bootstrap_complete=true
+trap - EXIT

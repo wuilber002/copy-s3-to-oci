@@ -95,6 +95,10 @@ def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real
     assert "simulation_postgres_password" in bootstrap
     assert 'chown 70:70 "$secret_root/simulation_postgres_password"' in bootstrap
     assert 'chmod 0400 "$secret_root/simulation_postgres_password"' in bootstrap
+    assert "trap cleanup_failed_bootstrap EXIT" in bootstrap
+    assert 'podman stop -t 10 --ignore "${containers[@]}"' in bootstrap
+    assert "s3-oci-postgres" in bootstrap[bootstrap.index("cleanup_failed_bootstrap"):bootstrap.index("trap cleanup_failed_bootstrap EXIT")]
+    assert "bootstrap_complete=true" in bootstrap
     assert "CREATE ROLE migration_simulation" in bootstrap
     assert "createdb -U migration -O migration_simulation migration_simulation" in bootstrap
     assert "printf 'REAL\\n'" in bootstrap
