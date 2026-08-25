@@ -53,7 +53,7 @@
     'Editar origem': 'Edit source', 'Excluir': 'Delete', 'Arquivar': 'Archive', 'Atualizar': 'Refresh',
     'Cadastre ou selecione uma origem.': 'Create or select a source.', 'Objetos descobertos': 'Discovered objects', 'Objetos encontrados no discovery': 'Objects found during discovery',
     'Exibir por página': 'Show per page', 'Buscar chave S3': 'Search S3 key', 'Buscar': 'Search',
-    'Criar ondas': 'Create waves',
+    'Criar ondas': 'Create waves', 'Criar onda': 'Create wave',
     'Criar uma onda manualmente': 'Create one wave manually', 'Criar todas automaticamente': 'Create all automatically', 'Criar automaticamente por prefixo': 'Create automatically by prefix',
     'Onda manual': 'Manual wave', 'Nome da onda': 'Wave name', 'Quantidade de dados': 'Data amount', 'Unidade de medida': 'Unit of measure',
     'Retenção do restore (dias)': 'Restore retention (days)', 'Tier de restore': 'Restore tier', 'Criar onda manual': 'Create manual wave',

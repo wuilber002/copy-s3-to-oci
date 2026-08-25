@@ -276,3 +276,17 @@ def test_cost_symbols_show_hover_summary_and_keep_clickable_detail():
     assert "costTooltip(data)" in page
     assert ".cost-action[data-cost-help]:hover::after" in page
     assert "Custo único ${complete?'estimado':'parcial'}" in page
+
+
+def test_wave_creation_uses_one_shared_action_for_every_method():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="wave-create-submit"' in page
+    assert 'onclick="submitSelectedWaveMethod()">Criar onda</button>' in page
+    assert "function submitSelectedWaveMethod()" in page
+    assert "manual:'#wave-form'" in page
+    assert "automatic:'#automatic-wave-form'" in page
+    assert "prefix:'#prefix-wave-form'" in page
+    assert "dynamic:'#dynamic-wave-form'" in page
+    assert "<h3>Onda manual</h3>" not in page
+    assert "<h3>Ondas por prefixo S3</h3>" not in page
+    assert "<h3>Criação dinâmica</h3>" not in page
