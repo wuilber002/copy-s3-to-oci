@@ -451,7 +451,6 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
     pending_token = continuation_token
     next_request_at = 0.0
     connection = source.aws_connection
-    bucket_name = source.s3_bucket
     request_interval = 1.0 / max(1, int(getattr(connection, "discovery_requests_per_second", 10) or 10))
 
     def checkpoint_batch() -> None:
@@ -565,6 +564,7 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
     metrics: dict[str, float | int] = {"requests": 0, "throttle_retries": 0, "elapsed_seconds": 0.0}
     started_at = time.monotonic()
     connection = source.aws_connection
+    bucket_name = source.s3_bucket
     requests_per_second = max(1, int(getattr(connection, "restore_poll_requests_per_second", RESTORE_POLL_HEAD_REQUESTS_PER_SECOND) or RESTORE_POLL_HEAD_REQUESTS_PER_SECOND))
     concurrency = max(1, int(getattr(connection, "restore_poll_concurrency", RESTORE_POLL_HEAD_CONCURRENCY) or RESTORE_POLL_HEAD_CONCURRENCY))
     # Plain immutable values remain safe after a progress callback commits the

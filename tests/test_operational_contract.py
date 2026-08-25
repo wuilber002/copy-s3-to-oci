@@ -16,7 +16,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 from datetime import datetime, timedelta, timezone
 
 from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, list_sources, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
-from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
+from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -324,6 +324,23 @@ def test_restore_poll_is_targeted_to_pending_wave_objects():
     assert restored_from_head_response({"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'})
     assert not restored_from_head_response({"Restore": 'ongoing-request="true"'})
     assert restore_expiry_from_head_response({"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'}).isoformat() == "2026-08-22T00:00:00+00:00"
+
+
+def test_restore_poll_uses_the_source_bucket_after_orm_checkpoint_safety_refactor():
+    calls = []
+
+    class S3:
+        def head_object(self, **kwargs):
+            calls.append(kwargs)
+            return {"Restore": 'ongoing-request="false", expiry-date="Fri, 22 Aug 2026 00:00:00 GMT"'}
+
+    connection = type("Connection", (), {"restore_poll_requests_per_second": 10, "restore_poll_concurrency": 10})()
+    source = type("Source", (), {"s3_bucket": "archive-source", "aws_connection": connection})()
+    obj = type("Object", (), {"id": 17, "object_key": "prefix/file.bin", "version_id": None})()
+    ready, metrics = restored_pending_archives_from_head(S3(), source, [obj])
+    assert calls == [{"Bucket": "archive-source", "Key": "prefix/file.bin"}]
+    assert ready[17].isoformat() == "2026-08-22T00:00:00+00:00"
+    assert metrics["requests"] == 1
 
 
 def test_restore_models_preserve_attempt_and_per_object_evidence():
