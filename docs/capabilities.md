@@ -292,13 +292,21 @@ externas serão substituídas por implementações simuladas.
 
 - Cenários e evidências poderão ser excluídos manualmente ou pelo housekeeping,
   cuja retenção padrão será de 60 dias e poderá ser alterada na console.
-- A retenção será contada depois que a execução atingir um estado terminal;
+- A retenção será contada depois que a execução atingir um estado terminal. O
+  lifecycle será `ACTIVE → DEPRECATED → PURGE_ELIGIBLE → PURGED`: após 60 dias,
+  os dados entram em depreciação reversível e permanecem em quarentena por mais
+  30 dias antes de poderem ser removidos.
+- Durante a quarentena, um administrador poderá restaurar o registro para
+  `ACTIVE`. Antes da purga, uma nova verificação referencial será obrigatória;
   trabalhos ativos, templates e registros referenciados não serão apagados.
+- A purga automática será configurável e poderá exigir aprovação manual. Um
+  tombstone mínimo de auditoria será preservado, e os backups deverão cobrir o
+  período completo de quarentena.
 - RAIJIN e simulador serão atualizados juntos e aceitarão somente uma versão
   compatível do contrato interno, validada no startup.
 - O gerador de dados terá versão persistida. Algoritmos antigos permanecerão
-  disponíveis enquanto existirem cenários dependentes; depois disso, seus
-  registros poderão ser limpos e o código será retirado em uma release normal.
+  disponíveis enquanto existirem cenários dependentes; depois disso, seguirão
+  o mesmo ciclo de depreciação, e o código será retirado em uma release normal.
 
 ## Capacidades em evolução
 

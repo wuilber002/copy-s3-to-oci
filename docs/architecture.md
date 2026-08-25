@@ -4,6 +4,26 @@ Uma única VM Linux em OCI hospeda a aplicação, PostgreSQL, orquestrador, work
 
 O PostgreSQL é a fonte de verdade e a fila durável. As tarefas usam reserva transacional, lease e heartbeat. Após uma queda ou reboot, tarefas com lease expirado são retomadas de forma idempotente.
 
+## Backend simulado planejado
+
+O RAIJIN terá um modo `SIMULATION` mutuamente exclusivo com o modo `REAL`. Ele
+usará os mesmos governance e transfer workers, substituindo somente as
+integrações AWS e OCI por um backend externo simulado. Inventários, fila,
+histórico e configurações ficarão em um banco lógico separado chamado
+`migration_simulation`; credenciais e configurações das nuvens reais não serão
+montadas nesse modo.
+
+Cada execução será imutavelmente `CONTROL`, para validar grandes volumes de
+forma lógica, ou `DATA`, para validar streaming, SHA-256, multipart e retomada
+com bytes determinísticos gerados localmente. O destino virtual calculará
+evidências sobre os bytes recebidos e os descartará imediatamente, mantendo no
+banco somente catálogo, checksums, manifestos e histórico.
+
+A troca de modo exigirá drenagem completa dos trabalhos. RAIJIN e simulador
+usarão um único contrato interno versionado e deverão passar por handshake de
+compatibilidade no startup. A capacidade permanece planejada e seu contrato
+funcional está detalhado em [Capacidades e operação](capabilities.md).
+
 ## Princípios
 
 - Uma onda tem no máximo 10 TB.
