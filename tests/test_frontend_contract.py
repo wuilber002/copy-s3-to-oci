@@ -157,7 +157,7 @@ def test_source_summary_shows_discovery_duration_and_checkpoint_progress():
 def test_discovery_is_selected_in_a_minimal_modal_with_remote_and_inventory_file_paths():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="discovery-modal"' in page
-    assert 'onclick="openDiscoveryModal()">Discovery</button>' in page
+    assert 'onclick="openDiscoveryModal()" disabled>Discovery</button>' in page
     assert 'id="discovery-mode-remote"' in page
     assert 'id="discovery-mode-file"' in page
     assert 'id="inventory-file" type="file"' in page
@@ -303,7 +303,10 @@ def test_cost_symbols_show_hover_summary_and_keep_clickable_detail():
 def test_wave_creation_uses_one_shared_action_for_every_method():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="wave-create-submit"' in page
-    assert 'onclick="submitSelectedWaveMethod()">Criar onda</button>' in page
+    assert 'onclick="submitSelectedWaveMethod()" disabled>Criar onda</button>' in page
+    assert 'id="wave-creation-empty"' in page
+    assert "function syncSourceDependentControls" in page
+    assert "queueAll.disabled=true" in page
     assert "function submitSelectedWaveMethod()" in page
     assert "manual:'#wave-form'" in page
     assert "automatic:'#automatic-wave-form'" in page
@@ -312,6 +315,16 @@ def test_wave_creation_uses_one_shared_action_for_every_method():
     assert "<h3>Onda manual</h3>" not in page
     assert "<h3>Ondas por prefixo S3</h3>" not in page
     assert "<h3>Criação dinâmica</h3>" not in page
+
+
+def test_buttons_use_content_width_and_standard_horizontal_spacing():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "width:max-content!important" in page
+    assert "padding-left:2em!important" in page
+    assert "padding-right:2em!important" in page
+    assert 'id="waves-queue-all" class="secondary" onclick="queueAllPlannedWaves()" disabled' in page
+    assert 'id="source-validate-destination"' in page
+    assert 'id="source-edit-action"' in page
 
 
 def test_wave_report_explains_restore_failures_and_supports_evidence_recovery():
