@@ -337,8 +337,9 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
   **Queue**, **Migrations** e **Settings**. Sources virtuais, discoveries,
   waves, filas, relatórios e workers são acompanhados e operados pelos mesmos
   fluxos usados no modo real.
-- Um banner vermelho permanente identifica o runtime isolado. O botão vermelho
-  **Simulation**, exibido depois da engrenagem de configurações, abre a console
+- Um banner vermelho permanente identifica o runtime isolado. O botão
+  **Simulation**, exibido entre **Migrations** e a engrenagem de configurações,
+  usa texto vermelho quando inativo e fundo vermelho quando selecionado, abrindo a console
   administrativa do backend virtual.
 - A página **Simulation** concentra somente a criação imutável de cenários,
   templates, orçamento físico do modo `DATA`, relógio virtual, falhas injetadas,
