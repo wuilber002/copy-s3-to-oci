@@ -73,6 +73,7 @@ case "$mode" in
       -e DATABASE_URL=postgresql+psycopg://migration_simulation@postgres:5432/migration_simulation \
       -e POSTGRES_PASSWORD_FILE=/run/secrets/simulation_postgres_password \
       -e RAIJIN_MODE_REQUEST_FILE=/run/mode-control/request \
+      -v "$runtime_root:/run/platform-status:ro,z" \
       -v "$mode_control_root:/run/mode-control:rw,z" \
       -v "$secret_root/simulation_postgres_password:/run/secrets/simulation_postgres_password:ro,z" "$image"
     for attempt in $(seq 1 30); do

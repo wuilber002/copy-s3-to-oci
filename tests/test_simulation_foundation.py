@@ -111,6 +111,8 @@ def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real
     assert "OCI_RUNTIME_CONFIG_FILE" not in simulation_branch
     assert "AWS_ACCESS_KEY_ID" not in simulation_branch
     assert "PYTHONPATH=/app" in simulation_branch
+    simulation_app = simulation_branch[simulation_branch.index("--name s3-oci-app"):simulation_branch.index("for attempt in $(seq 1 30)", simulation_branch.index("--name s3-oci-app"))]
+    assert '-v "$runtime_root:/run/platform-status:ro,z"' in simulation_app
     assert stop_runtime.index("s3-oci-postgres") > stop_runtime.index("s3-oci-simulator")
     assert "state IN ('READY','RUNNING')" in switch
 

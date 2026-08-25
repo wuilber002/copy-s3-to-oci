@@ -356,6 +356,9 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
 - No runtime simulado, endpoints de descoberta/configuração de AWS e OCI reais
   ficam indisponíveis por defesa em profundidade. A aplicação também não recebe
   credenciais de nuvem e usa o PostgreSQL isolado `migration_simulation`.
+- O arquivo de saúde produzido pelo host é montado somente para leitura tanto
+  no runtime real quanto no simulado; CPU, memória, timers e containers
+  permanecem observáveis sem conceder controle do host à aplicação.
 - A troca de modo continua mediada pelo host e é recusada enquanto houver
   tarefa ou discovery executável. Voltar ao modo `REAL` restaura o banco e as
   configurações reais sem misturar registros entre os ambientes.
