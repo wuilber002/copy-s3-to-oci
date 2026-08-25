@@ -81,6 +81,6 @@ O tamanho mínimo de laboratório é 2 OCPUs/8 GB. Ele suporta PostgreSQL, a int
 
 ## Recuperação
 
-PostgreSQL, backups lógicos locais, WAL, logs e releases residem no boot volume persistente. Uma policy automática de backup do boot volume deve ser associada à VM, com retenção mínima de 14 dias. Backup local acelera restauração, mas o backup do volume protege contra perda da VM ou do disco.
+PostgreSQL, backups lógicos locais, WAL, logs e releases residem no boot volume persistente. Uma policy automática de backup do boot volume deve ser associada à VM, com retenção padrão de 35 dias para cobrir a quarentena do simulador. Backup local acelera restauração, mas o backup do volume protege contra perda da VM ou do disco.
 
 O `user_data` do cloud-init é intencionalmente ignorado em atualizações Terraform: ele só executa no primeiro boot. Uma atualização de release nunca pode substituir uma VM que contém o banco de controle.

@@ -5,9 +5,10 @@ install_root=/opt/s3-oci-migration/release
 data_root=/var/lib/s3-oci-migration
 secret_root=/etc/s3-oci-migration/secrets
 runtime_root=/run/s3-oci-migration
+mode_control_root=/var/lib/s3-oci-migration/mode-control
 oci_runtime_config=/etc/s3-oci-migration/oci-runtime.json
 
-mkdir -p "$data_root/postgres" "$secret_root" "$runtime_root"
+mkdir -p "$data_root/postgres" "$secret_root" "$runtime_root" "$mode_control_root"
 chmod 700 "$secret_root"
 # The web service is loopback-only. SSH is the sole administrative entrypoint,
 # and it accepts only the public key provisioned by Terraform/cloud-init.
@@ -35,9 +36,15 @@ if [[ ! -s "$secret_root/postgres_password" ]]; then
     --secret-name postgres_password \
     --output "$secret_root/postgres_password"
 fi
+if [[ ! -s "$secret_root/simulation_postgres_password" ]]; then
+  python3 "$install_root/scripts/fetch-oci-secret.py" \
+    --runtime-config "$oci_runtime_config" \
+    --secret-name simulation_postgres_password \
+    --output "$secret_root/simulation_postgres_password"
+fi
 
 podman network exists s3-oci-migration 2>/dev/null || podman network create s3-oci-migration
-podman rm -f s3-oci-app s3-oci-postgres s3-oci-governance-worker s3-oci-transfer-worker s3-oci-real-worker 2>/dev/null || true
+podman rm -f s3-oci-app s3-oci-postgres s3-oci-governance-worker s3-oci-transfer-worker s3-oci-real-worker s3-oci-simulator 2>/dev/null || true
 
 podman run -d --name s3-oci-postgres --replace --restart unless-stopped \
   --network s3-oci-migration --network-alias postgres \
@@ -46,6 +53,7 @@ podman run -d --name s3-oci-postgres --replace --restart unless-stopped \
   -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
   -v "$data_root/postgres:/var/lib/postgresql/data:Z" \
   -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
+  -v "$secret_root/simulation_postgres_password:/run/secrets/simulation_postgres_password:ro,z" \
   docker.io/library/postgres:16-alpine
 
 postgres_ready=false
@@ -61,59 +69,42 @@ if [[ "$postgres_ready" != true ]]; then
   exit 1
 fi
 
-podman build -t localhost/s3-oci-migration:latest "$install_root"
-podman run -d --name s3-oci-app --replace --restart unless-stopped \
-  --network s3-oci-migration \
-  -p 127.0.0.1:8080:8080 \
-  -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
-  -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
-  -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
-  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
-  -v "$runtime_root:/run/platform-status:ro,z" \
-  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,z" \
-  localhost/s3-oci-migration:latest
-
-# The API startup performs safe additive schema migrations. Wait for it before
-# starting the worker, otherwise a freshly deployed worker could query a new
-# column a few seconds before that migration has completed.
-app_ready=false
-for attempt in $(seq 1 30); do
-  if curl --fail --silent http://127.0.0.1:8080/healthz >/dev/null; then
-    app_ready=true
-    break
-  fi
-  sleep 2
-done
-if [[ "$app_ready" != true ]]; then
-  echo "API did not become healthy; real worker will not start" >&2
-  exit 1
+# A distinct role and database keep real and simulated control-plane state
+# isolated while sharing the same durable PostgreSQL container. The password
+# is read inside PostgreSQL from the mounted Secret and never enters argv/logs.
+podman exec -i s3-oci-postgres psql -U migration -d migration -v ON_ERROR_STOP=1 <<'SQL'
+DO $block$
+DECLARE
+  simulation_password text := trim(pg_read_file('/run/secrets/simulation_postgres_password'));
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'migration_simulation') THEN
+    EXECUTE format('CREATE ROLE migration_simulation LOGIN PASSWORD %L', simulation_password);
+  ELSE
+    EXECUTE format('ALTER ROLE migration_simulation PASSWORD %L', simulation_password);
+  END IF;
+END
+$block$;
+SQL
+if ! podman exec s3-oci-postgres psql -U migration -d migration -tAc \
+  "SELECT 1 FROM pg_database WHERE datname = 'migration_simulation'" | grep -q 1; then
+  podman exec s3-oci-postgres createdb -U migration -O migration_simulation migration_simulation
 fi
 
-# Kept separate from the API: governance owns discovery, Batch Operations,
-# restore polling and deep audits. It remains idle until explicitly enabled.
-podman run -d --name s3-oci-governance-worker --replace --restart unless-stopped \
-  --network s3-oci-migration \
-  -e RAIJIN_WORKER_ID=raijin-governance-worker-vm \
-  -e RAIJIN_WORKER_ROLE=governance \
-  -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
-  -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
-  -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
-  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
-  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,z" \
-  localhost/s3-oci-migration:latest python3 -m app.real_worker
-
-# Transfer owns only file copy and multipart resume. A long object cannot
-# delay a restore poll, discovery checkpoint or scheduler decision.
-podman run -d --name s3-oci-transfer-worker --replace --restart unless-stopped \
-  --network s3-oci-migration \
-  -e RAIJIN_WORKER_ID=raijin-transfer-worker-vm \
-  -e RAIJIN_WORKER_ROLE=transfer \
-  -e DATABASE_URL=postgresql+psycopg://migration@postgres:5432/migration \
-  -e POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password \
-  -e OCI_RUNTIME_CONFIG_FILE=/run/oci-runtime/oci-runtime.json \
-  -v "$secret_root/postgres_password:/run/secrets/postgres_password:ro,z" \
-  -v "$oci_runtime_config:/run/oci-runtime/oci-runtime.json:ro,z" \
-  localhost/s3-oci-migration:latest python3 -m app.real_worker
+podman build -t localhost/s3-oci-migration:latest "$install_root"
+mode_file=/etc/s3-oci-migration/operation-mode
+if [[ ! -s "$mode_file" ]]; then
+  printf 'REAL\n' >"$mode_file"
+fi
+operation_mode="$(tr '[:lower:]' '[:upper:]' <"$mode_file")"
+[[ "$operation_mode" == REAL || "$operation_mode" == SIMULATION ]] || {
+  echo "Invalid operation mode in $mode_file" >&2
+  exit 1
+}
+install -m 0750 "$install_root/scripts/start-runtime.sh" /usr/local/sbin/s3-oci-start-runtime
+install -m 0750 "$install_root/scripts/stop-runtime.sh" /usr/local/sbin/s3-oci-stop-runtime
+install -m 0750 "$install_root/scripts/raijin-mode.sh" /usr/local/sbin/raijin-mode
+install -m 0750 "$install_root/scripts/process-mode-request.sh" /usr/local/sbin/s3-oci-process-mode-request
+/usr/local/sbin/s3-oci-start-runtime "$operation_mode"
 
 cat >/etc/systemd/system/s3-oci-migration.service <<'EOF'
 [Unit]
@@ -125,7 +116,7 @@ Wants=network-online.target
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/opt/s3-oci-migration/release/scripts/bootstrap.sh
-ExecStop=/usr/bin/podman stop -t 30 s3-oci-app s3-oci-governance-worker s3-oci-transfer-worker s3-oci-postgres
+ExecStop=/usr/local/sbin/s3-oci-stop-runtime
 
 [Install]
 WantedBy=multi-user.target
@@ -133,6 +124,31 @@ EOF
 
 systemctl daemon-reload
 systemctl enable s3-oci-migration.service
+
+cat >/etc/systemd/system/s3-oci-mode-request.service <<'EOF'
+[Unit]
+Description=Process a validated RAIJIN operation-mode request
+After=s3-oci-migration.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/s3-oci-process-mode-request
+EOF
+cat >/etc/systemd/system/s3-oci-mode-request.timer <<'EOF'
+[Unit]
+Description=Watch for RAIJIN operation-mode requests
+
+[Timer]
+OnBootSec=10
+OnUnitActiveSec=5
+AccuracySec=1
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now s3-oci-mode-request.timer
 
 install -m 0750 "$install_root/scripts/backup-postgres.sh" /usr/local/sbin/s3-oci-backup-postgres
 install -m 0750 "$install_root/scripts/restore-postgres.sh" /usr/local/sbin/s3-oci-restore-postgres

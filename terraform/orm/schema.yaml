@@ -151,9 +151,14 @@ variables:
     type: boolean
     default: true
     required: true
-    description: Creates the PostgreSQL password Secret. Disable only when the customer supplies it and manages Secret access outside this stack.
+    description: Creates separate PostgreSQL password Secrets for real and simulation databases. Disable only when the customer supplies both and manages Secret access outside this stack.
   external_postgres_password_secret_ocid:
     title: Existing PostgreSQL password Secret OCID
+    type: string
+    required: true
+    visible: ${create_platform_secrets == false}
+  external_simulation_postgres_password_secret_ocid:
+    title: Existing simulation PostgreSQL password Secret OCID
     type: string
     required: true
     visible: ${create_platform_secrets == false}
@@ -221,7 +226,7 @@ variables:
     type: boolean
     default: true
     required: true
-    description: Creates and attaches a daily incremental backup policy retaining 14 days.
+    description: Creates and attaches a daily incremental backup policy retaining 35 days, covering the default simulator quarantine.
   backup_policy_compartment_ocid:
     title: Backup policy compartment (optional)
     type: oci:identity:compartment:id

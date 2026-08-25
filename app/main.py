@@ -24,17 +24,22 @@ import gzip
 import math
 import re
 import shutil
+import uuid
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, Request as FastAPIRequest
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, case, create_engine, func, inspect, or_, select, text
-from sqlalchemy.engine import URL
+from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
+
+from app.cloud_backends import backend_for
+from app.runtime_context import load_runtime_context
+from app.simulator_admin import SimulatorAdminClient
 
 
 def utcnow() -> datetime:
@@ -84,8 +89,14 @@ def read_secret(path: str) -> str:
 
 
 database_url = os.environ["DATABASE_URL"]
+runtime_context = load_runtime_context()
+cloud_backend = backend_for(runtime_context)
 password = read_secret(os.environ["POSTGRES_PASSWORD_FILE"])
-database_url = database_url.replace("migration@", f"migration:{password}@")
+parsed_database_url = make_url(database_url)
+if parsed_database_url.drivername.startswith("postgres"):
+    database_url = parsed_database_url.set(password=password).render_as_string(
+        hide_password=False
+    )
 platform_status_file = os.environ.get("PLATFORM_STATUS_FILE", "/run/platform-status/status.json")
 oci_runtime_config_file = os.environ.get("OCI_RUNTIME_CONFIG_FILE", "/run/oci-runtime/oci-runtime.json")
 DYNAMIC_PLATFORM_MAX_BYTES = 10 * 1024**4
@@ -141,6 +152,13 @@ class Source(Base):
     aws_region: Mapped[str] = mapped_column(String(64))
     aws_bucket_region: Mapped[str | None] = mapped_column(String(64), nullable=True)
     aws_connection_id: Mapped[int | None] = mapped_column(ForeignKey("aws_connections.id"), nullable=True, index=True)
+    backend_kind: Mapped[str] = mapped_column(String(16), default="REAL", index=True)
+    simulation_scenario_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    simulation_execution_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    simulation_correlation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    simulation_tenant_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    simulation_project_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    simulation_fidelity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     destination_bucket: Mapped[str] = mapped_column(String(255))
     # The conservative default is durable and explicit. The governance worker
     # will later interpret AS_OBJECTS_AVAILABLE without changing source history.
@@ -662,7 +680,6 @@ class RuntimeSettings(Base):
     default_restore_days: Mapped[int] = mapped_column(Integer, default=7)
     default_restore_tier: Mapped[str] = mapped_column(String(16), default="BULK")
     task_lease_seconds: Mapped[int] = mapped_column(Integer, default=300)
-    simulation_enabled: Mapped[bool] = mapped_column(default=False)
     aws_migration_role_arn: Mapped[str] = mapped_column(String(2048), default="")
     aws_batch_role_arn: Mapped[str] = mapped_column(String(2048), default="")
     aws_control_bucket: Mapped[str] = mapped_column(String(255), default="")
@@ -785,6 +802,50 @@ class SourceUpdate(SourceCreate):
 
 class SourceTransferStrategyUpdate(BaseModel):
     transfer_strategy: str = Field(pattern="^(AFTER_ALL_RESTORED|AS_OBJECTS_AVAILABLE)$")
+
+
+class SimulationScenarioBootstrap(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$")
+    fidelity: str = Field(pattern="^(CONTROL|DATA)$")
+    seed: str = Field(min_length=1, max_length=255)
+    logical_size_bytes: int = Field(ge=0)
+    object_count: int = Field(gt=0, le=10_000_000)
+    physical_budget_bytes: int = Field(default=1_000_000_000_000, ge=0)
+    clock_acceleration: float = Field(default=3600.0, gt=0)
+    retention_days: int = Field(default=60, ge=0, le=3650)
+    quarantine_days: int = Field(default=30, ge=0, le=3650)
+    source_bucket: str = Field(min_length=1, max_length=255)
+    destination_bucket: str = Field(min_length=1, max_length=255)
+    region: str = Field(default="us-east-1", min_length=1, max_length=64)
+    prefixes: list[str] = Field(default_factory=lambda: ["simulation"], min_length=1, max_length=1000)
+    storage_class: str = Field(default="DEEP_ARCHIVE", max_length=64)
+    template_id: str | None = None
+    configuration: dict = Field(default_factory=dict)
+    fault_rules: list = Field(default_factory=list)
+
+
+class SimulationExecutionClone(BaseModel):
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{1,127}$")
+    fidelity: str | None = Field(default=None, pattern="^(CONTROL|DATA)$")
+    physical_budget_bytes: int | None = Field(default=None, ge=0)
+
+
+class SimulationScenarioPurge(BaseModel):
+    confirmation: str
+    reason: str = Field(min_length=10, max_length=2000)
+
+
+class SimulationTemplateWrite(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    description: str = Field(default="", max_length=4000)
+    fidelity: str = Field(pattern="^(CONTROL|DATA)$")
+    configuration: dict = Field(default_factory=dict)
+    fault_rules: list = Field(default_factory=list)
+
+
+class OperationModeSwitchRequest(BaseModel):
+    target_mode: str = Field(pattern="^(REAL|SIMULATION)$")
+    confirmed: bool = False
 
 
 class LegacySourceConnectionMigration(BaseModel):
@@ -926,8 +987,43 @@ app = FastAPI(title="S3 to OCI Migration", version="0.4.0")
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
+@app.middleware("http")
+async def simulation_foundation_guard(request: FastAPIRequest, call_next):
+    """Fail closed until simulated cloud operation ports are implemented.
+
+    Health, runtime identity and the static shell remain observable. No current
+    operational API can accidentally reach a real cloud from Simulation mode.
+    """
+    from app.runtime_context import mode_switch_requested
+    if request.method not in {"GET", "HEAD", "OPTIONS"} and mode_switch_requested() and request.url.path != "/api/runtime/mode":
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "RAIJIN is draining for an operation-mode switch"},
+        )
+    if runtime_context.is_simulation:
+        path = request.url.path
+        allowed = (
+            path in {"/", "/healthz", "/api/runtime", "/api/runtime/mode"}
+            or path.startswith("/static/")
+            or path.startswith("/api/simulation")
+        )
+        if not allowed:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "Simulation operational APIs are not enabled in this release phase",
+                    "operation_mode": runtime_context.mode.value,
+                },
+            )
+    return await call_next(request)
+
+
 @app.on_event("startup")
 def create_schema() -> None:
+    # A Simulation process must prove it is talking to the expected external
+    # backend before touching its isolated schema. Operations may still be
+    # disabled while the following simulator phases are being implemented.
+    cloud_backend.readiness(require_operations=False)
     Base.metadata.create_all(engine)
     # Lightweight additive migrations keep the single-VM deployment upgradeable. No
     # destructive schema operation is performed automatically.
@@ -985,7 +1081,7 @@ def create_schema() -> None:
         "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "laboratory_mode_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
@@ -1000,6 +1096,8 @@ def create_schema() -> None:
     existing_restore_attempt_columns = {column["name"] for column in inspect(engine).get_columns("restore_attempts")}
     existing_discovery_change_columns = {column["name"] for column in inspect(engine).get_columns("discovery_changes")}
     with engine.begin() as connection:
+        if engine.dialect.name == "postgresql" and "simulation_enabled" in existing_runtime_columns:
+            connection.execute(text("ALTER TABLE runtime_settings DROP COLUMN simulation_enabled"))
         for column, sql_type in expected_columns.items():
             if column not in existing_columns:
                 connection.execute(text(f"ALTER TABLE objects ADD COLUMN {column} {sql_type}"))
@@ -1595,14 +1693,436 @@ def aws_connection_configuration(connection: AwsConnection, secret: dict) -> dic
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
-    with open("app/static/index.html", encoding="utf-8") as page:
+    page_name = "simulation.html" if runtime_context.is_simulation else "index.html"
+    with open(f"app/static/{page_name}", encoding="utf-8") as page:
         return page.read()
 
 
 @app.get("/healthz")
 def healthcheck(session: Session = Depends(get_session)) -> dict:
     session.execute(select(1))
-    return {"status": "ok"}
+    readiness = cloud_backend.readiness(require_operations=False)
+    return {"status": "ok", "operation_mode": runtime_context.mode.value,
+            "backend_operations_enabled": readiness.operations_enabled,
+            "backend_contract_version": readiness.contract_version}
+
+
+@app.get("/api/runtime")
+def runtime_identity() -> dict:
+    readiness = cloud_backend.readiness(require_operations=False)
+    return {"operation_mode": runtime_context.mode.value,
+            "backend_operations_enabled": readiness.operations_enabled,
+            "backend_contract_version": readiness.contract_version,
+            "backend_capabilities": list(readiness.capabilities)}
+
+
+@app.post("/api/runtime/mode", status_code=202)
+def request_operation_mode_switch(
+    payload: OperationModeSwitchRequest, session: Session = Depends(get_session)
+) -> dict:
+    """Request a host-mediated, fail-closed runtime switch.
+
+    The container receives no Podman or systemd privilege. It can only write a
+    target token to the dedicated request mount; the host-side command repeats
+    the durable queue audit before replacing any process.
+    """
+    if not payload.confirmed:
+        raise HTTPException(status_code=422, detail="Explicit mode-switch confirmation is required")
+    if payload.target_mode == runtime_context.mode.value:
+        raise HTTPException(status_code=409, detail=f"RAIJIN is already in {payload.target_mode} mode")
+    active_tasks = int(session.scalar(select(func.count(Task.id)).where(
+        Task.state.in_([TaskState.READY, TaskState.RUNNING])
+    )) or 0)
+    active_discoveries = int(session.scalar(select(func.count(DiscoveryJob.id)).where(
+        DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING])
+    )) or 0)
+    if active_tasks or active_discoveries:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Mode switch blocked by {active_tasks} task(s) and {active_discoveries} discovery job(s)",
+        )
+    request_file = os.environ.get("RAIJIN_MODE_REQUEST_FILE", "/run/mode-control/request")
+    try:
+        temporary = f"{request_file}.{os.getpid()}.tmp"
+        with open(temporary, "w", encoding="ascii") as target:
+            target.write(payload.target_mode + "\n")
+        os.replace(temporary, request_file)
+    except OSError as error:
+        raise HTTPException(status_code=503, detail="Host mode-control channel is unavailable") from error
+    return {"accepted": True, "current_mode": runtime_context.mode.value,
+            "target_mode": payload.target_mode, "state": "DRAINING"}
+
+
+def require_simulation_mode() -> None:
+    if runtime_context.is_real or not runtime_context.simulator_base_url:
+        raise HTTPException(status_code=409, detail="This operation is available only in Simulation mode")
+
+
+@app.get("/api/simulation/scenarios")
+def simulation_scenarios() -> list[dict]:
+    require_simulation_mode()
+    cloud_backend.readiness(require_operations=True)
+    return SimulatorAdminClient(runtime_context.simulator_base_url).list_scenarios()
+
+
+@app.get("/api/simulation/templates")
+def simulation_templates() -> list[dict]:
+    require_simulation_mode()
+    cloud_backend.readiness(require_operations=True)
+    return SimulatorAdminClient(runtime_context.simulator_base_url).list_templates()
+
+
+@app.post("/api/simulation/templates", status_code=201)
+def create_simulation_template(payload: SimulationTemplateWrite) -> dict:
+    require_simulation_mode()
+    cloud_backend.readiness(require_operations=True)
+    return SimulatorAdminClient(runtime_context.simulator_base_url).create_template(
+        payload.model_dump()
+    )
+
+
+@app.put("/api/simulation/templates/{template_id}")
+def update_simulation_template(template_id: str, payload: SimulationTemplateWrite) -> dict:
+    require_simulation_mode()
+    cloud_backend.readiness(require_operations=True)
+    return SimulatorAdminClient(runtime_context.simulator_base_url).update_template(
+        template_id, payload.model_dump()
+    )
+
+
+@app.post("/api/simulation/scenarios", status_code=201)
+def create_simulation_scenario(
+    payload: SimulationScenarioBootstrap, session: Session = Depends(get_session)
+) -> dict:
+    """Create one immutable simulator execution and its isolated Raijin source."""
+    require_simulation_mode()
+    cloud_backend.readiness(require_operations=True)
+    if session.scalar(select(Source.id).where(Source.name == payload.name)):
+        raise HTTPException(status_code=409, detail="Simulation source name already exists")
+    prefixes = normalize_source_prefixes(payload.prefixes)
+    admin = SimulatorAdminClient(runtime_context.simulator_base_url, timeout_seconds=600)
+    scenario = admin.create_scenario(
+        {
+            "name": payload.name,
+            "fidelity": payload.fidelity,
+            "seed": payload.seed,
+            "logical_size_bytes": payload.logical_size_bytes,
+            "physical_budget_bytes": payload.physical_budget_bytes,
+            "clock_acceleration": payload.clock_acceleration,
+            "retention_days": payload.retention_days,
+            "quarantine_days": payload.quarantine_days,
+            "configuration": payload.configuration,
+            "fault_rules": payload.fault_rules,
+            "template_id": payload.template_id,
+        }
+    )
+    catalog = admin.materialize(
+        scenario["id"],
+        {
+            "source_bucket": payload.source_bucket,
+            "destination_bucket": payload.destination_bucket,
+            "region": payload.region,
+            "object_count": payload.object_count,
+            "logical_size_bytes": payload.logical_size_bytes,
+            "prefixes": prefixes,
+            "storage_class": payload.storage_class,
+        },
+    )
+    execution = admin.create_execution(scenario["id"])
+    source = Source(
+        name=payload.name,
+        s3_bucket=payload.source_bucket,
+        s3_prefix=prefixes[0],
+        aws_region=payload.region,
+        aws_bucket_region=payload.region,
+        aws_connection_id=None,
+        destination_bucket=payload.destination_bucket,
+        transfer_strategy="AFTER_ALL_RESTORED",
+        backend_kind="SIMULATED",
+        simulation_scenario_id=scenario["id"],
+        simulation_execution_id=execution["id"],
+        simulation_correlation_id=execution["correlation_id"],
+        simulation_tenant_id=str(uuid.uuid4()),
+        simulation_project_id=str(uuid.uuid4()),
+        simulation_fidelity=scenario["fidelity"],
+    )
+    session.add(source)
+    session.flush()
+    session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
+    record_event(
+        session,
+        "SIMULATED_SCENARIO_CREATED",
+        f"SIMULATED {payload.fidelity} scenario '{payload.name}' created with seed {payload.seed}",
+        source_id=source.id,
+    )
+    session.commit()
+    return {
+        "source_id": source.id,
+        "scenario": scenario,
+        "execution": execution,
+        "catalog": catalog,
+    }
+
+
+def simulation_source_or_404(session: Session, source_id: int) -> Source:
+    source = source_or_404(session, source_id)
+    if source.backend_kind != "SIMULATED":
+        raise HTTPException(status_code=409, detail="Source does not belong to Simulation mode")
+    return source
+
+
+@app.get("/api/simulation/sources")
+def simulation_sources(session: Session = Depends(get_session)) -> list[dict]:
+    require_simulation_mode()
+    rows = list(session.scalars(select(Source).where(
+        Source.backend_kind == "SIMULATED"
+    ).order_by(Source.archived_at.is_not(None), Source.id.desc())))
+    result = []
+    admin = SimulatorAdminClient(runtime_context.simulator_base_url)
+    scenarios = {item["id"]: item for item in admin.list_scenarios()}
+    for source in rows:
+        objects, size = session.execute(select(
+            func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)
+        ).where(ObjectRecord.source_id == source.id)).one()
+        waves = int(session.scalar(select(func.count(Wave.id)).where(Wave.source_id == source.id)) or 0)
+        pending = int(session.scalar(select(func.count(Task.id)).join(Wave).where(
+            Wave.source_id == source.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])
+        )) or 0)
+        clock = admin.clock_status(source.simulation_execution_id) if source.simulation_execution_id else None
+        execution = admin.get_execution(source.simulation_execution_id) if source.simulation_execution_id else None
+        scenario = scenarios.get(source.simulation_scenario_id, {})
+        result.append({
+            "id": source.id, "name": source.name, "status": source.status,
+            "fidelity": source.simulation_fidelity, "source_bucket": source.s3_bucket,
+            "destination_bucket": source.destination_bucket, "region": source.aws_region,
+            "objects": int(objects), "bytes": int(size), "waves": waves,
+            "pending_tasks": pending, "scenario_id": source.simulation_scenario_id,
+            "execution_id": source.simulation_execution_id, "clock": clock,
+            "execution_state": execution.get("state") if execution else None,
+            "physical_budget_bytes": execution.get("physical_budget_bytes") if execution else 0,
+            "physical_bytes_processed": execution.get("physical_bytes_processed") if execution else 0,
+            "scenario_state": scenario.get("state"),
+            "retention_days": scenario.get("retention_days"),
+            "quarantine_days": scenario.get("quarantine_days"),
+            "archived_at": source.archived_at,
+        })
+    return result
+
+
+@app.post("/api/simulation/housekeeping")
+def simulation_housekeeping() -> dict:
+    require_simulation_mode()
+    return SimulatorAdminClient(runtime_context.simulator_base_url).apply_housekeeping()
+
+
+@app.post("/api/simulation/scenarios/{scenario_id}/restore")
+def simulation_restore_scenario(scenario_id: str) -> dict:
+    require_simulation_mode()
+    return SimulatorAdminClient(runtime_context.simulator_base_url).restore_scenario(scenario_id)
+
+
+@app.post("/api/simulation/sources/{source_id}/purge")
+def simulation_purge_source(
+    source_id: int,
+    payload: SimulationScenarioPurge,
+    session: Session = Depends(get_session),
+) -> dict:
+    """Cross-database guard before irreversible simulator catalog deletion."""
+    require_simulation_mode()
+    source = simulation_source_or_404(session, source_id)
+    if payload.confirmation != "PURGE":
+        raise HTTPException(status_code=422, detail="Type PURGE to confirm physical deletion")
+    if source.archived_at is None:
+        raise HTTPException(status_code=409, detail="Archive the simulated source before purging its catalog")
+    active_tasks = int(session.scalar(select(func.count(Task.id)).join(Wave).where(
+        Wave.source_id == source.id,
+        Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+    )) or 0)
+    active_discoveries = int(session.scalar(select(func.count(DiscoveryJob.id)).where(
+        DiscoveryJob.source_id == source.id,
+        DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
+    )) or 0)
+    if active_tasks or active_discoveries:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Purge blocked by {active_tasks} task(s) and {active_discoveries} discovery job(s)",
+        )
+    admin = SimulatorAdminClient(runtime_context.simulator_base_url)
+    execution = admin.get_execution(source.simulation_execution_id)
+    if execution.get("state") not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+        raise HTTPException(status_code=409, detail="Simulation execution must be terminal before purge")
+    result = admin.purge_scenario(source.simulation_scenario_id, payload.reason)
+    record_event(
+        session,
+        "SIMULATION_SCENARIO_PURGED",
+        f"SIMULATED catalog physically purged; tombstone {result['evidence_sha256']}",
+        source_id=source.id,
+    )
+    session.commit()
+    return result
+
+
+@app.post("/api/simulation/sources/{source_id}/archive")
+def simulation_archive_source(source_id: int, session: Session = Depends(get_session)) -> dict:
+    require_simulation_mode()
+    source = simulation_source_or_404(session, source_id)
+    if source.archived_at is not None:
+        return {"id": source.id, "status": source.status, "archived_at": source.archived_at}
+    active_tasks = int(session.scalar(select(func.count(Task.id)).join(Wave).where(
+        Wave.source_id == source.id,
+        Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+    )) or 0)
+    active_discoveries = int(session.scalar(select(func.count(DiscoveryJob.id)).where(
+        DiscoveryJob.source_id == source.id,
+        DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
+    )) or 0)
+    if active_tasks or active_discoveries:
+        raise HTTPException(status_code=409, detail="Simulation source still has active work")
+    execution = SimulatorAdminClient(runtime_context.simulator_base_url).get_execution(
+        source.simulation_execution_id
+    )
+    if execution.get("state") not in {"SUCCEEDED", "FAILED", "CANCELLED"}:
+        raise HTTPException(status_code=409, detail="Simulation execution must be terminal before archive")
+    source.archived_at, source.status = utcnow(), "ARCHIVED"
+    record_event(
+        session,
+        "SIMULATION_SOURCE_ARCHIVED",
+        f"SIMULATED source '{source.name}' archived; simulator evidence retained",
+        source_id=source.id,
+    )
+    session.commit()
+    return {"id": source.id, "status": source.status, "archived_at": source.archived_at}
+
+
+@app.post("/api/simulation/sources/{source_id}/clone", status_code=201)
+def clone_simulation_source(
+    source_id: int,
+    payload: SimulationExecutionClone,
+    session: Session = Depends(get_session),
+) -> dict:
+    require_simulation_mode()
+    original = simulation_source_or_404(session, source_id)
+    if session.scalar(select(Source.id).where(Source.name == payload.name)):
+        raise HTTPException(status_code=409, detail="Simulation source name already exists")
+    result = SimulatorAdminClient(runtime_context.simulator_base_url, timeout_seconds=600).clone_execution(
+        original.simulation_execution_id,
+        payload.name,
+        payload.fidelity,
+        payload.physical_budget_bytes,
+    )
+    scenario, execution, catalog = result["scenario"], result["execution"], result["catalog"]
+    prefixes = source_prefix_values(original)
+    source = Source(
+        name=payload.name,
+        s3_bucket=catalog["source_bucket"],
+        s3_prefix=prefixes[0],
+        aws_region=original.aws_region,
+        aws_bucket_region=original.aws_bucket_region,
+        destination_bucket=catalog["destination_bucket"],
+        transfer_strategy=original.transfer_strategy,
+        backend_kind="SIMULATED",
+        simulation_scenario_id=scenario["id"],
+        simulation_execution_id=execution["id"],
+        simulation_correlation_id=execution["correlation_id"],
+        simulation_tenant_id=str(uuid.uuid4()),
+        simulation_project_id=str(uuid.uuid4()),
+        simulation_fidelity=scenario["fidelity"],
+    )
+    session.add(source)
+    session.flush()
+    session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
+    record_event(
+        session,
+        "SIMULATED_EXECUTION_CLONED",
+        f"SIMULATED execution cloned from source {original.id} with immutable snapshot and seed",
+        source_id=source.id,
+    )
+    session.commit()
+    return {"source_id": source.id, **result}
+
+
+@app.post("/api/simulation/sources/{source_id}/discovery", status_code=202)
+def simulation_discovery(source_id: int, session: Session = Depends(get_session)) -> dict:
+    require_simulation_mode()
+    source = simulation_source_or_404(session, source_id)
+    job = queue_discovery(source, session)
+    return {"source_id": source.id, "job_id": job.id, "status": source.status}
+
+
+@app.get("/api/simulation/sources/{source_id}/waves")
+def simulation_waves(source_id: int, session: Session = Depends(get_session)) -> list[dict]:
+    require_simulation_mode()
+    simulation_source_or_404(session, source_id)
+    return list_waves(source_id, session)
+
+
+@app.get("/api/simulation/sources/{source_id}/flight-board")
+def simulation_flight_board(source_id: int, session: Session = Depends(get_session)) -> dict:
+    """Expose persisted planned/observed phases and scheduler decisions."""
+    require_simulation_mode()
+    simulation_source_or_404(session, source_id)
+    result = flight_board(source_id=source_id, run_id=None, session=session)
+    result["scheduler_decisions"] = [
+        {
+            "at": item.created_at,
+            "kind": item.kind,
+            "wave_id": item.wave_id,
+            "message": item.message,
+        }
+        for item in session.scalars(select(Event).where(
+            Event.source_id == source_id,
+            Event.kind.in_([
+                "DYNAMIC_WAVE_REPLANNED",
+                "DYNAMIC_PIPELINE_REPLANNED",
+                "DYNAMIC_RESTORE_RELEASED",
+                "DYNAMIC_RESTORE_SCHEDULED",
+            ]),
+        ).order_by(Event.created_at, Event.id))
+    ]
+    return result
+
+
+@app.post("/api/simulation/sources/{source_id}/waves/dynamic", status_code=201)
+def simulation_create_dynamic_waves(
+    source_id: int, payload: DynamicWaveCreate, session: Session = Depends(get_session)
+) -> dict:
+    require_simulation_mode()
+    simulation_source_or_404(session, source_id)
+    return create_dynamic_waves(source_id, payload, session)
+
+
+@app.post("/api/simulation/sources/{source_id}/waves/queue-all")
+def simulation_queue_all(source_id: int, session: Session = Depends(get_session)) -> dict:
+    require_simulation_mode()
+    simulation_source_or_404(session, source_id)
+    return queue_all_planned_waves(source_id, session)
+
+
+@app.get("/api/simulation/executions/{execution_id}/clock")
+def simulation_clock(execution_id: str) -> dict:
+    require_simulation_mode()
+    return SimulatorAdminClient(runtime_context.simulator_base_url).clock_status(execution_id)
+
+
+@app.get("/api/simulation/executions/{execution_id}/report")
+def simulation_execution_report(execution_id: str) -> dict:
+    require_simulation_mode()
+    return SimulatorAdminClient(runtime_context.simulator_base_url).execution_report(execution_id)
+
+
+@app.post("/api/simulation/executions/{execution_id}/clock")
+def simulation_control_clock(execution_id: str, payload: dict) -> dict:
+    require_simulation_mode()
+    action = str(payload.get("action") or "").upper()
+    if action not in {"PAUSE", "RESUME", "ADVANCE"}:
+        raise HTTPException(status_code=422, detail="Clock action must be PAUSE, RESUME, or ADVANCE")
+    try:
+        advance_seconds = float(payload.get("advance_seconds") or 0)
+    except (TypeError, ValueError) as error:
+        raise HTTPException(status_code=422, detail="advance_seconds must be numeric") from error
+    return SimulatorAdminClient(runtime_context.simulator_base_url).control_clock(
+        execution_id, action, advance_seconds
+    )
 
 
 @app.get("/api/platform/status")
@@ -3533,7 +4053,12 @@ def transfer_history_profiles(session: Session, source_id: int, multipart_part_s
 
 def predict_object_transfer_seconds(obj: ObjectRecord, settings: RuntimeSettings, profiles: dict[str, dict]) -> tuple[float, int]:
     """Predict one object conservatively; history is used only with 5 samples."""
-    bucket = prediction_bucket(obj.size_bytes, settings.multipart_part_size_mib)
+    return predict_size_transfer_seconds(obj.size_bytes, settings, profiles)
+
+
+def predict_size_transfer_seconds(size_bytes: int, settings: RuntimeSettings, profiles: dict[str, dict]) -> tuple[float, int]:
+    """Predict an object from scalar inventory data without retaining an ORM row."""
+    bucket = prediction_bucket(size_bytes, settings.multipart_part_size_mib)
     profile = profiles.get(bucket, {})
     if profile.get("samples", 0) >= 5 and profile.get("p75_seconds", 0) > 0:
         return float(profile["p75_seconds"]), int(profile["samples"])
@@ -3544,9 +4069,9 @@ def predict_object_transfer_seconds(obj: ObjectRecord, settings: RuntimeSettings
     # overhead.  The prior 0.25-second cold estimate underpredicted the
     # Deep Archive validation workload by about 4x.  Use a conservative
     # baseline until this source has its own durable P75 history.
-    seconds = 1.25 + (obj.size_bytes * 8 / (throughput_per_worker * 1_000_000))
-    if obj.size_bytes >= settings.multipart_part_size_mib * 1024 ** 2:
-        parts = math.ceil(obj.size_bytes / (settings.multipart_part_size_mib * 1024 ** 2))
+    seconds = 1.25 + (size_bytes * 8 / (throughput_per_worker * 1_000_000))
+    if size_bytes >= settings.multipart_part_size_mib * 1024 ** 2:
+        parts = math.ceil(size_bytes / (settings.multipart_part_size_mib * 1024 ** 2))
         seconds += 1.0 + parts * .08
     return max(.25, seconds), 0
 
@@ -3570,43 +4095,46 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
     settings = runtime_settings(session)
     profiles = transfer_history_profiles(session, source_id, settings.multipart_part_size_mib)
     waves: list[dict] = []
-    current: list[tuple[ObjectRecord, float, int]] = []
+    current_count = 0
     bytes_total = predicted_sum = sample_count = 0
 
     def flush(exclusive: bool = False) -> None:
-        nonlocal current, bytes_total, predicted_sum, sample_count
-        if not current:
+        nonlocal current_count, bytes_total, predicted_sum, sample_count
+        if not current_count:
             return
         # Individual estimates represent worker time. Wall time is bounded by
         # aggregate throughput and by worker parallelism, plus a small setup.
         link_seconds = bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000)
         wall_seconds = max(link_seconds, predicted_sum / max(1, settings.transfer_workers)) + 30
-        waves.append({"objects": list(current), "bytes": bytes_total, "object_count": len(current),
+        waves.append({"bytes": bytes_total, "object_count": current_count,
                       "predicted_transfer_seconds": math.ceil(wall_seconds), "prediction_samples": sample_count,
                       "exclusive": exclusive})
-        current, bytes_total, predicted_sum, sample_count = [], 0, 0.0, 0
+        current_count, bytes_total, predicted_sum, sample_count = 0, 0, 0.0, 0
 
-    for obj in session.scalars(select(ObjectRecord).where(*discovered_object_filters(source_id, prefix)).order_by(ObjectRecord.object_key, ObjectRecord.id)).yield_per(1000):
-        predicted, samples = predict_object_transfer_seconds(obj, settings, profiles)
-        projected_bytes = bytes_total + obj.size_bytes
-        projected_count = len(current) + 1
+    rows = session.execute(select(ObjectRecord.size_bytes).where(
+        *discovered_object_filters(source_id, prefix)
+    ).order_by(ObjectRecord.object_key, ObjectRecord.id)).yield_per(5000)
+    for (size_bytes,) in rows:
+        predicted, samples = predict_size_transfer_seconds(size_bytes, settings, profiles)
+        projected_bytes = bytes_total + size_bytes
+        projected_count = current_count + 1
         projected_sum = predicted_sum + predicted
         projected_wall = max(projected_bytes * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
                              projected_sum / max(1, settings.transfer_workers)) + 30
         exceeds = projected_bytes > max_bytes or projected_count > max_objects or projected_wall > target_transfer_seconds
-        if current and exceeds:
+        if current_count and exceeds:
             flush()
-        if not current:
+        if not current_count:
             # An object beyond any hard/soft target forms an exclusive wave;
             # it is never silently skipped.
-            current.append((obj, predicted, samples))
-            bytes_total, predicted_sum, sample_count = obj.size_bytes, predicted, samples
+            current_count = 1
+            bytes_total, predicted_sum, sample_count = size_bytes, predicted, samples
             one_wall = max(bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
                            predicted_sum / max(1, settings.transfer_workers)) + 30
             if bytes_total > max_bytes or one_wall > target_transfer_seconds:
                 flush(exclusive=True)
             continue
-        current.append((obj, predicted, samples))
+        current_count += 1
         # A wave may mix size classes. Keep the strongest historical sample
         # count as a confidence indicator; do not inflate it per object.
         bytes_total, predicted_sum, sample_count = projected_bytes, projected_sum, max(sample_count, samples)
@@ -3804,19 +4332,45 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             Wave.planned_transfer_start_at, Wave.id
         )))
         cursor: datetime | None = None
+        cursor_basis = "initial forecast"
         for wave in waves:
-            actual_start, actual_end = session.execute(select(
-                func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at)
+            actual_start, actual_end, elapsed_sum, elapsed_max = session.execute(select(
+                func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at),
+                func.sum(ObjectRecord.transfer_elapsed_seconds), func.max(ObjectRecord.transfer_elapsed_seconds),
             ).where(ObjectRecord.wave_id == wave.id)).one()
             planned_start = wave.planned_transfer_start_at or now
             duration_seconds = max(1, int(wave.predicted_transfer_seconds or 1))
-            if actual_start and actual_end and actual_end >= actual_start:
+            observed_basis = "prediction"
+            # CONTROL transfers intentionally complete in milliseconds of real
+            # time while returning the duration imposed by the virtual network.
+            # Convert per-object logical work to one transfer-lane wall time so
+            # degraded/oscillating profiles can move later restore windows.
+            if (
+                wave.source.backend_kind == "SIMULATED"
+                and wave.source.simulation_fidelity == "CONTROL"
+                and elapsed_sum
+            ):
+                duration_seconds = max(
+                    1,
+                    math.ceil(max(
+                        float(elapsed_max or 0),
+                        float(elapsed_sum) / max(1, settings.transfer_workers),
+                    )),
+                )
+                observed_basis = "simulated logical transfer duration"
+            elif actual_start and actual_end and actual_end >= actual_start:
                 duration_seconds = max(1, int((actual_end - actual_start).total_seconds()))
+                observed_basis = "observed transfer timestamps"
+            constrained_by_prior_wave = bool(cursor and cursor > planned_start)
+            decision_basis = cursor_basis if constrained_by_prior_wave else observed_basis
             start = max(planned_start, cursor) if cursor else planned_start
-            if actual_end:
+            if observed_basis == "simulated logical transfer duration" and actual_end:
+                cursor = start + timedelta(seconds=duration_seconds)
+            elif actual_end:
                 cursor = max(start, actual_end)
             else:
                 cursor = start + timedelta(seconds=duration_seconds)
+            cursor_basis = observed_basis
             has_batch_task = session.scalar(select(Task.id).where(
                 Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
             ).limit(1)) is not None
@@ -3826,9 +4380,18 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             new_restore_at = max(now, start - timedelta(seconds=restore_lead))
             shifted = abs((wave.planned_transfer_start_at - start).total_seconds()) if wave.planned_transfer_start_at else float("inf")
             if shifted >= 60:
+                prior_transfer_at = wave.planned_transfer_start_at
+                prior_restore_at = wave.planned_restore_at
                 wave.planned_transfer_start_at, wave.planned_restore_at = start, new_restore_at
                 changed += 1
                 run_changed = True
+                record_event(
+                    session,
+                    "DYNAMIC_WAVE_REPLANNED",
+                    f"Wave '{wave.name}' moved from transfer {prior_transfer_at.isoformat() if prior_transfer_at else 'unset'} / restore {prior_restore_at.isoformat() if prior_restore_at else 'unset'} to transfer {start.isoformat()} / restore {new_restore_at.isoformat()}; basis: {decision_basis}, current duration {duration_seconds}s",
+                    source_id=wave.source_id,
+                    wave_id=wave.id,
+                )
         if run_changed:
             run.planner_version = "v2-adaptive"
     if changed:
@@ -3906,20 +4469,80 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
     created: list[Wave] = []
     for sequence, (plan, timing) in enumerate(zip(plans, times), start=1):
         name = automatic_wave_name(session, source, payload.prefix, sequence)
-        objects = [obj for obj, _prediction, _samples in plan["objects"]]
-        for obj, prediction, _samples in plan["objects"]:
-            obj.planned_transfer_seconds = prediction
-        wave = assign_wave(session, source.id, name, DYNAMIC_PLATFORM_MAX_BYTES, payload.restore_days, payload.restore_tier,
-                           objects, plan["exclusive"], planner_mode="DYNAMIC",
-                           predicted_transfer_seconds=plan["predicted_transfer_seconds"],
-                           prediction_samples=plan["prediction_samples"], planned_restore_at=timing[0],
-                           planned_transfer_start_at=timing[1], pipeline_run_id=run.id)
+        wave = Wave(
+            source_id=source.id, name=name, max_bytes=DYNAMIC_PLATFORM_MAX_BYTES,
+            restore_days=payload.restore_days, restore_tier=payload.restore_tier,
+            status="PLANNED", planner_mode="DYNAMIC",
+            predicted_transfer_seconds=plan["predicted_transfer_seconds"],
+            prediction_samples=plan["prediction_samples"], planned_restore_at=timing[0],
+            planned_transfer_start_at=timing[1], pipeline_run_id=run.id,
+        )
+        session.add(wave)
+        session.flush()
         if schedule_restores:
             wave.status = "RESTORE_SCHEDULED"
             record_event(session, "DYNAMIC_RESTORE_SCHEDULED",
                          f"Wave '{wave.name}' restore scheduled for {timing[0].isoformat()} before predicted transfer window {timing[1].isoformat()}",
                          source_id=source.id, wave_id=wave.id)
         created.append(wave)
+    # Assign the inventory in a second, scalar-only pass. The prior planner
+    # retained every ORM ObjectRecord in every plan, which made a 640k-object
+    # CONTROL scenario unnecessarily consume gigabytes of memory. Plan
+    # boundaries are deterministic counts, so batched mappings preserve the
+    # exact order without retaining the catalog in the identity map.
+    plan_index = assigned_in_plan = assigned_total = 0
+    mappings: list[dict] = []
+    last_key: str | None = None
+    last_id: int | None = None
+    filters = discovered_object_filters(source_id, payload.prefix)
+    while True:
+        keyset = []
+        if last_key is not None and last_id is not None:
+            keyset.append(or_(
+                ObjectRecord.object_key > last_key,
+                and_(ObjectRecord.object_key == last_key, ObjectRecord.id > last_id),
+            ))
+        rows = list(session.execute(select(
+            ObjectRecord.id, ObjectRecord.size_bytes, ObjectRecord.object_key
+        ).where(*filters, *keyset).order_by(
+            ObjectRecord.object_key, ObjectRecord.id
+        ).limit(5000)))
+        if not rows:
+            break
+        for object_id, size_bytes, object_key in rows:
+            last_key, last_id = object_key, object_id
+            while plan_index < len(plans) and assigned_in_plan >= plans[plan_index]["object_count"]:
+                plan_index += 1
+                assigned_in_plan = 0
+            if plan_index >= len(plans):
+                raise RuntimeError("Dynamic assignment exceeded its immutable plan")
+            prediction, _samples = predict_size_transfer_seconds(
+                size_bytes, result["settings"], result["profiles"]
+            )
+            mappings.append({
+                "id": object_id,
+                "wave_id": created[plan_index].id,
+                "state": ObjectState.WAVE_ASSIGNED,
+                "planned_transfer_seconds": prediction,
+            })
+            assigned_in_plan += 1
+            assigned_total += 1
+        session.bulk_update_mappings(ObjectRecord, mappings)
+        mappings.clear()
+    expected_total = sum(plan["object_count"] for plan in plans)
+    if assigned_total != expected_total:
+        raise RuntimeError(
+            f"Dynamic assignment produced {assigned_total} object(s); expected {expected_total}"
+        )
+    for wave, plan in zip(created, plans):
+        suffix = " (contains an object beyond an automatic limit)" if plan["exclusive"] else ""
+        record_event(
+            session,
+            "WAVE_CREATED",
+            f"Wave '{wave.name}' planned with {plan['object_count']} object(s) and {plan['bytes']} byte(s){suffix}; predicted transfer {plan['predicted_transfer_seconds']}s from {plan['prediction_samples']} historical sample(s); no task was queued",
+            source_id=source.id,
+            wave_id=wave.id,
+        )
     record_event(session, "DYNAMIC_WAVES_CREATED",
                  f"Dynamic pipeline run {run.id} created {len(created)} wave(s); automatic copy limit {target_transfer_seconds}s with {reserve_seconds}s retention reserve; historical samples: {historical_samples}; restore scheduling {'enabled' if schedule_restores else 'not enabled'}",
                  source_id=source.id)

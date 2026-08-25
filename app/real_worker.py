@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, unquote, urlparse
+from uuid import UUID, NAMESPACE_URL, uuid5
 
 import boto3
 import oci
@@ -30,9 +31,27 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 from sqlalchemy import func, or_, select, update
 
+from app.backend_contracts import (
+    DescribeRestoreBatchRequest,
+    ExecutionContext,
+    HeadObjectRequest,
+    ListObjectsRequest,
+    LogicalTransferRequest,
+    MultipartCommitRequest,
+    MultipartCreateRequest,
+    MultipartPartEvidence,
+    MultipartPartRequest,
+    ObjectDescriptor,
+    ObjectIdentity,
+    PutObjectRequest,
+    ReadRangeRequest,
+    SubmitRestoreBatchRequest,
+)
+from app.simulator_admin import SimulatorAdminClient
+from app.simulator_ports import SimulatedDestinationPort, SimulatedSourcePort, SimulatorTransportError
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows, source_key_in_scope, source_prefix_values,
-    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_settings, utcnow,
+    DynamicPipelineRun, Wave, cloud_backend, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_context, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -99,6 +118,11 @@ def classify_task_error(error: Exception) -> tuple[str, str]:
     status, code = metadata.get("HTTPStatusCode"), details.get("Code")
     name = type(error).__name__
     summary = f"{name} ({status} {code})" if status or code else f"{name}: {str(error)[:500]}"
+    if isinstance(error, SimulatorTransportError):
+        # Contract/validation responses are deterministic and require a code
+        # or scenario correction.  Connection failures are retryable through
+        # the same durable task policy used for real provider interruptions.
+        return ("failed" if "HTTP 4" in str(error) else "retry"), summary
     if code in TRANSIENT_AWS_CODES or status in {429, 500, 502, 503, 504}:
         return "retry", summary
     if code in PERMANENT_AWS_CODES or (isinstance(status, int) and 400 <= status < 500):
@@ -114,6 +138,7 @@ def event(session, kind: str, message: str, source_id: int | None = None, wave_i
 
 def connection_values(connection: AwsConnection) -> dict[str, str]:
     """Read the current connection payload; credentials never enter PostgreSQL."""
+    runtime_context.require_real_cloud("read OCI Secret for AWS connection")
     signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
     bundle = oci.secrets.SecretsClient({}, signer=signer).get_secret_bundle(connection.secret_ocid).data
     values = parse_aws_connection_payload(base64.b64decode(bundle.secret_bundle_content.content).decode("utf-8").strip())
@@ -328,7 +353,31 @@ def discover(session, source: Source, settings, job: DiscoveryJob | None = None)
     source.status, source.discovery_error = "DISCOVERING", None
     source.discovery_started_at = utcnow()
     session.commit()
+    if runtime_context.is_simulation:
+        SimulatorAdminClient(runtime_context.simulator_base_url).set_execution_state(
+            source.simulation_execution_id, "RUNNING"
+        )
     remote_discover(session, source, settings, job)
+
+
+def simulation_execution_context(source: Source) -> ExecutionContext:
+    required = {
+        "execution": source.simulation_execution_id,
+        "correlation": source.simulation_correlation_id,
+        "tenant": source.simulation_tenant_id,
+        "project": source.simulation_project_id,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if source.backend_kind != "SIMULATED" or missing:
+        raise RuntimeError(
+            "Simulated source has incomplete execution context: " + ", ".join(missing)
+        )
+    return ExecutionContext(
+        execution_id=UUID(required["execution"]),
+        correlation_id=UUID(required["correlation"]),
+        tenant_id=UUID(required["tenant"]),
+        project_id=UUID(required["project"]),
+    )
 
 
 def inventory_timestamp(value: str | None):
@@ -441,7 +490,14 @@ def import_s3_inventory_manifest(session, source: Source, settings, job: Discove
 
 
 def remote_discover(session, source: Source, settings, job: DiscoveryJob | None = None) -> None:
-    s3, _, _ = aws_clients(settings, source.aws_region, source)
+    simulated_port = (
+        SimulatedSourcePort(runtime_context.simulator_base_url)
+        if runtime_context.is_simulation and runtime_context.simulator_base_url
+        else None
+    )
+    s3 = None
+    if simulated_port is None:
+        s3, _, _ = aws_clients(settings, source.aws_region, source)
     inserted = 0
     continuation_token = source.discovery_continuation_token
     prefixes = source_prefix_values(source)
@@ -451,7 +507,11 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
     pending_token = continuation_token
     next_request_at = 0.0
     connection = source.aws_connection
-    request_interval = 1.0 / max(1, int(getattr(connection, "discovery_requests_per_second", 10) or 10))
+    request_interval = (
+        0.0
+        if simulated_port
+        else 1.0 / max(1, int(getattr(connection, "discovery_requests_per_second", 10) or 10))
+    )
 
     def checkpoint_batch() -> None:
         """Atomically persist a bounded discovery batch and its S3 cursor."""
@@ -487,7 +547,31 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
             if wait > 0:
                 time.sleep(wait)
             try:
-                page = s3.list_objects_v2(**request)
+                if simulated_port:
+                    simulated_page = simulated_port.list_objects(
+                        ListObjectsRequest(
+                            context=simulation_execution_context(source),
+                            bucket=source.s3_bucket,
+                            prefix=prefixes[prefix_index],
+                            continuation_token=continuation_token,
+                            max_keys=DISCOVERY_MAX_KEYS,
+                        )
+                    )
+                    page = {
+                        "Contents": [
+                            {
+                                "Key": item.key,
+                                "Size": item.size_bytes,
+                                "ETag": item.etag,
+                                "StorageClass": item.storage_class,
+                                "LastModified": item.last_modified,
+                            }
+                            for item in simulated_page.objects
+                        ],
+                        "NextContinuationToken": simulated_page.next_continuation_token,
+                    }
+                else:
+                    page = s3.list_objects_v2(**request)
                 next_request_at = time.monotonic() + request_interval
                 break
             except ClientError as error:
@@ -741,6 +825,9 @@ def submit_restore(session, task: Task, settings) -> None:
         wave.status = "RESTORED"
         succeed(session, task, "TRANSFER_WAVE")
         return
+    if runtime_context.is_simulation:
+        submit_restore_simulated(session, task, wave, source, archives)
+        return
     operation = aws_operation_config(source, settings)
     if not operation["control_bucket"] or not operation["batch_role_arn"]:
         raise RuntimeError("AWS control bucket and Batch Operations role ARN must be configured")
@@ -789,8 +876,291 @@ def submit_restore(session, task: Task, settings) -> None:
     succeed(session, task, "POLL_RESTORE")
 
 
+def simulated_manifest_line(obj: ObjectRecord) -> bytes:
+    return (
+        json.dumps(
+            {"key": obj.object_key, "version_id": obj.version_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+
+def submit_restore_simulated(
+    session, task: Task, wave: Wave, source: Source, archives: list[ObjectRecord]
+) -> None:
+    context = simulation_execution_context(source)
+    port = SimulatedSourcePort(runtime_context.simulator_base_url)
+    attempt = RestoreAttempt(
+        wave_id=wave.id,
+        aws_region=source.aws_region,
+        expected_objects=len(archives),
+    )
+    session.add(attempt)
+    session.flush()
+    manifest_sha = hashlib.sha256()
+    for obj in archives:
+        manifest_sha.update(simulated_manifest_line(obj))
+    idempotency_key = uuid5(NAMESPACE_URL, f"raijin:simulation:restore:wave:{wave.id}")
+    response = port.submit_restore_batch(
+        SubmitRestoreBatchRequest(
+            context=context,
+            bucket=source.s3_bucket,
+            tier=wave.restore_tier,
+            retention_days=wave.restore_days,
+            object_count=len(archives),
+            manifest_sha256=manifest_sha.hexdigest(),
+            idempotency_key=idempotency_key,
+        ),
+        (simulated_manifest_line(obj) for obj in archives),
+    )
+    manifest_key = f"simulated://restore-manifests/wave-{wave.id}/attempt-{attempt.id}"
+    attempt.job_id = response.job_id
+    attempt.job_status = response.status
+    attempt.manifest_key = manifest_key
+    attempt.manifest_etag = manifest_sha.hexdigest()
+    wave.batch_job_id = response.job_id
+    wave.batch_job_status = response.status
+    wave.manifest_key = manifest_key
+    wave.manifest_etag = manifest_sha.hexdigest()
+    wave.status = "RESTORE_REQUESTED"
+    requested_at = utcnow()
+    for obj in archives:
+        obj.state = ObjectState.RESTORE_REQUESTED
+        obj.restore_requested_at = requested_at
+        obj.restore_attempt_id = attempt.id
+        session.add(RestoreObjectResult(attempt_id=attempt.id, object_id=obj.id))
+    event(
+        session,
+        "SIMULATED_BATCH_RESTORE_SUBMITTED",
+        f"SIMULATED Batch job {response.job_id} accepted manifest with {len(archives)} object(s)",
+        source_id=source.id,
+        wave_id=wave.id,
+    )
+    succeed(session, task, "POLL_RESTORE")
+
+
+def poll_restore_simulated(
+    session, task: Task, settings, wave: Wave, source: Source
+) -> None:
+    context = simulation_execution_context(source)
+    port = SimulatedSourcePort(runtime_context.simulator_base_url)
+    attempt = restore_attempt_for_job(session, wave, source)
+    objects = list(
+        session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id))
+    )
+    if attempt.completed_at is None:
+        by_key = {(obj.object_key, obj.version_id or ""): obj for obj in objects}
+        token = None
+        status = "PROCESSING"
+        accepted = failed = 0
+        while True:
+            page = port.describe_restore_batch(
+                DescribeRestoreBatchRequest(
+                    context=context,
+                    job_id=wave.batch_job_id,
+                    continuation_token=token,
+                    max_results=1000,
+                )
+            )
+            status = page.status
+            accepted, failed = page.accepted_count, page.failed_count
+            for result in page.results:
+                obj = by_key.get((result.key, result.version_id or ""))
+                if obj is None:
+                    continue
+                outcome = session.scalar(
+                    select(RestoreObjectResult).where(
+                        RestoreObjectResult.attempt_id == attempt.id,
+                        RestoreObjectResult.object_id == obj.id,
+                    )
+                )
+                if outcome is None:
+                    outcome = RestoreObjectResult(attempt_id=attempt.id, object_id=obj.id)
+                    session.add(outcome)
+                outcome.task_status = "SUCCEEDED" if result.accepted else "FAILED"
+                outcome.http_status = 200 if result.accepted else 409
+                outcome.error_code = result.error_code
+                outcome.error_message = result.error_message
+                outcome.report_key = f"simulated://restore-jobs/{page.job_id}/results"
+            token = page.next_continuation_token
+            if not token:
+                break
+        attempt.batch_describe_requests = int(attempt.batch_describe_requests or 0) + 1
+        attempt.job_status = wave.batch_job_status = status
+        attempt.succeeded_objects = accepted
+        attempt.failed_objects = failed
+        if status != "COMPLETE":
+            if status == "FAILED":
+                fail_restore_attempt(
+                    session, task, wave, attempt, f"SIMULATED Batch job {wave.batch_job_id} failed"
+                )
+                return
+            wave.status = "RESTORING"
+            session.commit()
+            retry(session, task, f"SIMULATED Batch job status is {status}", 60)
+            return
+        if failed:
+            attempt.report_manifest_key = f"simulated://restore-jobs/{wave.batch_job_id}/results"
+            fail_restore_attempt(
+                session,
+                task,
+                wave,
+                attempt,
+                f"SIMULATED Batch restore rejected {failed} of {len(objects)} object(s)",
+            )
+            return
+        attempt.report_manifest_key = f"simulated://restore-jobs/{wave.batch_job_id}/results"
+        attempt.completed_at = utcnow()
+        attempt.failure_summary = None
+        for obj in objects:
+            if obj.storage_class in ARCHIVE_CLASSES and obj.state in {
+                ObjectState.RESTORE_REQUESTED,
+                ObjectState.RESTORING,
+            }:
+                obj.state = ObjectState.RESTORE_REQUEST_ACCEPTED
+        wave.status = "RESTORE_REQUEST_ACCEPTED"
+        event(
+            session,
+            "SIMULATED_RESTORE_REQUEST_ACCEPTED",
+            f"SIMULATED Batch job {wave.batch_job_id}: all {len(objects)} object(s) have individual acceptance evidence",
+            source_id=source.id,
+            wave_id=wave.id,
+        )
+        session.commit()
+
+    pending_archives = [
+        obj
+        for obj in objects
+        if obj.storage_class in ARCHIVE_CLASSES
+        and obj.state
+        in {
+            ObjectState.RESTORE_REQUESTED,
+            ObjectState.RESTORE_REQUEST_ACCEPTED,
+            ObjectState.RESTORING,
+        }
+    ]
+    ready_expiries: dict[int, datetime | None] = {}
+    recommended_real_delays: list[float] = []
+    started = time.monotonic()
+    for index, obj in enumerate(pending_archives, start=1):
+        result = port.head_object(
+            HeadObjectRequest(
+                context=context,
+                object=ObjectIdentity(
+                    bucket=source.s3_bucket,
+                    key=obj.object_key,
+                    version_id=obj.version_id,
+                ),
+            )
+        )
+        if result.exists and not result.restore_in_progress and result.restore_expires_at:
+            ready_expiries[obj.id] = result.restore_expires_at
+        elif result.simulator_recommended_real_poll_seconds is not None:
+            recommended_real_delays.append(result.simulator_recommended_real_poll_seconds)
+        if index % RESTORE_POLL_HEAD_BATCH_SIZE == 0:
+            task.lease_expires_at = utcnow() + timedelta(seconds=settings.task_lease_seconds)
+            session.commit()
+    poll_elapsed = time.monotonic() - started
+    persist_restore_poll_metrics(
+        wave,
+        {
+            "requests": len(pending_archives),
+            "throttle_retries": 0,
+            "elapsed_seconds": poll_elapsed,
+        },
+    )
+    wave.last_availability_poll_objects = len(pending_archives)
+    wave.last_availability_poll_seconds = poll_elapsed
+    availability_observed_at = utcnow()
+    for obj in objects:
+        if obj.storage_class not in ARCHIVE_CLASSES or obj.id in ready_expiries:
+            if obj.state in {
+                ObjectState.RESTORE_REQUESTED,
+                ObjectState.RESTORE_REQUEST_ACCEPTED,
+                ObjectState.RESTORING,
+                ObjectState.WAVE_ASSIGNED,
+            }:
+                obj.state = ObjectState.RESTORED
+                obj.restored_at = obj.restored_at or availability_observed_at
+                if obj.storage_class in ARCHIVE_CLASSES:
+                    obj.restore_expires_at = ready_expiries.get(obj.id)
+        elif obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED}:
+            obj.state = ObjectState.RESTORING
+    pending = int(
+        session.scalar(
+            select(func.count(ObjectRecord.id)).where(
+                ObjectRecord.wave_id == wave.id,
+                ObjectRecord.state.in_(
+                    [
+                        ObjectState.RESTORE_REQUESTED,
+                        ObjectState.RESTORE_REQUEST_ACCEPTED,
+                        ObjectState.RESTORING,
+                    ]
+                ),
+            )
+        )
+        or 0
+    )
+    wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
+    if pending:
+        wave.status = "RESTORING"
+        ready_for_transfer = int(
+            session.scalar(
+                select(func.count(ObjectRecord.id)).where(
+                    ObjectRecord.wave_id == wave.id,
+                    ObjectRecord.state == ObjectState.RESTORED,
+                )
+            )
+            or 0
+        )
+        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
+            ensure_transfer_task(session, wave)
+            event(
+                session,
+                "SIMULATED_RESTORE_PARTIALLY_AVAILABLE",
+                f"SIMULATED: {ready_for_transfer} restored object(s) released while {pending} remain unavailable",
+                source_id=source.id,
+                wave_id=wave.id,
+            )
+        session.commit()
+        delay = restore_availability_poll_delay_seconds(
+            attempt.completed_at,
+            utcnow(),
+            wave.restore_tier,
+            partial_availability=bool(ready_for_transfer),
+            transfer_strategy=source.transfer_strategy,
+            pending_objects=pending,
+        )
+        if recommended_real_delays:
+            # Preserve the production polling policy in virtual time while
+            # converting its wait to real simulator time. Never busy-loop.
+            delay = max(1, min(delay, int(min(recommended_real_delays)) + 1))
+        retry(
+            session,
+            task,
+            f"SIMULATED: {pending} object(s) still unavailable; next poll in {delay // 60} minutes",
+            delay,
+        )
+        return
+    wave.status = "RESTORED"
+    event(
+        session,
+        "SIMULATED_RESTORE_AVAILABLE",
+        "SIMULATED: all wave objects are available for transfer",
+        source_id=source.id,
+        wave_id=wave.id,
+    )
+    ensure_transfer_task(session, wave)
+    succeed(session, task)
+
+
 def poll_restore(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
+    if runtime_context.is_simulation:
+        poll_restore_simulated(session, task, settings, wave, source)
+        return
     # Keep the control-bucket layout in sync with submission.  The completion
     # report lives under the source-specific Raijin prefix, not the legacy
     # s3-oci-control prefix.
@@ -1206,6 +1576,270 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
         worker_session.commit()
 
 
+def transfer_object_simulated(
+    object_id: int,
+    rate_bytes_per_second: float,
+    configured_multipart_part_size: int = DEFAULT_MULTIPART_PART_SIZE,
+) -> None:
+    """Run the production object state machine against typed simulator ports.
+
+    The main database remains the authority for leases and checkpoints.  The
+    simulator receives the same byte ranges the real worker would upload, then
+    independently regenerates the expected source bytes, validates them and
+    discards the payload.  No simulated object body is persisted.
+    """
+    with SessionLocal() as worker_session:
+        obj = worker_session.get(ObjectRecord, object_id)
+        if not obj or obj.state not in {ObjectState.RESTORED, ObjectState.TRANSFERRING}:
+            return
+        source = obj.wave.source
+        context = simulation_execution_context(source)
+        source_port = SimulatedSourcePort(runtime_context.simulator_base_url)
+        destination_port = SimulatedDestinationPort(runtime_context.simulator_base_url)
+        if obj.state != ObjectState.TRANSFERRING:
+            obj.transfer_elapsed_seconds = 0
+        obj.state, obj.transfer_started_at = ObjectState.TRANSFERRING, utcnow()
+        obj.transfer_progress_bytes, obj.transfer_progress_at, obj.transfer_rate_mbps = (
+            0,
+            utcnow(),
+            0,
+        )
+        worker_session.commit()
+        elapsed_baseline = time.monotonic()
+        progress_bytes = 0
+
+        def throttle(size: int, started: float) -> None:
+            if rate_bytes_per_second <= 0:
+                return
+            delay = size / rate_bytes_per_second - (time.monotonic() - started)
+            if delay > 0:
+                time.sleep(delay)
+
+        def persist_progress(completed: int) -> None:
+            nonlocal progress_bytes, elapsed_baseline
+            now = time.monotonic()
+            elapsed = max(now - elapsed_baseline, 0)
+            delta = max(0, completed - progress_bytes)
+            obj.transfer_elapsed_seconds += elapsed
+            obj.transfer_progress_bytes = completed
+            obj.transfer_progress_at = utcnow()
+            obj.transfer_rate_mbps = (
+                round(delta * 8 / max(elapsed, 0.001) / 1_000_000, 2) if delta else 0
+            )
+            progress_bytes, elapsed_baseline = completed, now
+            worker_session.commit()
+
+        identity = ObjectIdentity(
+            bucket=source.s3_bucket,
+            key=obj.object_key,
+            version_id=obj.version_id,
+        )
+        if source.simulation_fidelity == "CONTROL":
+            result = destination_port.transfer_logically(
+                LogicalTransferRequest(
+                    context=context,
+                    source=identity,
+                    destination_bucket=source.destination_bucket,
+                    size_bytes=obj.size_bytes,
+                    idempotency_key=uuid5(
+                        NAMESPACE_URL,
+                        f"raijin:simulation:logical-transfer:{context.execution_id}:{obj.id}",
+                    ),
+                )
+            )
+            obj.transfer_elapsed_seconds += result.simulated_elapsed_seconds
+            obj.transfer_progress_bytes = obj.size_bytes
+            obj.transfer_progress_at = utcnow()
+            obj.transfer_rate_mbps = (
+                round(obj.size_bytes * 8 / result.simulated_elapsed_seconds / 1_000_000, 2)
+                if result.simulated_elapsed_seconds > 0
+                else 0
+            )
+            obj.source_checksum = None
+            obj.destination_checksum = None
+            obj.checksum_algorithm = "SIMULATED_LOGICAL_EVIDENCE"
+            obj.delivery_integrity_algorithm = "SIMULATED_LOGICAL_EVIDENCE"
+            obj.delivery_integrity_checksum = result.evidence.checksum_sha256
+            obj.delivery_integrity_status = "OCI_ACCEPTED"
+            obj.delivery_integrity_verified_at = utcnow()
+            obj.state, obj.transferred_at = ObjectState.TRANSFERRED, utcnow()
+            worker_session.commit()
+            return
+
+        def read_range(offset: int, length: int) -> bytes:
+            if length == 0:
+                return b""
+            payload = b"".join(
+                source_port.read_range(
+                    ReadRangeRequest(
+                        context=context,
+                        object=identity,
+                        offset=offset,
+                        length=length,
+                    )
+                )
+            )
+            if len(payload) != length:
+                raise RuntimeError(
+                    f"Simulated source range ended early: expected {length}, received {len(payload)}"
+                )
+            return payload
+
+        descriptor = ObjectDescriptor(
+            bucket=source.destination_bucket,
+            key=obj.object_key,
+            version_id=obj.version_id,
+            size_bytes=obj.size_bytes,
+            storage_class="STANDARD",
+            etag=obj.etag,
+            last_modified=obj.last_modified,
+            metadata=json.loads(obj.metadata_json or "{}"),
+            tags=json.loads(obj.tags_json or "{}"),
+        )
+        full_digest = hashlib.sha256()
+        resumed = False
+        if obj.size_bytes <= DIRECT_SHA_LIMIT:
+            payload = read_range(0, obj.size_bytes)
+            full_digest.update(payload)
+            checksum = base64.b64encode(full_digest.digest()).decode("ascii")
+            started = time.monotonic()
+            evidence = destination_port.put_object(
+                PutObjectRequest(
+                    context=context,
+                    object=descriptor,
+                    source_checksum_sha256=checksum,
+                    idempotency_key=uuid5(
+                        NAMESPACE_URL,
+                        f"raijin:simulation:put:{context.execution_id}:{obj.id}",
+                    ),
+                ),
+                iter((payload,)),
+            )
+            throttle(len(payload), started)
+            persist_progress(len(payload))
+            delivery_algorithm, delivery_checksum = "SHA256", evidence.checksum_sha256
+            checksum_algorithm, source_checksum = "SHA256", checksum
+        else:
+            part_size = int(
+                obj.multipart_part_size
+                or effective_multipart_part_size(
+                    obj.size_bytes, configured_multipart_part_size
+                )
+            )
+            upload_id = obj.multipart_upload_id
+            persisted_parts = json.loads(obj.multipart_parts_json or "{}")
+            if not upload_id:
+                upload_id = destination_port.create_multipart(
+                    MultipartCreateRequest(
+                        context=context,
+                        object=descriptor,
+                        part_size_bytes=part_size,
+                        idempotency_key=uuid5(
+                            NAMESPACE_URL,
+                            f"raijin:simulation:multipart:{context.execution_id}:{obj.id}",
+                        ),
+                    )
+                )
+                obj.multipart_upload_id = upload_id
+                obj.multipart_part_size = part_size
+                obj.multipart_parts_json = "{}"
+                obj.multipart_updated_at = utcnow()
+                worker_session.commit()
+            total_parts = (obj.size_bytes + part_size - 1) // part_size
+            completed_bytes = 0
+            parts: list[MultipartPartEvidence] = []
+            for part_number in range(1, total_parts + 1):
+                expected_size = expected_part_size(obj.size_bytes, part_number, part_size)
+                prior = persisted_parts.get(str(part_number))
+                if prior and prior.get("size") == expected_size and prior.get("sha256"):
+                    resumed = True
+                    completed_bytes += expected_size
+                    parts.append(
+                        MultipartPartEvidence(
+                            part_number=part_number,
+                            size_bytes=expected_size,
+                            checksum_sha256=prior["sha256"],
+                            etag=prior["etag"],
+                        )
+                    )
+                    continue
+                offset = (part_number - 1) * part_size
+                payload = read_range(offset, expected_size)
+                digest = sha256_b64(payload)
+                full_digest.update(payload)
+                started = time.monotonic()
+                part = destination_port.upload_part(
+                    MultipartPartRequest(
+                        context=context,
+                        upload_id=upload_id,
+                        object=identity,
+                        part_number=part_number,
+                        size_bytes=expected_size,
+                        checksum_sha256=digest,
+                        idempotency_key=uuid5(
+                            NAMESPACE_URL,
+                            f"raijin:simulation:part:{upload_id}:{part_number}",
+                        ),
+                    ),
+                    iter((payload,)),
+                )
+                throttle(len(payload), started)
+                completed_bytes += len(payload)
+                parts.append(part)
+                persisted_parts[str(part_number)] = {
+                    "etag": part.etag,
+                    "size": part.size_bytes,
+                    "sha256": part.checksum_sha256,
+                }
+                obj.multipart_parts_json = json.dumps(
+                    persisted_parts, separators=(",", ":")
+                )
+                obj.multipart_updated_at = utcnow()
+                worker_session.commit()
+                persist_progress(completed_bytes)
+            evidence = destination_port.commit_multipart(
+                MultipartCommitRequest(
+                    context=context,
+                    upload_id=upload_id,
+                    object=identity,
+                    parts=parts,
+                    full_checksum_sha256=(
+                        None
+                        if resumed
+                        else base64.b64encode(full_digest.digest()).decode("ascii")
+                    ),
+                    idempotency_key=uuid5(
+                        NAMESPACE_URL,
+                        f"raijin:simulation:commit:{upload_id}",
+                    ),
+                )
+            )
+            obj.multipart_upload_id, obj.multipart_updated_at = None, utcnow()
+            persist_progress(obj.size_bytes)
+            delivery_algorithm = "SHA256_MULTIPART_PARTS"
+            delivery_checksum = evidence.checksum_sha256
+            checksum_algorithm = "SHA256_MULTIPART_PARTS"
+            source_checksum = (
+                None if resumed else base64.b64encode(full_digest.digest()).decode("ascii")
+            )
+
+        obj.source_checksum, obj.destination_checksum = source_checksum, None
+        obj.checksum_algorithm = checksum_algorithm
+        obj.integrity_verified_at, obj.integrity_error = None, None
+        obj.delivery_integrity_algorithm = delivery_algorithm
+        obj.delivery_integrity_checksum = delivery_checksum
+        obj.delivery_integrity_status = "OCI_ACCEPTED"
+        obj.delivery_integrity_verified_at = utcnow()
+        obj.transfer_elapsed_seconds += max(0, time.monotonic() - elapsed_baseline)
+        obj.state, obj.transferred_at = ObjectState.TRANSFERRED, utcnow()
+        obj.transfer_progress_bytes, obj.transfer_progress_at, obj.transfer_rate_mbps = (
+            obj.size_bytes,
+            utcnow(),
+            0,
+        )
+        worker_session.commit()
+
+
 def transfer_wave(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
     # Reflect the claimed transfer immediately.  Establishing AWS clients can
@@ -1214,10 +1848,13 @@ def transfer_wave(session, task: Task, settings) -> None:
     # which never needs a restore request.
     wave.status = "TRANSFERRING"
     session.commit()
-    s3, _, _ = aws_clients(settings, source.aws_region, source)
-    namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
-    if not namespace:
-        raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
+    if runtime_context.is_real:
+        s3, _, _ = aws_clients(settings, source.aws_region, source)
+        namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
+        if not namespace:
+            raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
+    else:
+        s3, namespace = None, "simulated"
 
     # The wave task remains exclusive: file workers only parallelize objects
     # inside it. Settings are reloaded before each batch, so changing workers
@@ -1238,9 +1875,17 @@ def transfer_wave(session, task: Task, settings) -> None:
         multipart_part_size = live_settings.multipart_part_size_mib * 1024 * 1024
         errors: list[str] = []
         with ThreadPoolExecutor(max_workers=len(object_ids), thread_name_prefix="s3-oci-transfer") as executor:
-            futures = [executor.submit(transfer_object, s3, namespace, source.s3_bucket,
-                                       source.destination_bucket, object_id, rate, live_settings.preserve_s3_tags, multipart_part_size)
-                       for object_id in object_ids]
+            if runtime_context.is_simulation:
+                futures = [
+                    executor.submit(
+                        transfer_object_simulated, object_id, rate, multipart_part_size
+                    )
+                    for object_id in object_ids
+                ]
+            else:
+                futures = [executor.submit(transfer_object, s3, namespace, source.s3_bucket,
+                                           source.destination_bucket, object_id, rate, live_settings.preserve_s3_tags, multipart_part_size)
+                           for object_id in object_ids]
             for future in as_completed(futures):
                 try:
                     future.result()
@@ -1272,6 +1917,26 @@ def transfer_wave(session, task: Task, settings) -> None:
         run = session.get(DynamicPipelineRun, wave.pipeline_run_id)
         if run:
             refresh_dynamic_pipeline_run(session, run)
+    if runtime_context.is_simulation and wave.status == "COMPLETED":
+        total, unfinished = session.execute(
+            select(
+                func.count(ObjectRecord.id),
+                func.count(ObjectRecord.id).filter(
+                    ObjectRecord.state.notin_([ObjectState.TRANSFERRED, ObjectState.VERIFIED])
+                ),
+            ).where(ObjectRecord.source_id == source.id)
+        ).one()
+        if total and not unfinished:
+            SimulatorAdminClient(runtime_context.simulator_base_url).set_execution_state(
+                source.simulation_execution_id, "SUCCEEDED"
+            )
+            event(
+                session,
+                "SIMULATION_EXECUTION_SUCCEEDED",
+                f"SIMULATED execution completed after all {total} source object(s) were transferred",
+                source_id=source.id,
+                wave_id=wave.id,
+            )
     succeed(session, task)
 
 
@@ -1279,6 +1944,9 @@ def verify_wave(session, task: Task) -> None:
     """Read OCI objects and compare them to the SHA-256 evidence from S3."""
     wave = session.get(Wave, task.wave_id)
     source = wave.source
+    if runtime_context.is_simulation:
+        verify_wave_simulated(session, task, wave, source)
+        return
     namespace = read_oci_runtime_config().get("object_storage_namespace", "").strip()
     if not namespace:
         raise RuntimeError("OCI Object Storage namespace is absent from runtime configuration")
@@ -1350,6 +2018,101 @@ def verify_wave(session, task: Task) -> None:
     succeed(session, task)
 
 
+def verify_wave_simulated(session, task: Task, wave: Wave, source: Source) -> None:
+    """Deep-audit discarded destination payload using deterministic replay."""
+    if source.simulation_fidelity != "DATA":
+        raise RuntimeError(
+            "Deep SHA-256 audit requires a DATA simulation; CONTROL validates logical state only"
+        )
+    context = simulation_execution_context(source)
+    source_port = SimulatedSourcePort(runtime_context.simulator_base_url)
+    destination_port = SimulatedDestinationPort(runtime_context.simulator_base_url)
+    objects = list(
+        session.scalars(
+            select(ObjectRecord)
+            .where(
+                ObjectRecord.wave_id == wave.id,
+                ObjectRecord.state == ObjectState.TRANSFERRED,
+            )
+            .order_by(ObjectRecord.id)
+        )
+    )
+    failed = 0
+    for obj in objects:
+        obj.audit_started_at, obj.audit_progress_bytes = utcnow(), 0
+        obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
+        session.commit()
+        source_digest, destination_digest = hashlib.sha256(), hashlib.sha256()
+        try:
+            for offset in range(0, obj.size_bytes, COPY_CHUNK_SIZE):
+                length = min(COPY_CHUNK_SIZE, obj.size_bytes - offset)
+                source_request = ReadRangeRequest(
+                    context=context,
+                    object=ObjectIdentity(
+                        bucket=source.s3_bucket,
+                        key=obj.object_key,
+                        version_id=obj.version_id,
+                    ),
+                    offset=offset,
+                    length=length,
+                    allow_archived_for_audit=True,
+                )
+                destination_request = ReadRangeRequest(
+                    context=context,
+                    object=ObjectIdentity(
+                        bucket=source.destination_bucket,
+                        key=obj.object_key,
+                        version_id=obj.version_id,
+                    ),
+                    offset=offset,
+                    length=length,
+                )
+                source_payload = b"".join(source_port.read_range(source_request))
+                destination_payload = b"".join(
+                    destination_port.read_range(destination_request)
+                )
+                if len(source_payload) != length or len(destination_payload) != length:
+                    raise RuntimeError("Simulated audit range ended early")
+                source_digest.update(source_payload)
+                destination_digest.update(destination_payload)
+                obj.audit_progress_bytes = offset + length
+                obj.audit_progress_at = utcnow()
+                session.commit()
+            obj.source_checksum = base64.b64encode(source_digest.digest()).decode("ascii")
+            obj.destination_checksum = base64.b64encode(
+                destination_digest.digest()
+            ).decode("ascii")
+            if obj.source_checksum != obj.destination_checksum:
+                raise RuntimeError("SHA-256 source/destination mismatch")
+            obj.integrity_error = None
+            obj.integrity_verified_at = utcnow()
+            obj.state = ObjectState.VERIFIED
+        except Exception as error:
+            obj.integrity_error = f"Simulated deep audit failed: {type(error).__name__}: {error}"
+            obj.state = ObjectState.FAILED
+            failed += 1
+        obj.audit_progress_at, obj.audit_rate_mbps = utcnow(), 0
+        session.commit()
+    remaining = int(
+        session.scalar(
+            select(func.count(ObjectRecord.id)).where(
+                ObjectRecord.wave_id == wave.id,
+                ObjectRecord.state != ObjectState.VERIFIED,
+            )
+        )
+        or 0
+    )
+    wave.status = "VERIFIED" if not remaining else "VERIFICATION_FAILED"
+    event(
+        session,
+        "SIMULATED_INTEGRITY_VERIFICATION_COMPLETED",
+        f"SIMULATED deep audit completed; {failed} failed and {remaining} remain pending",
+        source_id=source.id,
+        wave_id=wave.id,
+    )
+    succeed(session, task)
+
+
 def task_kinds_for_role(role: str) -> frozenset[str] | None:
     if role == "governance":
         return GOVERNANCE_TASK_KINDS
@@ -1361,13 +2124,25 @@ def task_kinds_for_role(role: str) -> frozenset[str] | None:
 
 
 def run_once(role: str = WORKER_ROLE) -> None:
+    from app.runtime_context import mode_switch_requested
+    if mode_switch_requested():
+        return
+    if runtime_context.is_simulation:
+        # Fail before touching the isolated control-plane schema unless the
+        # simulator contract and all currently advertised operations are live.
+        cloud_backend.readiness(require_operations=True)
     with SessionLocal() as session:
         settings = runtime_settings(session)
-        if not settings.real_worker_enabled:
+        # SIMULATION processes are already isolated from cloud credentials and
+        # use only typed simulator ports. The legacy-named production switch
+        # therefore controls REAL claims only; a simulation console does not
+        # need to mutate or reinterpret a real-cloud safety setting.
+        if runtime_context.is_real and not settings.real_worker_enabled:
             return
         allowed_task_kinds = task_kinds_for_role(role)
         if role in {"governance", "all"}:
-            refresh_due_global_aws_pricing(session)
+            if runtime_context.is_real:
+                refresh_due_global_aws_pricing(session)
             if settings.dynamic_pipeline_enabled:
                 replan_dynamic_pipeline(session, settings)
                 release_dynamic_restore_horizon(session, settings)
@@ -1428,6 +2203,15 @@ def run_once(role: str = WORKER_ROLE) -> None:
                 discovery_job.state, discovery_job.error, discovery_job.lease_expires_at, discovery_job.completed_at = TaskState.FAILED, source.discovery_error, None, finished_at
                 event(session, "DISCOVERY_FAILED", source.discovery_error, source_id=source.id); session.commit()
             return
+        if runtime_context.is_simulation:
+            simulation_kinds = frozenset(
+                {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "TRANSFER_WAVE", "VERIFY_WAVE"}
+            )
+            allowed_task_kinds = (
+                simulation_kinds
+                if allowed_task_kinds is None
+                else frozenset(allowed_task_kinds & simulation_kinds)
+            )
         task = claim_task(session, settings.task_lease_seconds, allowed_task_kinds)
         if not task: return
         try:

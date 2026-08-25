@@ -59,6 +59,11 @@ resource "random_password" "postgres" {
   special = false
 }
 
+resource "random_password" "simulation_postgres" {
+  length  = 48
+  special = false
+}
+
 resource "oci_kms_vault" "migration" {
   count          = var.create_vault_key ? 1 : 0
   compartment_id = var.vault_compartment_ocid
@@ -90,6 +95,22 @@ resource "oci_vault_secret" "postgres_password" {
   secret_content {
     content_type = "BASE64"
     content      = base64encode(random_password.postgres.result)
+    name         = "terraform-generated"
+    stage        = "CURRENT"
+  }
+}
+
+resource "oci_vault_secret" "simulation_postgres_password" {
+  count          = var.create_platform_secrets ? 1 : 0
+  compartment_id = var.secrets_compartment_ocid
+  secret_name    = "${var.resource_name_prefix}-simulation-postgres-password"
+  vault_id       = local.vault_id
+  key_id         = local.vault_key_id
+  description    = "Automatically generated password for the isolated RAIJIN simulation PostgreSQL user."
+
+  secret_content {
+    content_type = "BASE64"
+    content      = base64encode(random_password.simulation_postgres.result)
     name         = "terraform-generated"
     stage        = "CURRENT"
   }
@@ -165,7 +186,8 @@ resource "oci_core_instance" "migration" {
           for compartment_id, compartment in data.oci_identity_compartment.destination : compartment_id => compartment.name
         }
         secret_ocids = {
-          postgres_password = var.create_platform_secrets ? oci_vault_secret.postgres_password[0].id : var.external_postgres_password_secret_ocid
+          postgres_password            = var.create_platform_secrets ? oci_vault_secret.postgres_password[0].id : var.external_postgres_password_secret_ocid
+          simulation_postgres_password = var.create_platform_secrets ? oci_vault_secret.simulation_postgres_password[0].id : var.external_simulation_postgres_password_secret_ocid
         }
         secrets_compartment_ocid = var.secrets_compartment_ocid
         secret_compartment_ocids = local.secret_compartment_ocids
@@ -191,6 +213,10 @@ resource "oci_core_instance" "migration" {
     precondition {
       condition     = var.create_platform_secrets || trimspace(var.external_postgres_password_secret_ocid) != ""
       error_message = "Provide external_postgres_password_secret_ocid when create_platform_secrets is false."
+    }
+    precondition {
+      condition     = var.create_platform_secrets || trimspace(var.external_simulation_postgres_password_secret_ocid) != ""
+      error_message = "Provide external_simulation_postgres_password_secret_ocid when create_platform_secrets is false."
     }
     precondition {
       condition     = !var.create_initial_aws_connection_secret || trimspace(var.initial_aws_connection_secret_name) != ""
@@ -249,7 +275,7 @@ resource "oci_core_volume_backup_policy" "migration" {
   schedules {
     backup_type       = "INCREMENTAL"
     period            = "ONE_DAY"
-    retention_seconds = 1209600 # 14 days
+    retention_seconds = 3024000 # 35 days; covers the default simulator quarantine
     hour_of_day       = 2
     time_zone         = "UTC"
   }

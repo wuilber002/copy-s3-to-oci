@@ -3,8 +3,15 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import create_engine, select
+from sqlalchemy import BigInteger, create_engine, select
+from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
+
+
+@compiles(BigInteger, "sqlite")
+def _compile_big_integer_as_sqlite_integer(_type, _compiler, **_kwargs):
+    """Keep PostgreSQL BIGINT models auto-incrementable in SQLite contract tests."""
+    return "INTEGER"
 
 
 _password = Path("/tmp/raijin-test-password-contract")
@@ -15,7 +22,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, list_sources, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, list_sources, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -473,6 +480,63 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     assert automatic_dynamic_duration_limit(2) == (36 * 3600, 12 * 3600)
 
 
+def test_dynamic_planner_uses_scalar_boundaries_and_assigns_every_object_once():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(
+            id=951,
+            name="large-plan-contract",
+            s3_bucket="source",
+            aws_region="us-east-1",
+            destination_bucket="destination",
+            status="DISCOVERED",
+        )
+        session.add(source)
+        session.flush()
+        session.add_all([
+            ObjectRecord(
+                id=960 + index,
+                source_id=source.id,
+                object_key=f"prefix/object-{index:04d}.bin",
+                size_bytes=1024 + index,
+                state=ObjectState.DISCOVERED,
+            )
+            for index in range(37)
+        ])
+        session.commit()
+
+        plan = dynamic_wave_plan(
+            session,
+            source.id,
+            max_bytes=10 * 1024**4,
+            target_transfer_seconds=16 * 3600,
+            max_objects=500_000,
+        )
+        assert sum(item["object_count"] for item in plan["waves"]) == 37
+        assert all("objects" not in item for item in plan["waves"])
+
+        response = create_dynamic_waves(
+            source.id,
+            DynamicWaveCreate(
+                restore_days=1,
+                restore_tier="BULK",
+                schedule_restores=False,
+            ),
+            session,
+        )
+        assert response["objects"] == 37
+        assigned = list(session.execute(
+            select(ObjectRecord.wave_id, ObjectRecord.state).where(
+                ObjectRecord.source_id == source.id
+            )
+        ))
+        assert len(assigned) == 37
+        assert all(wave_id is not None and state == ObjectState.WAVE_ASSIGNED for wave_id, state in assigned)
+        assert session.scalar(select(Wave).where(Wave.source_id == source.id)).planner_mode == "DYNAMIC"
+
+
 def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     source = Path("app/main.py").read_text(encoding="utf-8")
     frontend = Path("app/static/index.html").read_text(encoding="utf-8")
@@ -542,6 +606,98 @@ def test_dynamic_replan_preserves_submitted_waves_and_exposes_forecast():
     assert 'if wave.status != "RESTORE_SCHEDULED" or has_batch_task:' in source
     assert '"pipeline_completion_at"' in source
     assert "replan_dynamic_pipeline(session, settings)" in worker
+
+
+def test_dynamic_replan_uses_control_mode_logical_elapsed_time():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    # SQLite intentionally returns naive datetimes even for timezone-aware
+    # columns; production PostgreSQL keeps the UTC offset.
+    initial = datetime(2026, 8, 25, 12, 0)
+    with Session() as session:
+        source = Source(
+            id=971,
+            name="logical-replan",
+            s3_bucket="sim-source",
+            aws_region="us-east-1",
+            destination_bucket="sim-destination",
+            backend_kind="SIMULATED",
+            simulation_fidelity="CONTROL",
+        )
+        settings = RuntimeSettings(
+            id=1,
+            transfer_workers=2,
+            max_throughput_mbps=1100,
+            dynamic_pipeline_enabled=True,
+        )
+        run = DynamicPipelineRun(
+            id=972,
+            source_id=source.id,
+            status="SCHEDULED",
+            scheduled_restores=True,
+            restore_safety_seconds=0,
+        )
+        completed = Wave(
+            id=973,
+            source_id=source.id,
+            pipeline_run_id=run.id,
+            name="wave-001",
+            max_bytes=1,
+            restore_days=1,
+            restore_tier="BULK",
+            status="COMPLETED",
+            planner_mode="DYNAMIC",
+            predicted_transfer_seconds=60,
+            planned_transfer_start_at=initial,
+        )
+        future = Wave(
+            id=974,
+            source_id=source.id,
+            pipeline_run_id=run.id,
+            name="wave-002",
+            max_bytes=1,
+            restore_days=1,
+            restore_tier="BULK",
+            status="RESTORE_SCHEDULED",
+            planner_mode="DYNAMIC",
+            predicted_transfer_seconds=60,
+            planned_transfer_start_at=initial + timedelta(seconds=60),
+            planned_restore_at=initial,
+        )
+        session.add_all([source, settings, run, completed, future])
+        session.flush()
+        session.add_all([
+            ObjectRecord(
+                id=975,
+                source_id=source.id,
+                wave_id=completed.id,
+                object_key="a.bin",
+                size_bytes=1,
+                state=ObjectState.TRANSFERRED,
+                transfer_started_at=initial,
+                transferred_at=initial,
+                transfer_elapsed_seconds=300,
+            ),
+            ObjectRecord(
+                id=976,
+                source_id=source.id,
+                wave_id=completed.id,
+                object_key="b.bin",
+                size_bytes=1,
+                state=ObjectState.TRANSFERRED,
+                transfer_started_at=initial,
+                transferred_at=initial,
+                transfer_elapsed_seconds=300,
+            ),
+        ])
+        session.flush()
+        changed = replan_dynamic_pipeline(session, settings, now=initial)
+        assert changed == 1
+        assert future.planned_transfer_start_at == initial + timedelta(seconds=300)
+        event = session.scalar(select(Event).where(Event.kind == "DYNAMIC_WAVE_REPLANNED"))
+        assert event is not None
+        assert "simulated logical transfer duration" in event.message
 
 
 def test_connection_api_limits_are_durable_and_used_by_workers():

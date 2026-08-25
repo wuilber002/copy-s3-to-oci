@@ -166,6 +166,12 @@ variable "external_postgres_password_secret_ocid" {
   default     = ""
 }
 
+variable "external_simulation_postgres_password_secret_ocid" {
+  description = "Existing simulation PostgreSQL-password Secret OCID when the customer does not allow Terraform to create platform Secrets."
+  type        = string
+  default     = ""
+}
+
 variable "create_dynamic_group" {
   description = "Whether Terraform creates the instance dynamic group."
   type        = bool
@@ -209,7 +215,7 @@ variable "backup_policy_id" {
 }
 
 variable "create_boot_volume_backup_policy" {
-  description = "Create and attach a daily OCI boot-volume backup policy with 14-day retention."
+  description = "Create and attach a daily OCI boot-volume backup policy with 35-day retention, covering the default simulator quarantine."
   type        = bool
   default     = true
 }

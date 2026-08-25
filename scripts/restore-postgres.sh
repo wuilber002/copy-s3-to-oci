@@ -11,6 +11,7 @@ backup_file=''
 usage() {
   cat <<'EOF'
 Usage: s3-oci-restore-postgres --backup /var/lib/s3-oci-migration/backups/migration-<timestamp>.dump --confirm-restore
+       s3-oci-restore-postgres --backup /var/lib/s3-oci-migration/backups/migration-simulation-<timestamp>.dump --confirm-restore
 
 Restores one logical PostgreSQL backup into the Raijin control plane. The
 current database is backed up immediately before replacement. This operation
@@ -42,7 +43,9 @@ podman start s3-oci-postgres >/dev/null
 
 # Preserve the current state before a potentially irreversible logical restore.
 /usr/local/sbin/s3-oci-backup-postgres
-podman exec s3-oci-postgres pg_restore -U migration -d migration \
+target_database=migration
+[[ "$(basename "$backup_file_real")" == migration-simulation-* ]] && target_database=migration_simulation
+podman exec s3-oci-postgres pg_restore -U migration -d "$target_database" \
   --clean --if-exists --no-owner --exit-on-error "$backup_file_real"
 
 systemctl start s3-oci-migration.service

@@ -145,14 +145,27 @@ O re-discovery é incremental e auditável:
   histórica estiver íntegra, usa **Ver alterações → Preparar nova transferência**
   para criar a revisão nova, que fica em `DISCOVERED`.
 
-## Backend simulado — capacidade planejada
+## Backend simulado — implementado e em evolução
 
-O backend simulado será um gêmeo digital controlado da AWS, do OCI, da rede e
+O backend simulado é um gêmeo digital controlado da AWS, do OCI, da rede e
 do tempo. Seu objetivo não é criar um fluxo alternativo que aprove waves
 artificialmente: os mesmos governance e transfer workers usados em produção
 continuarão processando fila, leases, polling, restores, streaming, multipart,
 retries, checkpoints, reconciliação e replanejamento. Somente as integrações
-externas serão substituídas por implementações simuladas.
+externas são substituídas por implementações simuladas no modo isolado.
+
+Já estão disponíveis: modos exclusivos `REAL`/`SIMULATION`, banco lógico
+separado, handshake versionado, console dedicada, catálogo virtual, gerador de
+bytes determinístico, restore e Batch Operations simulados com evidência por
+objeto, relógio virtual, perfis de rede, transferência `CONTROL`, streaming
+`DATA`, multipart retomável, SHA-256 independente no destino descartável,
+auditoria profunda, orçamento físico, templates editáveis com snapshots
+imutáveis por execução, falhas reproduzíveis,
+housekeeping diário e reversível, purga física protegida por validação cruzada,
+tombstone SHA-256, relatório agregado de evidências, clonagem fiel de
+execuções, replanejamento pelas durações lógicas observadas e timeline visual
+previsto/observado com decisões do scheduler. O catálogo `CONTROL` foi validado
+com 100 TB lógicos e 640 mil objetos sem persistir payload.
 
 ### Modos e isolamento
 
@@ -287,6 +300,12 @@ externas serão substituídas por implementações simuladas.
   para que alterações futuras no modelo não modifiquem testes históricos.
 - A reprodução criará uma nova execução a partir do snapshot persistido e
   repetirá a mesma sequência até que a evidência deixe de ser necessária.
+- Restore, variação de rede e falhas probabilísticas usam a identidade estável
+  do objeto, não UUIDs locais do banco. Assim, a mesma seed e o mesmo snapshot
+  repetem tempos e pontos de falha inclusive em um catálogo clonado.
+- A expiração da cópia temporária é simulada: `Head`, leitura e transferência
+  deixam de considerar o objeto disponível, e ele pode receber uma nova
+  solicitação de restore.
 
 ### Retenção e compatibilidade
 
@@ -307,6 +326,10 @@ externas serão substituídas por implementações simuladas.
 - O gerador de dados terá versão persistida. Algoritmos antigos permanecerão
   disponíveis enquanto existirem cenários dependentes; depois disso, seguirão
   o mesmo ciclo de depreciação, e o código será retirado em uma release normal.
+- A matriz reproduzível `scripts/validate-simulation-templates.py` executa os
+  onze templates nativos com seeds registradas e exige evidência das falhas
+  declaradas. Os validadores separados comprovam catálogo e planejamento de
+  100 TB lógicos com aproximadamente 640 mil objetos.
 
 ## Capacidades em evolução
 

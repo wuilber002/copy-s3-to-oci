@@ -14,7 +14,7 @@
    A VM aceita administração SSH exclusivamente por chave pública/privada: senha, teclado interativo e login direto de root são desabilitados pelo cloud-init e reforçados pelo bootstrap. A porta 8080 nunca deve ser liberada; ela é publicada apenas em `127.0.0.1` na VM. O cliente pode manter a regra de SSH sem restrição de CIDR conforme sua política, desde que preserve a proteção da chave privada.
 3. Escolha criar Vault/Key ou informar os OCIDs de recursos existentes. O stack pode criar os Secrets de plataforma e um template JSON inicial de conexão AWS; quando esses recursos são externos, o cliente deve fornecer o Secret de senha PostgreSQL e as policies correspondentes.
 4. Se criar policy, informe os buckets OCI de destino em `destination_buckets_json`. Agrupe buckets no mesmo compartment sempre que possível.
-5. Aplique o stack. Por padrão, ele cria e associa uma policy de backup incremental diário do boot volume, com retenção de 14 dias. É possível informar uma policy existente em vez disso.
+5. Aplique o stack. Por padrão, ele cria e associa uma policy de backup incremental diário do boot volume, com retenção de 35 dias. É possível informar uma policy existente em vez disso.
 6. Para conexões AWS, crie ou atualize um único Secret JSON seguindo [Conexões AWS](aws-connections.md). Em **Configurações → Conexões AWS**, atualize os Secrets, cadastre a conexão e execute seu pré-check.
 7. Confirme que a policy automática de backup está associada ao boot volume.
 
@@ -50,7 +50,24 @@ Os formulários e indicadores principais possuem ícones `i` de ajuda contextual
 
 A navegação separa claramente os dois contextos: **Status** contém apenas saúde global, observabilidade e prontidão de integrações; **Queue** é a console de acompanhamento da migração, com atividade, fila durável de transferência, workers e auditorias profundas. A atualização automática configurável atua na tela Queue.
 
-Os parâmetros operacionais são persistidos no PostgreSQL. Dois containers reais ficam separados da API e inertes por padrão: o **worker de governança** assume discovery, restores Batch, polling, agendamento e auditorias; o **worker de transferência** assume somente cópia e retomada multipart. Ambos usam leases na mesma fila PostgreSQL e só operam após a habilitação explícita. O worker de simulação é uma ferramenta de teste e nunca chama AWS ou OCI.
+Os parâmetros operacionais são persistidos no PostgreSQL. Dois containers ficam separados da API: o **worker de governança** assume discovery, restores Batch, polling, agendamento e auditorias; o **worker de transferência** assume somente cópia e retomada multipart. Ambos usam leases na mesma fila PostgreSQL. Em `REAL`, só operam após habilitação explícita. Em `SIMULATION`, os mesmos workers usam exclusivamente os contratos HTTP do backend simulado; não existe mais um worker artificial que avança estados.
+
+### Execução local por Compose
+
+Os perfis são mutuamente exclusivos e expõem a console somente em
+`127.0.0.1:8080`:
+
+```bash
+docker compose --profile real up -d
+docker compose --profile simulation up -d
+```
+
+Não ative os dois perfis juntos. Em um diretório PostgreSQL novo, o init cria
+`migration_simulation` e o usuário dedicado usando o Secret
+`simulation_postgres_password`. Em um volume antigo, crie esse banco/usuário
+antes de iniciar o perfil, ou prefira o bootstrap da VM, que faz isso de forma
+idempotente. O ambiente de produção troca o modo por `raijin-mode`, depois de
+um drain comprovado da fila, e nunca executa os dois runtimes ao mesmo tempo.
 
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 
@@ -86,4 +103,4 @@ O procedimento final baixa uma release versionada do GitHub e verifica o checksu
 
 Na Oracle Linux, o bootstrap utiliza Podman nativo e registra `s3-oci-migration.service` no systemd. Os containers `s3-oci-postgres` e `s3-oci-app` usam volumes persistentes no boot volume. A API é publicada apenas em `127.0.0.1:8080`.
 
-O timer `s3-oci-backup-postgres.timer` executa diariamente às 02:15 UTC um `pg_dump` local e conserva 14 backups. Isso complementa, mas não substitui, a policy automática de backup do boot volume.
+O timer `s3-oci-backup-postgres.timer` executa diariamente às 02:15 UTC um `pg_dump` dos bancos real e simulado e conserva 35 dias por padrão. Esse prazo cobre a quarentena padrão de 30 dias do simulador. Ele pode ser ampliado com `RAIJIN_LOGICAL_BACKUP_RETENTION_DAYS` no serviço systemd, mas nunca reduzido abaixo de 30 dias. Isso complementa, mas não substitui, a policy automática de backup do boot volume.

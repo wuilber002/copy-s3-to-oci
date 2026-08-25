@@ -35,6 +35,12 @@ e, portanto, pode exigir reconciliação OCI e revisão das tarefas posteriores.
      --confirm-restore
    ```
 
+Para recuperar o ambiente simulado, use o arquivo
+`migration-simulation-YYYYMMDDTHHMMSSZ.dump` no mesmo comando. O utilitário
+identifica o banco de destino pelo nome do arquivo. Os dois bancos são
+copiados diariamente e a retenção padrão de 35 dias cobre toda a quarentena
+padrão de 30 dias.
+
 O comando exige confirmação explícita, aceita somente arquivos do diretório de
 backups, cria um backup adicional do estado atual antes de restaurar e aguarda
 `/healthz` voltar a responder. Se a API não retornar saudável, não reenvie
