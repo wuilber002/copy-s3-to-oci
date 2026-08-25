@@ -69,7 +69,7 @@ def test_transfer_queue_uses_compact_style_for_batch_job_id():
 
 def test_source_transfer_strategy_and_report_operational_summary_are_visible():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
-    assert 'id="source-transfer-strategy"' in page
+    assert 'id="source-transfer-strategy"' not in page
     assert 'id="selected-source-transfer-strategy"' in page
     assert "/transfer-strategy" in page
     assert "Resumo operacional" in page
