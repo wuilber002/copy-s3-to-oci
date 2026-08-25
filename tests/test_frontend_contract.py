@@ -313,3 +313,9 @@ def test_wave_report_explains_restore_failures_and_supports_evidence_recovery():
     assert "Ação recomendada" in page
     assert "retry-restore-evidence" in page
     assert "Esta ação não cria nem submete um novo restore" in page
+
+
+def test_source_modal_keeps_original_full_width_form_layout():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "#source-modal .modal-panel{width:min(1400px,100%)}" in page
+    assert 'id="source-form" class="source-form-layout"' in page
