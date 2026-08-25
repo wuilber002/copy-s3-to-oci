@@ -329,6 +329,20 @@ def test_buttons_use_content_width_and_standard_horizontal_spacing():
     assert 'id="source-edit-action"' in page
 
 
+def test_migration_tools_are_contextual_footer_modals_with_critical_ticker():
+    page = Path("app/static/index.html").read_text()
+    assert 'id="operational-statusbar" class="operational-statusbar"' in page
+    assert 'id="statusbar-migrations-actions" class="statusbar-actions hidden" data-footer-view="migrations"' in page
+    assert 'id="durable-queue-modal" class="modal hidden"' in page
+    assert 'id="operational-history-modal" class="modal hidden"' in page
+    assert '<section class="card"><h2>Fila durável</h2>' not in page
+    assert '<section class="card"><h2>Histórico operacional</h2>' not in page
+    assert "function syncStatusbarContext(view)" in page
+    assert "function updateOperationalMessages(operations,platform,observability)" in page
+    assert "setInterval(refreshOperationalMessages,30000)" in page
+    assert "operationalMessages.length" in page
+
+
 def test_wave_report_explains_restore_failures_and_supports_evidence_recovery():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "function renderWaveReportOverall" in page
