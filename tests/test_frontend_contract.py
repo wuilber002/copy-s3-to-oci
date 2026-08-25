@@ -247,6 +247,13 @@ def test_cost_estimation_has_a_global_operational_toggle():
     assert "button.textContent='💲'" not in page
 
 
+def test_running_tasks_are_not_rendered_as_alerts_but_stale_leases_are():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "tarefa(s) em execução" not in page
+    assert "tarefa(s) com lease expirado" in page
+    assert "api('/api/observability')" in page
+
+
 def test_cost_estimation_supports_public_aws_prices_and_per_connection_overrides():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="global-pricing-settings"' in page

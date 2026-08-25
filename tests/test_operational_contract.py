@@ -536,6 +536,15 @@ def test_connection_api_limits_are_durable_and_used_by_workers():
     assert 'getattr(connection, "restore_poll_requests_per_second"' in worker
 
 
+def test_long_restore_polling_heartbeats_its_lease_and_checkpoints_progress():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "def task_lease_heartbeat" in worker
+    assert "Task.worker_id == WORKER_ID" in worker
+    assert "progress_callback=persist_poll_progress" in worker
+    assert "RESTORE_POLL_HEAD_BATCH_SIZE = 1_000" in worker
+    assert "wave.last_availability_poll_objects" in worker
+
+
 def test_restore_completion_evidence_is_idempotent_and_request_metrics_are_durable():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     source = Path("app/main.py").read_text(encoding="utf-8")

@@ -16,8 +16,10 @@ import json
 import os
 import re
 import socket
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, unquote, urlparse
@@ -26,7 +28,7 @@ import boto3
 import oci
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows, source_key_in_scope, source_prefix_values,
@@ -168,6 +170,39 @@ def aws_clients(settings, region: str, source: Source):
 def worker_can_reclaim_lease(task_worker_id: str | None, lease_expires_at, now) -> bool:
     """Whether this single-VM worker may recover an interrupted task now."""
     return task_worker_id == WORKER_ID or not lease_expires_at or lease_expires_at < now
+
+
+@contextmanager
+def task_lease_heartbeat(task_id: int, lease_seconds: int):
+    """Renew a long-running task lease from an independent DB session.
+
+    AWS calls can legitimately outlive the default five-minute lease. The
+    heartbeat prevents another worker process from reclaiming the same durable
+    task while the original process is still polling or waiting on SDK retries.
+    """
+    stop = threading.Event()
+    interval = max(5, min(60, max(1, lease_seconds) // 3))
+
+    def renew() -> None:
+        while not stop.wait(interval):
+            try:
+                with SessionLocal() as heartbeat_session:
+                    heartbeat_session.execute(update(Task).where(
+                        Task.id == task_id,
+                        Task.state == TaskState.RUNNING,
+                        Task.worker_id == WORKER_ID,
+                    ).values(lease_expires_at=utcnow() + timedelta(seconds=lease_seconds)))
+                    heartbeat_session.commit()
+            except Exception as error:
+                print(f"task lease heartbeat failed for task {task_id}: {type(error).__name__}", flush=True)
+
+    thread = threading.Thread(target=renew, name=f"task-{task_id}-lease-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=max(1, min(5, interval)))
 
 
 def claim_task(session, lease_seconds: int, allowed_kinds: frozenset[str] | None = None) -> Task | None:
@@ -416,6 +451,7 @@ def remote_discover(session, source: Source, settings, job: DiscoveryJob | None 
     pending_token = continuation_token
     next_request_at = 0.0
     connection = source.aws_connection
+    bucket_name = source.s3_bucket
     request_interval = 1.0 / max(1, int(getattr(connection, "discovery_requests_per_second", 10) or 10))
 
     def checkpoint_batch() -> None:
@@ -516,7 +552,8 @@ def should_poll_restore_with_head(wave_archive_objects: int, source_objects: int
     return True
 
 
-def restored_pending_archives_from_head(s3, source: Source, archives: list[ObjectRecord]) -> tuple[dict[int, datetime | None], dict[str, float | int]]:
+def restored_pending_archives_from_head(s3, source: Source, archives: list[ObjectRecord],
+                                        progress_callback=None) -> tuple[dict[int, datetime | None], dict[str, float | int]]:
     """Return only wave objects observed as restored by bounded HeadObject calls.
 
     Each request is for one still-pending archive object belonging to this
@@ -530,19 +567,23 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
     connection = source.aws_connection
     requests_per_second = max(1, int(getattr(connection, "restore_poll_requests_per_second", RESTORE_POLL_HEAD_REQUESTS_PER_SECOND) or RESTORE_POLL_HEAD_REQUESTS_PER_SECOND))
     concurrency = max(1, int(getattr(connection, "restore_poll_concurrency", RESTORE_POLL_HEAD_CONCURRENCY) or RESTORE_POLL_HEAD_CONCURRENCY))
+    # Plain immutable values remain safe after a progress callback commits the
+    # SQLAlchemy session and expires ORM instances.
+    targets = [(obj.id, obj.object_key, obj.version_id) for obj in archives]
 
-    def check(obj: ObjectRecord) -> tuple[int, datetime | None] | None:
-        arguments = {"Bucket": source.s3_bucket, "Key": obj.object_key}
-        if obj.version_id:
-            arguments["VersionId"] = obj.version_id
+    def check(target: tuple[int, str, str | None]) -> tuple[int, datetime | None] | None:
+        object_id, object_key, version_id = target
+        arguments = {"Bucket": bucket_name, "Key": object_key}
+        if version_id:
+            arguments["VersionId"] = version_id
         response = s3.head_object(**arguments)
         if restored_from_head_response(response):
-            return obj.id, restore_expiry_from_head_response(response)
+            return object_id, restore_expiry_from_head_response(response)
         return None
 
     try:
-        for start in range(0, len(archives), RESTORE_POLL_HEAD_BATCH_SIZE):
-            batch = archives[start:start + RESTORE_POLL_HEAD_BATCH_SIZE]
+        for start in range(0, len(targets), RESTORE_POLL_HEAD_BATCH_SIZE):
+            batch = targets[start:start + RESTORE_POLL_HEAD_BATCH_SIZE]
             for second_start in range(0, len(batch), requests_per_second):
                 second_batch = batch[second_start:second_start + requests_per_second]
                 second_started_at = time.monotonic()
@@ -563,10 +604,13 @@ def restored_pending_archives_from_head(s3, source: Source, archives: list[Objec
                 # This is an explicit start-rate ceiling in addition to SDK
                 # retries and concurrency. It protects S3 and makes API cost
                 # and load predictable for large waves.
-                has_next = second_start + requests_per_second < len(batch) or start + len(batch) < len(archives)
+                has_next = second_start + requests_per_second < len(batch) or start + len(batch) < len(targets)
                 remaining = 1.0 - (time.monotonic() - second_started_at)
                 if has_next and remaining > 0:
                     time.sleep(remaining)
+            metrics["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
+            if progress_callback:
+                progress_callback(dict(metrics), dict(ready))
     except Exception as error:
         metrics["elapsed_seconds"] = round(time.monotonic() - started_at, 3)
         setattr(error, "raijin_restore_poll_metrics", metrics)
@@ -815,14 +859,49 @@ def poll_restore(session, task: Task, settings) -> None:
     # polling response needed to decide readiness. No inferred restore time is
     # stored: restored_at remains the Raijin observation timestamp only.
     poll_method = "HeadObject (pending wave objects)"
+    checkpointed = {"requests": 0, "throttle_retries": 0, "elapsed_seconds": 0.0}
+
+    def persist_poll_progress(metrics: dict[str, float | int], ready: dict[int, datetime | None]) -> None:
+        """Checkpoint a bounded polling slice without double-counting it."""
+        delta = {
+            "requests": int(metrics.get("requests", 0) or 0) - int(checkpointed["requests"]),
+            "throttle_retries": int(metrics.get("throttle_retries", 0) or 0) - int(checkpointed["throttle_retries"]),
+            "elapsed_seconds": float(metrics.get("elapsed_seconds", 0) or 0) - float(checkpointed["elapsed_seconds"]),
+        }
+        if any(value > 0 for value in delta.values()):
+            persist_restore_poll_metrics(wave, delta)
+        wave.last_availability_poll_objects = int(metrics.get("requests", 0) or 0)
+        wave.last_availability_poll_seconds = float(metrics.get("elapsed_seconds", 0) or 0)
+        if ready:
+            observed_at = utcnow()
+            for restored_object in session.scalars(select(ObjectRecord).where(
+                ObjectRecord.id.in_(list(ready)),
+                ObjectRecord.wave_id == wave.id,
+            )):
+                if restored_object.state in {
+                    ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING,
+                }:
+                    restored_object.state = ObjectState.RESTORED
+                    restored_object.restored_at = restored_object.restored_at or observed_at
+                    restored_object.restore_expires_at = ready.get(restored_object.id)
+        checkpointed.update(metrics)
+        session.commit()
+
     try:
-        ready_expiries, poll_metrics = restored_pending_archives_from_head(s3, source, pending_archives)
+        with task_lease_heartbeat(task.id, settings.task_lease_seconds):
+            ready_expiries, poll_metrics = restored_pending_archives_from_head(
+                s3, source, pending_archives, progress_callback=persist_poll_progress
+            )
+        persist_poll_progress(poll_metrics, ready_expiries)
     except Exception as error:
-        persist_restore_poll_metrics(wave, getattr(error, "raijin_restore_poll_metrics", {}))
+        persist_poll_progress(getattr(error, "raijin_restore_poll_metrics", {}), {})
         wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
         session.commit()
         raise
-    persist_restore_poll_metrics(wave, poll_metrics)
+    # Progress commits expire ORM instances. Refresh the wave inventory in one
+    # query before final reconciliation instead of triggering one lazy SELECT
+    # per object on large waves.
+    objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
     availability_observed_at = utcnow()
     for obj in objects:
         if obj.storage_class not in ARCHIVE_CLASSES or obj.id in ready_expiries:
