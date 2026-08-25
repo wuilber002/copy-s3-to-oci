@@ -30,7 +30,7 @@ from sqlalchemy import func, or_, select
 
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows, source_key_in_scope, source_prefix_values,
-    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, runtime_settings, utcnow,
+    DynamicPipelineRun, Wave, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -278,7 +278,7 @@ def fail_permanently(session, task: Task, error: str) -> None:
             .where(RestoreAttempt.wave_id == wave.id)
             .order_by(RestoreAttempt.id.desc())
         )
-        if attempt and attempt.job_id:
+        if attempt and attempt.job_id and not attempt.failure_summary:
             attempt.failure_summary = (
                 "Raijin polling/report processing failed after AWS accepted "
                 f"Batch job {attempt.job_id}: {task.error}"
@@ -663,6 +663,10 @@ def import_completion_report(session, s3, operation: dict[str, str], attempt: Re
         for row in csv.reader(io.StringIO(report["Body"].read().decode("utf-8", "replace"))):
             if len(row) < 7:
                 continue
+            # AWS currently emits the actionable values after TaskStatus as
+            # HTTP status then service error code (for example
+            # ``failed,409,RestoreAlreadyInProgress``). Preserve the observed
+            # wire format: it is the evidence operators need in the report.
             _, key, version_id, task_status, http_status, error_code, error_message = (row + [""] * 7)[:7]
             obj = objects_by_key.get((unquote(key), version_id or "")) or objects_by_key.get((key, version_id or ""))
             if not obj:
@@ -754,7 +758,7 @@ def poll_restore(session, task: Task, settings) -> None:
         # do not call DescribeJob or re-list/re-read its report on every
         # availability poll.  That was the source of repeated events and
         # avoidable charged control-bucket requests in the first archive test.
-        if attempt.completed_at is None:
+        if attempt.completed_at is None or attempt.report_manifest_key is None:
             attempt.batch_describe_requests = int(attempt.batch_describe_requests or 0) + 1
             job = s3control.describe_job(AccountId=account_id, JobId=wave.batch_job_id)["Job"]
             attempt.job_status = wave.batch_job_status = job.get("Status")
@@ -770,14 +774,6 @@ def poll_restore(session, task: Task, settings) -> None:
             progress = job.get("ProgressSummary", {}) or {}
             attempt.succeeded_objects = int(progress.get("NumberOfTasksSucceeded") or 0)
             attempt.failed_objects = int(progress.get("NumberOfTasksFailed") or 0)
-            total = int(progress.get("TotalNumberOfTasks") or 0)
-            if total != attempt.expected_objects or attempt.failed_objects or attempt.succeeded_objects != attempt.expected_objects:
-                message = f"Batch job completed with {attempt.succeeded_objects}/{attempt.expected_objects} succeeded and {attempt.failed_objects} failed"
-                if attempt.failed_objects == attempt.expected_objects:
-                    for result in session.scalars(select(RestoreObjectResult).where(RestoreObjectResult.attempt_id == attempt.id)):
-                        result.task_status, result.error_message = "FAILED", "Batch job completed with no successful restore requests; completion report unavailable"
-                fail_restore_attempt(session, task, wave, attempt, message)
-                return
             objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
             try:
                 report_available, report_metrics = import_completion_report(session, s3, operation, attempt, objects)
@@ -790,18 +786,26 @@ def poll_restore(session, task: Task, settings) -> None:
                 wave.status = "RESTORE_REQUESTED"
                 wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
                 session.commit()
-                retry(session, task, "Batch job accepted all objects; waiting for completion report evidence", 60)
+                retry(session, task, "Batch job is complete; waiting for per-object completion report evidence", 60)
                 return
-            failed_results = session.scalar(select(func.count(RestoreObjectResult.id)).where(RestoreObjectResult.attempt_id == attempt.id, RestoreObjectResult.task_status != "SUCCEEDED")) or 0
-            if failed_results:
-                fail_restore_attempt(session, task, wave, attempt, f"Completion report contains {failed_results} failed or unknown restore request(s)")
+            diagnosis = restore_result_diagnostics(session, attempt.id)
+            if diagnosis["action_required"]:
+                reason = diagnosis["reasons"][0] if diagnosis["reasons"] else {"code": "UNKNOWN", "count": diagnosis["unexpected_failed"]}
+                message = (f"S3 Batch restore requires operator action: {reason['count']} object(s) reported "
+                           f"{reason['code']}; {diagnosis['effective_accepted']}/{attempt.expected_objects} "
+                           "requests are accepted or already in progress")
+                fail_restore_attempt(session, task, wave, attempt, message)
                 return
-            attempt.completed_at = utcnow()
+            attempt.completed_at, attempt.failure_summary = utcnow(), None
             for obj in objects:
                 if obj.storage_class in ARCHIVE_CLASSES and obj.state in {ObjectState.RESTORE_REQUESTED, ObjectState.RESTORING}:
                     obj.state = ObjectState.RESTORE_REQUEST_ACCEPTED
             wave.status = "RESTORE_REQUEST_ACCEPTED"
-            event(session, "RESTORE_REQUEST_ACCEPTED", f"Batch job {wave.batch_job_id} accepted all {attempt.expected_objects} archive restore request(s) with per-object evidence", source_id=source.id, wave_id=wave.id)
+            event(session, "RESTORE_REQUEST_ACCEPTED",
+                  f"Batch job {wave.batch_job_id}: {diagnosis['raw_succeeded']} succeeded and "
+                  f"{diagnosis['accepted_equivalent']} already in progress; all {attempt.expected_objects} "
+                  "archive objects accepted with per-object evidence",
+                  source_id=source.id, wave_id=wave.id)
             session.commit()
     objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id)))
     pending_archives = [obj for obj in objects if obj.storage_class in ARCHIVE_CLASSES and obj.state in {

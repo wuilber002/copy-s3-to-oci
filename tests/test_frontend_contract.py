@@ -303,3 +303,13 @@ def test_wave_creation_uses_one_shared_action_for_every_method():
     assert "<h3>Onda manual</h3>" not in page
     assert "<h3>Ondas por prefixo S3</h3>" not in page
     assert "<h3>Criação dinâmica</h3>" not in page
+
+
+def test_wave_report_explains_restore_failures_and_supports_evidence_recovery():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "function renderRestoreDiagnosis" in page
+    assert "Diagnóstico do restore" in page
+    assert "Código AWS" in page
+    assert "Ação recomendada" in page
+    assert "retry-restore-evidence" in page
+    assert "Esta ação não cria nem submete um novo restore" in page

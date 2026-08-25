@@ -439,6 +439,62 @@ class RestoreObjectResult(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+# AWS records RestoreAlreadyInProgress as a failed S3 Batch task even though
+# the desired operational state already exists: a restore request is active
+# for that object. Preserve the raw AWS result, but treat this code as
+# accepted-equivalent when deciding whether availability polling may proceed.
+RESTORE_ACCEPTED_EQUIVALENT_ERROR_CODES = frozenset({"RestoreAlreadyInProgress"})
+
+
+def restore_result_diagnostics(session: Session, attempt_id: int) -> dict:
+    """Aggregate immutable per-object Batch evidence into an operator diagnosis."""
+    rows = session.execute(
+        select(RestoreObjectResult, ObjectRecord.object_key)
+        .join(ObjectRecord, ObjectRecord.id == RestoreObjectResult.object_id)
+        .where(RestoreObjectResult.attempt_id == attempt_id)
+        .order_by(RestoreObjectResult.id)
+    ).all()
+    raw_succeeded = accepted_equivalent = unexpected_failed = pending = 0
+    grouped: dict[tuple[str, int | None, str], dict] = {}
+    for result, object_key in rows:
+        status = (result.task_status or "PENDING").upper()
+        code = result.error_code or ("PENDING_EVIDENCE" if status == "PENDING" else "UNKNOWN")
+        if status == "SUCCEEDED":
+            raw_succeeded += 1
+            continue
+        if status == "PENDING":
+            pending += 1
+        elif code in RESTORE_ACCEPTED_EQUIVALENT_ERROR_CODES:
+            accepted_equivalent += 1
+        else:
+            unexpected_failed += 1
+        message = (result.error_message or "No detail returned by AWS").split(" (Service:", 1)[0][:500]
+        key = (code, result.http_status, message)
+        reason = grouped.setdefault(key, {"code": code, "http_status": result.http_status,
+                                          "message": message, "count": 0, "sample_keys": []})
+        reason["count"] += 1
+        if len(reason["sample_keys"]) < 3:
+            reason["sample_keys"].append(object_key)
+    reasons = sorted(grouped.values(), key=lambda item: (-item["count"], item["code"]))
+    effective_accepted = raw_succeeded + accepted_equivalent
+    action_required = bool(unexpected_failed or pending)
+    if action_required:
+        leading = reasons[0] if reasons else {"code": "UNKNOWN", "count": unexpected_failed + pending}
+        summary = f"{leading['count']} object(s) reported {leading['code']}"
+        recommendation = "Review the AWS reason below, correct the cause, then reprocess only this wave."
+    elif accepted_equivalent:
+        summary = (f"{accepted_equivalent} object(s) were already being restored; AWS returned "
+                   "RestoreAlreadyInProgress and no duplicate restore is required")
+        recommendation = "Continue availability polling; do not submit another restore job."
+    else:
+        summary = "All object restore requests were accepted by AWS"
+        recommendation = "Continue availability polling."
+    return {"raw_succeeded": raw_succeeded, "accepted_equivalent": accepted_equivalent,
+            "effective_accepted": effective_accepted, "unexpected_failed": unexpected_failed,
+            "pending_evidence": pending, "action_required": action_required,
+            "summary": summary, "recommended_action": recommendation, "reasons": reasons}
+
+
 class Task(Base):
     __tablename__ = "tasks"
 
@@ -3976,6 +4032,31 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
     transfer_elapsed_seconds = max(0, int(((transfer_completed_at or now) - transfer_started_at).total_seconds())) if transfer_started_at else None
     failed_tasks = sum(1 for task in tasks if task.state == TaskState.FAILED)
     timing = restore_timing(session, wave_id)
+    attempt_diagnostics = {
+        attempt.id: restore_result_diagnostics(session, attempt.id) if attempt.report_manifest_key else None
+        for attempt in attempts
+    }
+    latest_attempt = attempts[0] if attempts else None
+    restore_diagnosis = attempt_diagnostics.get(latest_attempt.id) if latest_attempt else None
+    if latest_attempt and restore_diagnosis is None and latest_attempt.failure_summary:
+        restore_diagnosis = {
+            "action_required": True,
+            "summary": latest_attempt.failure_summary,
+            "recommended_action": "Import the AWS completion report before deciding whether a new restore submission is required.",
+            "reasons": [],
+            "raw_succeeded": int(latest_attempt.succeeded_objects or 0),
+            "accepted_equivalent": 0,
+            "effective_accepted": int(latest_attempt.succeeded_objects or 0),
+            "unexpected_failed": int(latest_attempt.failed_objects or 0),
+            "pending_evidence": 0,
+        }
+    if restore_diagnosis is not None:
+        restore_diagnosis["can_retry_evidence"] = bool(
+            wave.batch_job_id and latest_attempt and not latest_attempt.report_manifest_key
+            and not session.scalar(select(Task.id).where(
+                Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])
+            ))
+        )
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
             "summary": {"transfer_elapsed_seconds": transfer_elapsed_seconds,
                         "transfer_started_at": transfer_started_at, "transfer_completed_at": transfer_completed_at,
@@ -3983,6 +4064,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                         "failed_objects": int(failed_objects or 0), "failed_tasks": failed_tasks,
                         "failures_or_errors": int(failed_objects or 0) + failed_tasks},
             "batch": {"job_id": wave.batch_job_id, "status": wave.batch_job_status, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
+            "restore_diagnosis": restore_diagnosis,
             "restore_attempts": [{"id": attempt.id, "job_id": attempt.job_id, "region": attempt.aws_region, "status": attempt.job_status,
                                   "expected": attempt.expected_objects, "succeeded": attempt.succeeded_objects, "failed": attempt.failed_objects,
                                   "manifest_key": attempt.manifest_key, "report_manifest_key": attempt.report_manifest_key,
@@ -3991,6 +4073,7 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                                   "request_metrics": {"describe_requests": int(attempt.batch_describe_requests or 0),
                                                       "completion_report_list_requests": int(attempt.completion_report_list_requests or 0),
                                                       "completion_report_get_requests": int(attempt.completion_report_get_requests or 0)},
+                                  "diagnosis": attempt_diagnostics.get(attempt.id),
                                   "failure_summary": attempt.failure_summary,
                                   "created_at": attempt.created_at, "completed_at": attempt.completed_at}
                                  for attempt in attempts],
@@ -4150,6 +4233,36 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
     record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}' by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status, "message": "Restore task queued"}
+
+
+@app.post("/api/waves/{wave_id}/retry-restore-evidence")
+def retry_restore_evidence(wave_id: int, session: Session = Depends(get_session)) -> dict:
+    """Re-read evidence for an accepted Batch job without submitting a new paid restore."""
+    wave = wave_or_404(session, wave_id)
+    attempt = session.scalar(
+        select(RestoreAttempt).where(RestoreAttempt.wave_id == wave.id).order_by(RestoreAttempt.id.desc())
+    )
+    if not wave.batch_job_id or not attempt or attempt.job_id != wave.batch_job_id:
+        raise HTTPException(status_code=409, detail="No current AWS Batch restore job is available for evidence recovery")
+    queued = session.scalar(select(Task.id).where(
+        Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])
+    ))
+    if queued:
+        raise HTTPException(status_code=409, detail="This wave already has a queued or running task")
+    if attempt.report_manifest_key:
+        diagnosis = restore_result_diagnostics(session, attempt.id)
+        if diagnosis["action_required"]:
+            raise HTTPException(status_code=409, detail=diagnosis["recommended_action"])
+    wave.status = "RESTORE_REQUESTED"
+    session.add(Task(wave_id=wave.id, kind="POLL_RESTORE"))
+    record_event(
+        session, "RESTORE_EVIDENCE_RECOVERY_QUEUED",
+        f"AWS completion evidence recovery queued for existing Batch job {wave.batch_job_id}; no new restore was submitted",
+        source_id=wave.source_id, wave_id=wave.id,
+    )
+    session.commit()
+    return {"wave_id": wave.id, "status": wave.status,
+            "message": "Completion evidence recovery queued; no new restore job was submitted"}
 
 
 @app.get("/api/tasks")

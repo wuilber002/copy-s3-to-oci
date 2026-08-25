@@ -15,7 +15,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, list_sources, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, list_sources, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -197,6 +197,60 @@ def test_deleting_an_unexecuted_source_removes_all_derived_records_in_order():
         assert deleted["objects"] == 1
         assert session.scalar(select(Source.id).where(Source.id == source.id)) is None
         assert session.scalar(select(DiscoveryJob.id).where(DiscoveryJob.source_id == source.id)) is None
+
+
+def test_restore_diagnostics_distinguish_already_in_progress_from_real_failures():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(id=201, name="diagnosis", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        wave = Wave(id=202, source_id=source.id, name="wave", max_bytes=3, restore_days=1, restore_tier="BULK")
+        session.add_all([source, wave]); session.flush()
+        objects = [ObjectRecord(id=203 + index, source_id=source.id, wave_id=wave.id,
+                                object_key=f"key-{index}", size_bytes=1) for index in range(3)]
+        session.add_all(objects); session.flush()
+        attempt = RestoreAttempt(id=206, wave_id=wave.id, aws_region="us-east-1", expected_objects=3)
+        session.add(attempt); session.flush()
+        session.add_all([
+            RestoreObjectResult(id=207, attempt_id=attempt.id, object_id=objects[0].id, task_status="SUCCEEDED"),
+            RestoreObjectResult(id=208, attempt_id=attempt.id, object_id=objects[1].id, task_status="FAILED",
+                                http_status=409, error_code="RestoreAlreadyInProgress",
+                                error_message="Object restore is already in progress"),
+            RestoreObjectResult(id=209, attempt_id=attempt.id, object_id=objects[2].id, task_status="FAILED",
+                                http_status=403, error_code="AccessDenied", error_message="Access denied"),
+        ])
+        session.commit()
+        diagnosis = restore_result_diagnostics(session, attempt.id)
+        assert diagnosis["raw_succeeded"] == 1
+        assert diagnosis["accepted_equivalent"] == 1
+        assert diagnosis["effective_accepted"] == 2
+        assert diagnosis["unexpected_failed"] == 1
+        assert diagnosis["action_required"] is True
+        assert diagnosis["reasons"][0]["code"] in {"AccessDenied", "RestoreAlreadyInProgress"}
+        access_denied = next(reason for reason in diagnosis["reasons"] if reason["code"] == "AccessDenied")
+        assert access_denied["sample_keys"] == ["key-2"]
+
+
+def test_restore_diagnostics_accept_an_already_running_restore_without_resubmission():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(id=211, name="overlap", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        wave = Wave(id=212, source_id=source.id, name="wave", max_bytes=1, restore_days=1, restore_tier="BULK")
+        obj = ObjectRecord(id=213, source_id=source.id, wave_id=wave.id, object_key="shared/key", size_bytes=1)
+        attempt = RestoreAttempt(id=214, wave_id=wave.id, aws_region="us-east-1", expected_objects=1)
+        session.add_all([source, wave, obj, attempt]); session.flush()
+        session.add(RestoreObjectResult(id=215, attempt_id=attempt.id, object_id=obj.id, task_status="FAILED",
+                                        http_status=409, error_code="RestoreAlreadyInProgress",
+                                        error_message="Object restore is already in progress"))
+        session.commit()
+        diagnosis = restore_result_diagnostics(session, attempt.id)
+        assert diagnosis["effective_accepted"] == 1
+        assert diagnosis["unexpected_failed"] == 0
+        assert diagnosis["action_required"] is False
+        assert "do not submit another restore job" in diagnosis["recommended_action"]
 
 
 def test_frontend_marks_rediscovery_as_a_controlled_operation():
@@ -467,10 +521,14 @@ def test_restore_completion_evidence_is_idempotent_and_request_metrics_are_durab
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     source = Path("app/main.py").read_text(encoding="utf-8")
     poll = worker[worker.index("def poll_restore"):worker.index("\n\nDIRECT_SHA_LIMIT")]
-    assert "if attempt.completed_at is None:" in poll
+    assert "if attempt.completed_at is None or attempt.report_manifest_key is None:" in poll
+    assert "restore_result_diagnostics(session, attempt.id)" in poll
+    assert "RestoreAlreadyInProgress" in source
     assert "attempt.batch_describe_requests" in poll
     assert "attempt.completion_report_list_requests" in poll
     assert "completion_report_get_requests" in source
+    assert "attempt and attempt.job_id and not attempt.failure_summary" in worker
+    assert "/api/waves/{wave_id}/retry-restore-evidence" in source
 
 
 def test_aws_error_summary_exposes_only_status_and_code():
