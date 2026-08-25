@@ -185,25 +185,9 @@ systemctl daemon-reload
 systemctl enable --now s3-oci-platform-status.timer
 /usr/local/sbin/s3-oci-write-platform-status
 
-install -m 0750 "$install_root/scripts/simulated-worker.py" /usr/local/sbin/s3-oci-simulated-worker
-cat >/etc/systemd/system/s3-oci-simulated-worker.service <<'EOF'
-[Unit]
-Description=S3 to OCI migration simulated worker
-After=s3-oci-migration.service
-Requires=s3-oci-migration.service
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /usr/local/sbin/s3-oci-simulated-worker
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# Remove the legacy task-advancing simulation worker. The replacement backend
+# simulator is intentionally not installed until the exclusive Simulation mode
+# and its isolated database are available.
+systemctl disable --now s3-oci-simulated-worker.service 2>/dev/null || true
+rm -f /etc/systemd/system/s3-oci-simulated-worker.service /usr/local/sbin/s3-oci-simulated-worker
 systemctl daemon-reload
-# The simulated worker requires this service. Do not synchronously wait for it
-# here or systemd would wait for this oneshot unit to finish before it can mark
-# the dependency active. The non-blocking start runs after this unit is active.
-systemctl enable s3-oci-simulated-worker.service
-systemctl start --no-block s3-oci-simulated-worker.service

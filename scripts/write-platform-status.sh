@@ -52,7 +52,7 @@ memory_used_kb=$((memory_total_kb - memory_available_kb))
 memory_percent=$(awk -v total="$memory_total_kb" -v used="$memory_used_kb" 'BEGIN { printf "%.2f", used*100/total }')
 
 temporary_file=$(mktemp "$runtime_root/status.XXXXXX")
-printf '{"available":true,"generated_at":"%s","resources":{"cpu_percent":%s,"memory_total_bytes":%s,"memory_used_bytes":%s,"memory_percent":%s},"services":{"migration_systemd":"%s","postgres_container":"%s","app_container":"%s","governance_worker":"%s","transfer_worker":"%s","postgres_backup_timer":"%s","platform_status_timer":"%s","simulated_worker":"%s"},"last_postgres_backup":%s}\n' \
+printf '{"available":true,"generated_at":"%s","resources":{"cpu_percent":%s,"memory_total_bytes":%s,"memory_used_bytes":%s,"memory_percent":%s},"services":{"migration_systemd":"%s","postgres_container":"%s","app_container":"%s","governance_worker":"%s","transfer_worker":"%s","postgres_backup_timer":"%s","platform_status_timer":"%s"},"last_postgres_backup":%s}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   "$cpu_percent" \
   "$((memory_total_kb * 1024))" \
@@ -65,7 +65,6 @@ printf '{"available":true,"generated_at":"%s","resources":{"cpu_percent":%s,"mem
   "$(container_state s3-oci-transfer-worker)" \
   "$(unit_state s3-oci-backup-postgres.timer)" \
   "$(unit_state s3-oci-platform-status.timer)" \
-  "$(unit_state s3-oci-simulated-worker.service)" \
   "$backup_json" >"$temporary_file"
 chmod 644 "$temporary_file"
 mv "$temporary_file" "$status_file"

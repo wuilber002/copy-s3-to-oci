@@ -6,7 +6,7 @@ Este roteiro valida multipart, retomada e reconciliação sem usar dados de prod
 
 - Crie um prefixo exclusivo, por exemplo `raijin-validation/<data>/`, no bucket S3 de teste autorizado.
 - Selecione um bucket OCI de teste ou o bucket de destino autorizado para o mesmo prefixo.
-- Mantenha o worker real habilitado e o worker simulado desabilitado.
+- Confirme que o RAIJIN está no modo operacional `REAL` antes do teste.
 - Use um objeto de pelo menos três vezes o tamanho configurado em **Multipart upload part (MiB)**; com 64 MiB, use 192 MiB ou maior.
 - Registre o nome da origem, chave e SHA-256 local do arquivo antes do upload para S3.
 
