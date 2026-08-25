@@ -471,6 +471,8 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert '#flight-board-modal .modal-panel{width:min(1500px,calc(100vw - 2rem));overflow-x:hidden}' in frontend
     assert '.flight-board-chart{overflow:hidden;max-height:none}' in frontend
     assert '.flight-board-track{position:relative;height:30px;border-radius:4px;background:#0b1220;min-width:0}' in frontend
+    assert '.flight-board-tick.last{left:auto!important;right:0;transform:none' in frontend
+    assert '.flight-board-tick.last .flight-board-tick-label{left:auto;right:.25rem}' in frontend
     assert '@app.get("/api/sources/{source_id}/pipeline-history")' in source
     assert 'id="pipeline-history-card"' in frontend
     assert 'function loadPipelineHistory()' in frontend
