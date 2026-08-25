@@ -107,6 +107,12 @@ def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real
     assert "state IN ('READY','RUNNING')" in switch
 
 
+def test_mode_switch_audits_each_database_with_its_own_role():
+    mode_switch = Path("scripts/raijin-mode.sh").read_text(encoding="utf-8")
+    assert "database=migration_simulation" in mode_switch
+    assert "database_user=migration_simulation" in mode_switch
+
+
 def test_terraform_creates_distinct_real_and_simulation_database_secrets():
     terraform = Path("terraform/orm/main.tf").read_text(encoding="utf-8")
     outputs = Path("terraform/orm/outputs.tf").read_text(encoding="utf-8")

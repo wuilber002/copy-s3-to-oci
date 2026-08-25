@@ -15,7 +15,10 @@ target="$(printf '%s' "$requested" | tr '[:lower:]' '[:upper:]')"
 
 database=migration
 database_user=migration
-[[ "$current" == SIMULATION ]] && database=migration_simulation
+if [[ "$current" == SIMULATION ]]; then
+  database=migration_simulation
+  database_user=migration_simulation
+fi
 active="$(podman exec s3-oci-postgres psql -U "$database_user" -d "$database" -tAc \
   "SELECT COALESCE((SELECT count(*) FROM tasks WHERE state IN ('READY','RUNNING')),0) + COALESCE((SELECT count(*) FROM discovery_jobs WHERE state IN ('READY','RUNNING')),0)" 2>/dev/null | tr -d '[:space:]')"
 if [[ ! "$active" =~ ^[0-9]+$ ]]; then
