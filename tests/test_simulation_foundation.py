@@ -101,6 +101,7 @@ def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real
     assert "s3-oci-postgres" in bootstrap[bootstrap.index("cleanup_failed_bootstrap"):bootstrap.index("trap cleanup_failed_bootstrap EXIT")]
     assert "bootstrap_complete=true" in bootstrap
     assert "CREATE ROLE migration_simulation" in bootstrap
+    assert "E' \\n\\r\\t'" in bootstrap
     assert "createdb -U migration -O migration_simulation migration_simulation" in bootstrap
     assert "printf 'REAL\\n'" in bootstrap
     assert runtime.count("RAIJIN_OPERATION_MODE=REAL") == 2

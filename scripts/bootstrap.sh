@@ -108,7 +108,10 @@ fi
 podman exec -i s3-oci-postgres psql -U migration -d migration -v ON_ERROR_STOP=1 <<'SQL'
 DO $block$
 DECLARE
-  simulation_password text := trim(pg_read_file('/run/secrets/simulation_postgres_password'));
+  simulation_password text := btrim(
+    pg_read_file('/run/secrets/simulation_postgres_password'),
+    E' \n\r\t'
+  );
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'migration_simulation') THEN
     EXECUTE format('CREATE ROLE migration_simulation LOGIN PASSWORD %L', simulation_password);
