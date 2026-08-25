@@ -206,6 +206,19 @@ def test_source_prefixes_use_a_controlled_add_remove_list():
     assert "max-height:7.4rem" in page
 
 
+def test_source_form_opens_in_a_modal_with_a_fixed_prefix_workspace():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="create-source-action"' in page
+    assert 'onclick="openNewSourceModal()">Criar nova origem</button>' in page
+    assert 'id="source-modal" class="modal hidden"' in page
+    assert 'id="source-form" class="source-form-layout"' in page
+    assert "function openNewSourceModal()" in page
+    assert "openModal('#source-modal')" in page
+    assert "function closeSourceModal()" in page
+    assert "#source-modal .prefix-list{align-content:start;height:10rem;max-height:10rem;overflow-y:auto" in page
+    assert "closeSourceModal();await loadSources()" in page
+
+
 def test_source_selector_uses_name_only_and_context_tags_are_in_the_heading():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="source-context-tags"' in page
