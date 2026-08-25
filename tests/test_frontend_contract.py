@@ -190,7 +190,7 @@ def test_source_prefixes_use_a_controlled_add_remove_list():
     assert "function addSourcePrefix" in page
     assert "function removeSourcePrefix" in page
     assert "sourcePrefixScopesOverlap" in page
-    assert "max-height:11.3rem" in page
+    assert "max-height:7.4rem" in page
 
 
 def test_source_selector_uses_name_only_and_context_tags_are_in_the_heading():
