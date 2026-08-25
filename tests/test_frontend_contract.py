@@ -322,7 +322,9 @@ def test_buttons_use_content_width_and_standard_horizontal_spacing():
     assert "width:max-content!important" in page
     assert "padding-left:2em!important" in page
     assert "padding-right:2em!important" in page
-    assert 'id="waves-queue-all" class="secondary" onclick="queueAllPlannedWaves()" disabled' in page
+    assert "button.hidden{display:none!important}" in page
+    assert 'id="waves-queue-all" class="secondary hidden" onclick="queueAllPlannedWaves()" disabled' in page
+    assert "queueAll.classList.toggle('hidden',!hasSource)" in page
     assert 'id="source-validate-destination"' in page
     assert 'id="source-edit-action"' in page
 
