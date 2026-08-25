@@ -22,7 +22,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, list_sources, normalize_source_prefixes, observability, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, list_sources, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -89,9 +89,36 @@ def test_source_selector_exposes_one_operational_status_per_source():
 
 
 def test_global_actionable_failure_banner_ignores_archived_sources():
-    app_source = Path("app/main.py").read_text(encoding="utf-8")
-    assert "Source.archived_at.is_(None)" in app_source
-    assert "Task.id == latest_task_id" in app_source
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        archived = Source(
+            name="archived-failure", s3_bucket="source", aws_region="us-east-1",
+            destination_bucket="destination", archived_at=datetime.now(timezone.utc),
+        )
+        active = Source(
+            name="active-success", s3_bucket="source-2", aws_region="us-east-1",
+            destination_bucket="destination",
+        )
+        session.add_all([archived, active])
+        session.flush()
+        archived_wave = Wave(
+            source_id=archived.id, name="failed", max_bytes=1,
+            restore_days=1, restore_tier="BULK", status="PAUSED",
+        )
+        active_wave = Wave(
+            source_id=active.id, name="successful", max_bytes=1,
+            restore_days=1, restore_tier="BULK", status="COMPLETED",
+        )
+        session.add_all([archived_wave, active_wave])
+        session.flush()
+        session.add_all([
+            Task(wave_id=archived_wave.id, kind="TRANSFER_WAVE", state=TaskState.FAILED),
+            Task(wave_id=active_wave.id, kind="TRANSFER_WAVE", state=TaskState.SUCCEEDED),
+        ])
+        session.commit()
+        assert operations_overview(session)["tasks"]["ACTIONABLE_FAILED"] == 0
 
 
 def test_active_sources_cannot_silently_share_an_s3_prefix_scope():

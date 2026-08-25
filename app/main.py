@@ -2350,7 +2350,13 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     # instead represent the latest task of each wave: once an operator starts
     # a newer task (for example, Reprocess), the old failure is historical and
     # no longer requires action unless the newest task fails as well.
-    latest_task_id = select(func.max(Task.id)).where(Task.wave_id == Wave.id).correlate(Wave).scalar_subquery()
+    latest_task = aliased(Task)
+    latest_task_id = (
+        select(func.max(latest_task.id))
+        .where(latest_task.wave_id == Wave.id)
+        .correlate(Wave)
+        .scalar_subquery()
+    )
     actionable_failed_tasks = session.scalar(
         select(func.count(Task.id)).join(Wave).join(Source, Source.id == Wave.source_id).where(
             Task.state == TaskState.FAILED,
