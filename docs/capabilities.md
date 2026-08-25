@@ -98,6 +98,10 @@ Alertas operacionais aparecem no topo para chamar a atenção imediata e podem
 ser dispensados com `×` sem bloquear a console. A mesma condição permanece na
 fila rotativa do rodapé enquanto estiver verdadeira. Um alerta dispensado só
 volta ao topo se a condição for resolvida e ocorrer novamente.
+O contador global de falhas considera somente a tarefa mais recente de cada
+wave pertencente a uma source ativa. Falhas de sources arquivadas permanecem
+no histórico auditável, mas deixam de representar uma pendência operacional
+atual.
 
 Na interface web, os controles que iniciam ou alteram processos de maior
 impacto exibem o ícone circular `i` dentro do próprio controle. O balão de

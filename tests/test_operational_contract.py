@@ -88,6 +88,12 @@ def test_source_selector_exposes_one_operational_status_per_source():
         assert statuses == {"discovered": "DISCOVERED", "queued": "QUEUED", "transferring": "TRANSFERRING", "restoring": "RESTORING"}
 
 
+def test_global_actionable_failure_banner_ignores_archived_sources():
+    app_source = Path("app/main.py").read_text(encoding="utf-8")
+    assert "Source.archived_at.is_(None)" in app_source
+    assert "Task.id == latest_task_id" in app_source
+
+
 def test_active_sources_cannot_silently_share_an_s3_prefix_scope():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

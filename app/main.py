@@ -2352,9 +2352,10 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     # no longer requires action unless the newest task fails as well.
     latest_task_id = select(func.max(Task.id)).where(Task.wave_id == Wave.id).correlate(Wave).scalar_subquery()
     actionable_failed_tasks = session.scalar(
-        select(func.count(Task.id)).join(Wave).where(
+        select(func.count(Task.id)).join(Wave).join(Source, Source.id == Wave.source_id).where(
             Task.state == TaskState.FAILED,
             Task.id == latest_task_id,
+            Source.archived_at.is_(None),
         )
     ) or 0
     task_counts["ACTIONABLE_FAILED"] = int(actionable_failed_tasks)
