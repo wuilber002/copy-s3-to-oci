@@ -38,6 +38,16 @@ locals {
   vault_key_id                    = var.create_vault_key ? oci_kms_key.migration[0].id : trimspace(var.existing_vault_key_ocid)
   initial_secret_compartment_ocid = trimspace(var.initial_aws_connection_secret_compartment_ocid) != "" ? var.initial_aws_connection_secret_compartment_ocid : var.secrets_compartment_ocid
 
+  # Keep the two historical credential Secrets under Terraform management
+  # until their deletion is performed as a separate, explicitly approved
+  # operation. RAIJIN no longer reads them; AWS Connections use customer JSON
+  # Secrets instead. Keeping their original resource address prevents an
+  # unrelated platform upgrade from deleting credential material.
+  legacy_secret_placeholders = {
+    aws_access_key_id     = "RETIRED: retained only to prevent implicit deletion during upgrades."
+    aws_secret_access_key = "RETIRED: retained only to prevent implicit deletion during upgrades."
+  }
+
   effective_backup_policy_id = var.create_boot_volume_backup_policy ? oci_core_volume_backup_policy.migration[0].id : trimspace(var.backup_policy_id)
 
 }
@@ -81,6 +91,28 @@ resource "oci_kms_key" "migration" {
   key_shape {
     algorithm = "AES"
     length    = 32
+  }
+}
+
+resource "oci_vault_secret" "aws" {
+  for_each = var.create_platform_secrets ? local.legacy_secret_placeholders : {}
+
+  compartment_id = var.secrets_compartment_ocid
+  secret_name    = "${var.resource_name_prefix}-${replace(each.key, "_", "-")}"
+  vault_id       = local.vault_id
+  key_id         = local.vault_key_id
+  description    = "Retired legacy credential Secret. RAIJIN uses AWS Connection JSON Secrets; retained pending separately approved cleanup."
+
+  secret_content {
+    content_type = "BASE64"
+    content      = base64encode(each.value)
+    name         = "retained-legacy-secret"
+    stage        = "CURRENT"
+  }
+
+  lifecycle {
+    ignore_changes  = [secret_content]
+    prevent_destroy = true
   }
 }
 
