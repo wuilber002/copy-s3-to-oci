@@ -317,7 +317,9 @@ def test_wave_creation_uses_one_shared_action_for_every_method():
 def test_wave_report_explains_restore_failures_and_supports_evidence_recovery():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "function renderRestoreDiagnosis" in page
-    assert "Diagnóstico do restore" in page
+    assert "Status do processamento do restore" in page
+    assert "restoreDiagnosisMessage" in page
+    assert "Continue o polling de disponibilidade." in page
     assert "Código AWS" in page
     assert "Ação recomendada" in page
     assert "retry-restore-evidence" in page

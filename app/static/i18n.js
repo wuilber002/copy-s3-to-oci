@@ -133,6 +133,7 @@
     ,'RESTORE 100% DISPONÍVEL': 'RESTORE 100% AVAILABLE', 'RESTORE PARCIAL:': 'PARTIAL RESTORE:', 'DISPONÍVEIS': 'AVAILABLE'
     ,'Estratégia de transferência': 'Transfer strategy', 'Após todos os arquivos estarem disponíveis': 'After all files are available', 'Liberar arquivos assim que disponíveis': 'Release files as they become available', 'Salvar estratégia': 'Save strategy', 'A liberação antecipada será ativada com o worker de governança.': 'Early release will be enabled with the governance worker.'
     ,'Resumo operacional': 'Operational summary', 'Tempo total de transferência': 'Total transfer time', 'Arquivos transferidos': 'Transferred files', 'Dados transferidos': 'Transferred data', 'Falhas/erros registrados': 'Recorded failures/errors', 'Tempo total de restore': 'Total restore time', 'Média entre disponibilizações': 'Average availability interval', 'objetos': 'objects', 'tarefas': 'tasks'
+    ,'Status do processamento do restore': 'Restore processing status', 'Resultado efetivo:': 'Effective result:', 'Ação recomendada:': 'Recommended action:', 'Status:': 'Status:', 'aceitos ou já em restore': 'accepted or already being restored', 'falhas que exigem ação': 'failures requiring action', 'sem evidência.': 'without evidence.'
   };
   let language = localStorage.getItem(STORAGE_KEY) === 'en' ? 'en' : 'pt';
   let translating = false;
