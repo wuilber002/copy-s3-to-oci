@@ -250,7 +250,7 @@ function closeFlightBoardModal(){closeModal('#flight-board-modal')}
 function closeDurableQueueModal(){closeModal('#durable-queue-modal')}
 function closeOperationalHistoryModal(){closeModal('#operational-history-modal')}
 async function openDurableQueueModal(){openModal('#durable-queue-modal');await loadTasks()}
-function syncOperationalHistorySource(){const source=sources.find(item=>String(item.id)===String(selectedSource));$('#operational-history-source').textContent=source?`— ${source.name}`:''}
+function syncOperationalHistorySource(){const source=sources.find(item=>String(item.id)===String(selectedSource));const allSources=window.raijinLocale?.()==='en-US'?'All sources':'Todos os sources';$('#operational-history-source').textContent=`— ${source?.name||allSources}`}
 async function openOperationalHistoryModal(){syncOperationalHistorySource();openModal('#operational-history-modal');await loadEvents()}
 function closeCostPricingModal(){closeModal('#cost-pricing-modal')}
 function closePublicPricingModal(){closeModal('#public-pricing-modal')}

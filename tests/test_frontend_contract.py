@@ -334,7 +334,8 @@ def test_operational_history_emphasizes_selected_source_in_title():
 
     assert 'id="operational-history-source"' in page
     assert "function syncOperationalHistorySource()" in page
-    assert "source?`— ${source.name}`:''" in page
+    assert "'All sources':'Todos os sources'" in page
+    assert "`— ${source?.name||allSources}`" in page
     assert "syncOperationalHistorySource();openModal('#operational-history-modal')" in page
 
 
