@@ -91,6 +91,7 @@ def test_simulated_backend_validates_remote_identity(monkeypatch):
 def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real():
     bootstrap = Path("scripts/bootstrap.sh").read_text(encoding="utf-8")
     runtime = Path("scripts/start-runtime.sh").read_text(encoding="utf-8")
+    stop_runtime = Path("scripts/stop-runtime.sh").read_text(encoding="utf-8")
     switch = Path("scripts/raijin-mode.sh").read_text(encoding="utf-8")
     assert "simulation_postgres_password" in bootstrap
     assert 'chown 70:70 "$secret_root/simulation_postgres_password"' in bootstrap
@@ -108,6 +109,8 @@ def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real
     simulation_branch = runtime.split("SIMULATION)", 1)[1]
     assert "OCI_RUNTIME_CONFIG_FILE" not in simulation_branch
     assert "AWS_ACCESS_KEY_ID" not in simulation_branch
+    assert "PYTHONPATH=/app" in simulation_branch
+    assert stop_runtime.index("s3-oci-postgres") > stop_runtime.index("s3-oci-simulator")
     assert "state IN ('READY','RUNNING')" in switch
 
 

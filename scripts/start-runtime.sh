@@ -45,6 +45,7 @@ case "$mode" in
     ;;
   SIMULATION)
     podman run --rm --network "$network" \
+      -e PYTHONPATH=/app \
       -e RAIJIN_OPERATION_MODE=SIMULATION \
       -e RAIJIN_SIMULATOR_BASE_URL=http://simulator:8090 \
       -e DATABASE_URL=postgresql+psycopg://migration_simulation@postgres:5432/migration_simulation \
