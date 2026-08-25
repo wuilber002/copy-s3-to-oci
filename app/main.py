@@ -1935,7 +1935,7 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
                 "elapsed_seconds": int(float(obj.transfer_elapsed_seconds or 0)) if obj else 0,
             })
         waves.append({
-            "wave_id": wave.id, "wave_name": wave.name, "source_name": wave.source.name,
+            "wave_id": wave.id, "wave_name": wave.name, "source_id": wave.source_id, "source_name": wave.source.name,
             "status": wave.status, "task_kind": task.kind, "task_state": task.state,
             "available_at": task.available_at, "active": active,
             # Batch data comes from durable local records only.  It makes the
@@ -1952,17 +1952,27 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
 
 
 @app.get("/api/flight-board/availability")
-def flight_board_availability(session: Session = Depends(get_session)) -> dict:
-    """Cheap indicator used to show the dynamic-pipeline flight-board button."""
-    dynamic_waves = session.scalar(select(func.count(Wave.id)).where(Wave.planner_mode == "DYNAMIC")) or 0
-    return {"available": bool(dynamic_waves), "waves": int(dynamic_waves)}
+def flight_board_availability(source_id: int | None = Query(default=None, ge=1),
+                              session: Session = Depends(get_session)) -> dict:
+    """Cheap indicator for the queued source's dynamic flight board only."""
+    filters = [Wave.planner_mode == "DYNAMIC"]
+    if source_id is not None:
+        filters.append(Wave.source_id == source_id)
+    dynamic_waves = session.scalar(select(func.count(Wave.id)).where(*filters)) or 0
+    return {"available": bool(dynamic_waves), "waves": int(dynamic_waves), "source_id": source_id}
 
 
 @app.get("/api/flight-board")
-def flight_board(run_id: int | None = Query(default=None, ge=1), session: Session = Depends(get_session)) -> dict:
-    """Return local-only planned and actual phases for dynamic migration waves."""
+def flight_board(source_id: int | None = Query(default=None, ge=1),
+                 run_id: int | None = Query(default=None, ge=1),
+                 session: Session = Depends(get_session)) -> dict:
+    """Return local-only phases for one source, or for one durable pipeline run."""
     now = utcnow()
     filters = [Wave.planner_mode == "DYNAMIC"]
+    source_name = None
+    if source_id is not None:
+        source_name = source_or_404(session, source_id).name
+        filters.append(Wave.source_id == source_id)
     if run_id is not None:
         filters.append(Wave.pipeline_run_id == run_id)
     rows = list(session.execute(
@@ -1971,7 +1981,8 @@ def flight_board(run_id: int | None = Query(default=None, ge=1), session: Sessio
     ))
     wave_ids = [wave.id for wave, _source_name in rows]
     if not wave_ids:
-        return {"waves": [], "generated_at": now, "truncated": False}
+        return {"waves": [], "generated_at": now, "truncated": False, "source_id": source_id,
+                "source_name": source_name}
     run_ids = [wave.pipeline_run_id for wave, _ in rows if wave.pipeline_run_id is not None]
     runs = list(session.scalars(select(DynamicPipelineRun).where(DynamicPipelineRun.id.in_(run_ids)))) if run_ids else []
     for run in runs:
@@ -2048,7 +2059,8 @@ def flight_board(run_id: int | None = Query(default=None, ge=1), session: Sessio
             "phases": phases,
         })
     timeline_points = [point for wave in board_waves for phase_item in wave["phases"] for point in (phase_item["start_at"], phase_item["end_at"])]
-    return {"waves": board_waves, "generated_at": now,
+    return {"waves": board_waves, "generated_at": now, "source_id": source_id,
+            "source_name": source_name,
             "timeline_start_at": min(timeline_points) if timeline_points else now,
             "timeline_end_at": max(timeline_points) if timeline_points else now + timedelta(hours=1),
             "truncated": len(rows) >= 500}
