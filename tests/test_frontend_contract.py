@@ -110,6 +110,7 @@ def test_discovered_objects_and_source_cost_actions_live_in_the_discovery_summar
     assert 'id="inventory-page-size"' in page
     assert "openDiscoveredObjectsModal()" in page
     assert "const actions=$('#source-summary-actions')" in page
+    assert ".source-actions{flex-wrap:nowrap;overflow:visible" in page
     assert ".source-actions .source-combobox{flex:0 0 490px" in page
 
 
