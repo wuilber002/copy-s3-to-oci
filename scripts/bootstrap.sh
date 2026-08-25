@@ -42,6 +42,11 @@ if [[ ! -s "$secret_root/simulation_postgres_password" ]]; then
     --secret-name simulation_postgres_password \
     --output "$secret_root/simulation_postgres_password"
 fi
+# postgres:16-alpine runs the database server as UID/GID 70. The server reads
+# this file through pg_read_file() while creating/updating the isolated role;
+# keep it unreadable to every other non-root host user.
+chown 70:70 "$secret_root/simulation_postgres_password"
+chmod 0400 "$secret_root/simulation_postgres_password"
 
 podman network exists s3-oci-migration 2>/dev/null || podman network create s3-oci-migration
 podman rm -f s3-oci-app s3-oci-postgres s3-oci-governance-worker s3-oci-transfer-worker s3-oci-real-worker s3-oci-simulator 2>/dev/null || true

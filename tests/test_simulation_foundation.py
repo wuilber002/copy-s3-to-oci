@@ -93,6 +93,8 @@ def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real
     runtime = Path("scripts/start-runtime.sh").read_text(encoding="utf-8")
     switch = Path("scripts/raijin-mode.sh").read_text(encoding="utf-8")
     assert "simulation_postgres_password" in bootstrap
+    assert 'chown 70:70 "$secret_root/simulation_postgres_password"' in bootstrap
+    assert 'chmod 0400 "$secret_root/simulation_postgres_password"' in bootstrap
     assert "CREATE ROLE migration_simulation" in bootstrap
     assert "createdb -U migration -O migration_simulation migration_simulation" in bootstrap
     assert "printf 'REAL\\n'" in bootstrap
