@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import Engine, inspect, select
+from sqlalchemy import Engine, inspect, select, text
 from sqlalchemy.orm import Session
 
 from app.simulation_schema import (
@@ -59,6 +59,25 @@ def migrate(engine: Engine) -> int:
                 SimulationSchemaRevision(
                     version=2,
                     description="Deterministic generator release lifecycle",
+                )
+            )
+            session.commit()
+        revision = 2
+    if revision < 3:
+        # SQLite does not enforce VARCHAR lengths and fresh schemas already use
+        # the current model. PostgreSQL needs an explicit widening migration
+        # for catalogs created before logical checksums gained their prefix.
+        if engine.dialect.name == "postgresql":
+            with engine.begin() as connection:
+                connection.execute(text(
+                    "ALTER TABLE sim_virtual_objects "
+                    "ALTER COLUMN source_sha256 TYPE VARCHAR(128)"
+                ))
+        with Session(engine) as session:
+            session.add(
+                SimulationSchemaRevision(
+                    version=3,
+                    description="Allow prefixed logical SHA-256 evidence",
                 )
             )
             session.commit()

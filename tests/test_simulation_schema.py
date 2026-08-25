@@ -7,6 +7,7 @@ from app.simulation_schema import (
     GeneratorRelease,
     SimulationScenario,
     SimulationSchemaRevision,
+    VirtualObject,
 )
 
 
@@ -32,7 +33,11 @@ def test_simulation_migration_is_idempotent():
 
     with Session(engine) as session:
         revisions = session.scalars(select(SimulationSchemaRevision)).all()
-    assert [item.version for item in revisions] == [1, 2]
+    assert [item.version for item in revisions] == [1, 2, 3]
+
+
+def test_virtual_object_checksum_accepts_control_evidence_prefix():
+    assert VirtualObject.__table__.c.source_sha256.type.length >= len("logical:" + "0" * 64)
 
 
 def test_data_scenario_defaults_to_one_decimal_terabyte_budget():

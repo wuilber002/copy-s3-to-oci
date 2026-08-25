@@ -19,7 +19,7 @@ from app.runtime_context import SIMULATOR_CONTRACT_VERSION
 from app.simulated_data import GENERATOR_VERSION
 
 
-SIMULATION_SCHEMA_VERSION = 2
+SIMULATION_SCHEMA_VERSION = 3
 DEFAULT_DATA_PHYSICAL_BUDGET_BYTES = 1_000_000_000_000
 DEFAULT_RETENTION_DAYS = 60
 DEFAULT_QUARANTINE_DAYS = 30
@@ -195,7 +195,9 @@ class VirtualObject(SimulationBase):
     # Destination rows retain their own catalog identity while regenerating
     # the exact byte stream of the source object they represent.
     content_object_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
-    source_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # CONTROL executions prefix deterministic evidence with ``logical:``;
+    # DATA executions store the ordinary 64-character SHA-256 hex digest.
+    source_sha256: Mapped[str | None] = mapped_column(String(128), nullable=True)
     restore_state: Mapped[str] = mapped_column(String(32), default="ARCHIVED", index=True)
     restore_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     restore_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
