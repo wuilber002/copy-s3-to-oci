@@ -145,6 +145,139 @@ O re-discovery é incremental e auditável:
   histórica estiver íntegra, usa **Ver alterações → Preparar nova transferência**
   para criar a revisão nova, que fica em `DISCOVERED`.
 
+## Backend simulado — capacidade planejada
+
+O backend simulado será um gêmeo digital controlado da AWS, do OCI, da rede e
+do tempo. Seu objetivo não é criar um fluxo alternativo que aprove waves
+artificialmente: os mesmos governance e transfer workers usados em produção
+continuarão processando fila, leases, polling, restores, streaming, multipart,
+retries, checkpoints, reconciliação e replanejamento. Somente as integrações
+externas serão substituídas por implementações simuladas.
+
+### Modos e isolamento
+
+- O RAIJIN operará em modo `REAL` ou `SIMULATION`, nunca nos dois ao mesmo
+  tempo.
+- O modo simulado usará o banco lógico `migration_simulation`, separado do
+  banco `migration` usado pela operação real.
+- Secrets, credenciais AWS e configuração OCI real não serão montadas no modo
+  simulado; o backend real não poderá ser instanciado nesse modo.
+- A troca de modo entrará primeiro em `DRAINING`, recusará novos trabalhos e
+  somente continuará se não houver discovery, restore, transferência,
+  multipart, polling ou auditoria em execução ou aguardando processamento.
+- A interface exibirá um banner permanente e marcará sources, waves, eventos e
+  relatórios como `SIMULATED`.
+
+### Inventário e buckets virtuais
+
+- O operador poderá criar buckets, sources e objetos virtuais usando uma seed
+  e uma distribuição de tamanhos, classes, prefixes, metadados e tags.
+- Um cenário de 100 TB ou 1,5 PB será representado pelo catálogo lógico dos
+  objetos; não será necessário criar o mesmo volume em disco.
+- O PostgreSQL armazenará somente identidade, tamanho lógico, versão, storage
+  class, datas, metadata, tags, seed de conteúdo, estado e evidências.
+- `List` e `Head` responderão pelo catálogo persistido, permitindo que o
+  discovery real do RAIJIN percorra o bucket virtual e seja avaliado em grande
+  escala.
+- A seed e a versão do cenário reproduzirão o mesmo inventário e a mesma
+  sequência de eventos em execuções posteriores.
+
+### Relógio virtual
+
+- O simulador manterá horário real e horário virtual separados, sem alterar o
+  relógio do Linux.
+- Um fator configurável permitirá representar horas ou dias simulados em
+  segundos reais.
+- Batch jobs, disponibilidade de restore, polling, retenção, expiração e
+  janelas planejadas usarão o relógio virtual por uma abstração única de tempo.
+- Depois de reiniciar a VM, o cenário voltará pausado no último checkpoint;
+  somente uma retomada explícita poderá avançar o relógio novamente.
+
+### Batch Operations, restore e polling
+
+- O backend AWS simulado receberá o mesmo manifesto lógico e responderá com
+  job, estado e completion report equivalentes aos consumidos em produção.
+- O cenário poderá aceitar, rejeitar ou aceitar parcialmente um job e poderá
+  produzir falhas individuais reproduzíveis por objeto.
+- A disponibilização poderá acontecer de uma vez, progressivamente, por grupos,
+  fora do prazo ou nunca acontecer.
+- Cada objeto manterá os horários simulados de solicitação, primeiro momento
+  observado como disponível e expiração da cópia restaurada.
+- O governance worker real executará o polling adaptativo. O simulador apenas
+  responderá ao `Describe`, `List` ou `Head`; não alterará diretamente a wave,
+  o objeto ou a task no banco do RAIJIN.
+- Isso permitirá medir quantidade de consultas, atraso entre disponibilidade e
+  detecção e comportamento das duas estratégias de liberação de arquivos.
+
+### Rede e transferência lógica
+
+- O perfil de rede definirá throughput, latência, jitter, throttling, períodos
+  de indisponibilidade e recuperação ao longo do tempo virtual.
+- A transferência lógica representará centenas de terabytes rapidamente,
+  avançando progresso e tempo conforme o modelo de rede, sem movimentar o
+  payload equivalente.
+- Os mesmos handlers e estados de transferência serão usados; o adaptador
+  simulado fornecerá progresso controlado em vez de acesso a uma nuvem real.
+- Mudanças de banda deverão produzir métricas observadas e fazer o scheduler
+  recalcular as próximas waves e janelas, preservando a decisão tomada no
+  histórico operacional.
+- A simulação lógica valida escala, governança e planejamento, mas não será
+  apresentada como prova do caminho físico dos bytes.
+
+### Simulação de dados
+
+- O backend AWS simulado gerará bytes determinísticos sob demanda, inclusive
+  por faixa (`offset` e `length`), sem arquivo físico e sem acesso à Internet.
+- O transfer worker real fará streaming, calculará SHA-256 e executará
+  multipart, checkpoints, retries e retomada exatamente pelo fluxo de
+  produção.
+- O backend OCI simulado calculará seus próprios checksums sobre os bytes
+  efetivamente recebidos. Ele nunca aceitará como prova apenas o hash declarado
+  pela origem ou pelo worker.
+- Cada chunk recebido será consumido e descartado imediatamente. Nenhum payload
+  será armazenado no PostgreSQL ou no filesystem.
+- O banco persistirá somente o bucket virtual, evidências de recebimento,
+  SHA-256 observados, partes multipart, manifesto ordenado, tamanho final,
+  checkpoints, falhas e timestamps.
+- Retomadas poderão requisitar novamente qualquer faixa do objeto porque a seed,
+  a chave, a versão e o offset reproduzem exatamente os mesmos bytes usando
+  memória limitada.
+- O SHA-256 integral não será inferido a partir dos hashes das partes. A
+  validação multipart comparará cada parte independentemente, sua ordem, seu
+  tamanho, o manifesto completo e o SHA-256 integral calculado pelo worker.
+- Uma auditoria profunda poderá regenerar deterministicamente o stream e
+  recalcular o SHA-256 integral sem manter o objeto armazenado.
+- Essa modalidade será executada com volumes físicos representativos menores;
+  ela valida streaming e integridade, enquanto a transferência lógica valida
+  escalas como 100 TB ou mais.
+
+### Destino OCI virtual e reconciliação
+
+- O commit de um objeto só atualizará o catálogo OCI virtual depois que todas
+  as partes esperadas forem recebidas e validadas.
+- Objetos incompletos, divergentes, corrompidos ou com partes fora de ordem
+  permanecerão identificados como falha e não serão promovidos silenciosamente.
+- `List`, `Head`, validação do destino e reconciliação consultarão o estado do
+  bucket virtual persistido.
+- O cenário poderá representar objeto já existente, objeto ausente, tamanho ou
+  metadata divergente, checksum inválido e indisponibilidade do bucket.
+- A validação deverá reabrir somente os objetos afetados, permitindo provar o
+  mesmo reprocessamento fino usado no ambiente real.
+
+### Falhas, retomada e reprodutibilidade
+
+- Falhas serão declaradas por cenário e poderão atingir objeto, parte, chamada,
+  período de tempo ou quantidade de tentativas.
+- Serão simulados timeout, throttling, desconexão, worker interrompido, parte
+  multipart rejeitada, restore expirado e corrupção de dados.
+- Toda falha aleatória usará seed e será persistida com o ponto exato de
+  injeção, tornando o teste reproduzível.
+- O simulador nunca consumirá a fila durável nem mudará diretamente os estados
+  operacionais. A recuperação continuará sendo responsabilidade dos workers
+  reais por leases, retries e checkpoints.
+- Relatórios compararão previsão e execução, mostrarão falhas injetadas,
+  decisões do scheduler e evidências de que nenhum endpoint real foi chamado.
+
 ## Capacidades em evolução
 
 Estas capacidades já têm base implementada, mas devem continuar sendo refinadas
