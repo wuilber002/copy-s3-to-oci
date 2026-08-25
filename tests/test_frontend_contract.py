@@ -359,7 +359,7 @@ def test_wave_report_explains_restore_failures_and_supports_evidence_recovery():
     assert "Polling de disponibilidade" in page
     assert "wave-report-overall" in page
     assert "function renderRestoreDiagnosis" in page
-    assert "Status do processamento do restore" in page
+    assert "Processamento do restore" in page
     assert "restoreDiagnosisMessage" in page
     assert "Continue o polling de disponibilidade." in page
     assert "Código AWS" in page
