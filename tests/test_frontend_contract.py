@@ -320,13 +320,22 @@ def test_wave_creation_uses_one_shared_action_for_every_method():
 def test_buttons_use_content_width_and_standard_horizontal_spacing():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "width:max-content!important" in page
-    assert "padding-left:2em!important" in page
-    assert "padding-right:2em!important" in page
+    assert "padding-left:1em!important" in page
+    assert "padding-right:1em!important" in page
     assert "button.hidden{display:none!important}" in page
     assert 'id="waves-queue-all" class="secondary hidden" onclick="queueAllPlannedWaves()" disabled' in page
     assert "queueAll.classList.toggle('hidden',!hasSource)" in page
     assert 'id="source-validate-destination"' in page
     assert 'id="source-edit-action"' in page
+
+
+def test_operational_history_emphasizes_selected_source_in_title():
+    page = Path("app/static/index.html").read_text()
+
+    assert 'id="operational-history-source"' in page
+    assert "function syncOperationalHistorySource()" in page
+    assert "source?`— ${source.name}`:''" in page
+    assert "syncOperationalHistorySource();openModal('#operational-history-modal')" in page
 
 
 def test_migration_tools_are_contextual_footer_modals_with_critical_ticker():
