@@ -15,7 +15,7 @@ Este guia é a referência canônica para preparar uma conta AWS para uma conex�
 | Bucket de origem | Contém os objetos que serão descobertos e migrados. | Cliente AWS |
 | Secret OCI | Guarda o JSON da conexão; nunca é exibido pela aplicação. | Cliente OCI |
 
-O operador cria os recursos AWS. O Terraform OCI não cria recursos na AWS.
+O operador cria os recursos AWS diretamente na conta AWS.
 
 > **Valores a substituir:** todo texto entre sinais de menor e maior, como `<AWS_ACCOUNT_ID>`, é obrigatório e deve ser substituído pelo valor do cliente antes de aplicar a policy. Não altere nomes de ações AWS, efeitos, conditions ou principals de serviço.
 
