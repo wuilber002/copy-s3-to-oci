@@ -1,5 +1,7 @@
 # AWS por CLI: recursos para a migração S3 → OCI
 
+> **Padrão de produção:** consulte primeiro [AWS setup — padrão empresarial do RAIJIN](aws-setup.md). Ele é a referência canônica de menor privilégio, proteção do bucket de controle, S3 Inventory, KMS e acesso entre contas. Este roteiro é um atalho operacional por CLI e deve respeitar as mesmas restrições; não use permissões adicionais presentes em exemplos antigos como baseline de produção.
+
 Este capítulo cria os recursos AWS mínimos para uma origem S3: um usuário de bootstrap com access key, a role de migração, a role de S3 Batch Operations e um bucket de controle para manifestos e relatórios. Execute-o no **AWS CloudShell** ou em uma estação com AWS CLI v2 autenticada na conta que possui o bucket de origem.
 
 > Não execute estes comandos no Terraform/OCI Resource Manager. O Terraform da plataforma não cria recursos na AWS e não recebe credenciais AWS.
@@ -8,7 +10,7 @@ Este capítulo cria os recursos AWS mínimos para uma origem S3: um usuário de 
 
 É necessário ter permissão para criar usuário, access key, roles e policies IAM, além de criar o bucket de controle. Execute este roteiro uma vez por conta AWS. Cada execução gera uma [conexão AWS](aws-connections.md) independente, que pode ser reutilizada por vários sources dessa conta.
 
-Os nomes abaixo são exemplos. O bucket de controle é criado sem versionamento para que o cleanup opcional seja direto. Ele é apenas para manifestos e relatórios; **nunca** coloque os dados de origem nele.
+Os nomes abaixo são exemplos. O bucket de controle armazena manifestos e relatórios; habilite versionamento e lifecycle conforme o padrão canônico. **Nunca** coloque os dados de origem nele.
 
 ```bash
 export AWS_REGION='us-east-1'             # região do bucket de origem
