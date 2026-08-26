@@ -39,7 +39,7 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_col
 
 from app.cloud_backends import backend_for
 from app.runtime_context import load_runtime_context
-from app.simulator_admin import SimulatorAdminClient
+from app.simulator_admin import SimulatorAdminClient, SimulatorAdminError
 
 
 def utcnow() -> datetime:
