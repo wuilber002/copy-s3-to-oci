@@ -5,19 +5,6 @@ remova ou altere um fluxo operacional deve atualizar este documento no mesmo
 commit. O objetivo é dar visibilidade rápida sobre **o que a plataforma é capaz
 de fazer** e **como ela organiza a operação**.
 
-## Diretriz da fase de homologação
-
-Enquanto o RAIJIN estiver em testes e homologação, a referência é sempre a
-release atual. Não são mantidas camadas de compatibilidade, migrações de
-comportamento ou fluxos legados apenas para preservar históricos de testes
-anteriores. Dados, waves, fontes e evidências de ensaios já concluídos são
-descartáveis; cada novo teste deve validar o comportamento vigente da
-plataforma.
-
-Uma exceção só deve ser criada mediante decisão explícita para o cenário em
-questão. Antes da entrada em produção, esta diretriz deverá ser revista para
-definir a política definitiva de atualização e retenção operacional.
-
 ## O que o RAIJIN faz
 
 ### Fontes, conexões e inventário
