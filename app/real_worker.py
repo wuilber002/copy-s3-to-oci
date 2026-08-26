@@ -1169,10 +1169,11 @@ def poll_restore_simulated(
             )
             or 0
         )
-        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
+        if ready_for_transfer:
             wave.first_restore_available_virtual_at = (
                 wave.first_restore_available_virtual_at or availability_virtual_at
             )
+        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
             ensure_transfer_task(session, wave)
             event(
                 session,
