@@ -5251,6 +5251,31 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                 Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])
             ))
         )
+    # A completed restore can still become unavailable before the copy worker
+    # consumes it (for example after its temporary restore window expires).
+    # In that case the old Batch completion evidence remains useful history,
+    # but it must not be presented as the current restore diagnosis.  The
+    # operator needs an unambiguous reason for the required, potentially
+    # billable, new restore approval.
+    if wave.restore_reapproval_required:
+        restore_diagnosis = {
+            "action_required": True,
+            "summary": "The previously restored copy is no longer available for transfer",
+            "recommended_action": "Review the wave report and explicitly approve a new restore before reprocessing. A new restore may incur AWS charges.",
+            "reasons": [{
+                "code": "RESTORE_REAPPROVAL_REQUIRED",
+                "http_status": None,
+                "message": wave.restore_reapproval_reason or "A restored object is no longer available.",
+                "count": int(total_objects or 0),
+                "sample_keys": [],
+            }],
+            "raw_succeeded": int(latest_attempt.succeeded_objects or 0) if latest_attempt else 0,
+            "accepted_equivalent": 0,
+            "effective_accepted": 0,
+            "unexpected_failed": 0,
+            "pending_evidence": 0,
+            "can_retry_evidence": False,
+        }
     return {"wave_id": wave_id, "status": wave.status, "objects": total_objects, "bytes": total_bytes, "object_states": by_state,
             "summary": {"transfer_elapsed_seconds": transfer_elapsed_seconds,
                         "transfer_started_at": transfer_started_at, "transfer_completed_at": transfer_completed_at,
