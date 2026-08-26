@@ -147,7 +147,7 @@ as medições mais recentes. O agendamento de restore é obrigatório nesse modo
 O **inventário de bordo**, acessível em **Queue**, apresenta:
 
 - linha do tempo colorida com períodos planejados e observados de fila, restore,
-  gordura operacional e transferência; o hover de cada bloco mostra tipo,
+  margem operacional e transferência; o hover de cada bloco mostra tipo,
   data/hora prevista ou iniciada e tempo decorrido/esperado;
 - legenda dos estados;
 - lista de waves com estado e datas de início e término;
