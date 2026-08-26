@@ -223,9 +223,29 @@ Se tags não forem preservadas, remova as duas ações `GetObject*Tagging`. Não
 
 ## 6. Criar a role do S3 Batch Operations
 
-Essa role é assumida pelo serviço AWS S3 Batch Operations, não pelo bootstrap user nem pela VM.
+Esta role é necessária quando a source contém objetos em classes de archive que exigem restore, como S3 Glacier Flexible Retrieval e S3 Glacier Deep Archive. Ela é assumida pelo serviço **S3 Batch Operations**, não pelo usuário IAM da conexão e não pela VM.
 
-### 6.1 Trust policy
+O fluxo funciona assim:
+
+1. A aplicação cria no bucket de controle o manifesto da wave: a lista de objetos que terão restore solicitado.
+2. A role de migração cria um S3 Batch Operations job e passa o ARN desta role ao serviço AWS.
+3. O S3 Batch Operations assume esta role, lê o manifesto e executa `s3:RestoreObject` somente nos objetos autorizados.
+4. Ao terminar, o serviço grava o completion report no mesmo prefixo do bucket de controle.
+5. A aplicação consulta o job e lê o report para registrar a evidência de aceitação, falha ou conclusão do restore.
+
+Portanto, esta role **não** recebe permissões gerais de leitura dos dados de origem. Ela recebe apenas: restore no prefixo aprovado, leitura do manifesto e escrita do report.
+
+### 6.1 Criar a role e configurar a trust policy
+
+Pelo Console AWS:
+
+1. Acesse **IAM → Roles → Create role**.
+2. Em **Trusted entity type**, selecione **Custom trust policy**.
+3. Substitua o conteúdo pelo JSON abaixo. Não altere o principal de serviço `batchoperations.s3.amazonaws.com`.
+4. Avance sem adicionar policies gerenciadas pela AWS.
+5. Em **Role name**, informe o valor de `<BATCH_ROLE>` registrado na seção 2. Exemplo: `oracle-s3-batch-restore-role`.
+6. Clique em **Create role**.
+7. Abra a role criada, acesse **Trust relationships → Edit trust policy** e confirme que o documento salvo é exatamente o apresentado abaixo.
 
 ```json
 {
@@ -243,7 +263,19 @@ Essa role é assumida pelo serviço AWS S3 Batch Operations, não pelo bootstrap
 }
 ```
 
-### 6.2 Policy mínima da role Batch
+O principal de confiança deve ser somente `batchoperations.s3.amazonaws.com`. Não adicione usuário IAM, conta AWS, VM, `s3.amazonaws.com` ou outras services nesta trust policy.
+
+### 6.2 Adicionar a policy mínima da role Batch
+
+Pelo Console AWS:
+
+1. Dentro da role `<BATCH_ROLE>`, abra **Permissions → Add permissions → Create inline policy**.
+2. Selecione a aba **JSON**.
+3. Cole o JSON abaixo depois de substituir os quatro placeholders indicados.
+4. Clique em **Next**.
+5. Em **Policy name**, use `oracle-s3-batch-restore-policy`.
+6. Revise se os ARNs apontam somente para o bucket/prefixo da source e para o bucket/prefixo de controle da mesma conexão.
+7. Clique em **Create policy**.
 
 Substitua no JSON: `<SOURCE_BUCKET>`, `<SOURCE_PREFIX>`, `<CONTROL_BUCKET>` e `<CONTROL_PREFIX>`. Eles devem ser idênticos aos valores usados na policy da role de migração.
 
@@ -276,7 +308,15 @@ Substitua no JSON: `<SOURCE_BUCKET>`, `<SOURCE_PREFIX>`, `<CONTROL_BUCKET>` e `<
 }
 ```
 
-Valide que o completion report é habilitado pelo job. A aplicação grava e lê os artefatos em `oracle/`; não use um bucket público para manifestos ou relatórios.
+### 6.3 Validar a role
+
+1. Confirme que a role de migração contém `iam:PassRole` para `arn:aws:iam::<AWS_ACCOUNT_ID>:role/<BATCH_ROLE>`.
+2. Confirme que esse `iam:PassRole` tem a condition `iam:PassedToService = batchoperations.s3.amazonaws.com`.
+3. Confirme que a aplicação está configurada com o ARN exato da role Batch no Secret da conexão.
+4. Execute o **Pre-check** na interface. Ele deve validar a credencial e o AssumeRole da role de migração.
+5. Na primeira wave com archive, acompanhe o relatório: a submissão deve registrar um Batch job ID e um completion report no bucket de controle.
+
+O completion report é parte da evidência operacional. Não use um bucket público para manifestos ou relatórios e não altere manualmente objetos já referenciados por um job em execução.
 
 ## 7. S3 Inventory (recomendado para inventários grandes)
 
