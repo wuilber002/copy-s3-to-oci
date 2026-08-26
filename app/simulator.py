@@ -620,6 +620,13 @@ def destination_logical_transfer(payload: LogicalTransferRequest) -> dict:
             payload.size_bytes,
             str(payload.idempotency_key),
         ).model_dump(mode="json")
+    except PermissionError as error:
+        # This is an expected operational state, not an internal simulator
+        # fault: the temporary restored copy is no longer available.
+        raise HTTPException(
+            status_code=409,
+            detail=f"{error}. A new restore requires explicit operator approval because it may incur AWS charges.",
+        ) from error
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except LookupError as error:

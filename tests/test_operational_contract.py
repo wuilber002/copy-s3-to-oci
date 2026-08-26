@@ -1044,3 +1044,17 @@ def test_public_price_refresh_covers_active_source_regions_including_legacy_sour
     handler = source[start:source.index("\n\ndef refresh_due_global_aws_pricing", start)]
     assert "Source.aws_region" in handler
     assert "AwsConnection.default_region" in handler
+
+
+def test_expired_restored_copy_requires_explicit_operator_approval_before_reprocess():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    handler = source[source.index('def reprocess_wave'):source.index('\n\n@app.post("/api/waves/{wave_id}/retry-restore-evidence")')]
+    assert "WaveReprocessRequest" in handler
+    assert "restore_reapproval_required" in handler
+    assert "explicitly approve the new restore" in handler
+
+
+def test_dynamic_repack_keeps_non_nullable_object_predictions_valid():
+    source = Path("app/main.py").read_text(encoding="utf-8")
+    handler = source[source.index("def repackage_unsubmitted_dynamic_waves"):source.index("\n\ndef replan_dynamic_pipeline")]
+    assert "planned_transfer_seconds=0" in handler

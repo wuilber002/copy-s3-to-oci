@@ -64,6 +64,10 @@ WORKER_ROLE = os.getenv("RAIJIN_WORKER_ROLE", "all").strip().lower()
 GOVERNANCE_TASK_KINDS = frozenset({"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE"})
 TRANSFER_TASK_KINDS = frozenset({"TRANSFER_WAVE"})
 ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS", "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS"}
+
+
+class RestoreReapprovalRequired(RuntimeError):
+    """A restored copy disappeared before transfer and a paid retry is required."""
 # Restore status is not queryable by an arbitrary set of object keys through
 # ListObjectsV2. Poll only objects assigned to the wave with HeadObject rather
 # than repeatedly scanning a full source prefix that may contain many other
@@ -370,7 +374,7 @@ def fail_permanently(session, task: Task, error: str) -> None:
                 "Raijin polling/report processing failed after AWS accepted "
                 f"Batch job {attempt.job_id}: {task.error}"
             )[:8000]
-    if wave and wave.status not in {"PAUSED", "VERIFIED", "RESTORE_REQUEST_FAILED"}:
+    if wave and wave.status not in {"PAUSED", "VERIFIED", "RESTORE_REQUEST_FAILED", "RESTORE_REAPPROVAL_REQUIRED"}:
         wave.status = "FAILED"
     event(session, "TASK_FAILED_PERMANENTLY", f"{task.kind} requires operator action: {task.error}", wave_id=task.wave_id)
     session.commit()
@@ -433,6 +437,62 @@ def simulation_phase_clock_hold(source: Source, phase: str):
         yield
     finally:
         admin.control_clock(source.simulation_execution_id, "RELEASE")
+
+
+def retain_simulation_clock_for_transfer(session, wave: Wave) -> None:
+    """Keep virtual time frozen across the queue hand-off to transfer.
+
+    The availability poll itself holds the accelerated clock.  Taking one
+    additional durable hold before that poll releases closes the otherwise
+    unavoidable gap until ``TRANSFER_WAVE`` is claimed by the worker.
+    """
+    if not runtime_context.is_simulation or wave.simulation_transfer_clock_held:
+        return
+    SimulatorAdminClient(runtime_context.simulator_base_url).control_clock(
+        wave.source.simulation_execution_id, "HOLD"
+    )
+    wave.simulation_transfer_clock_held = True
+    session.flush()
+
+
+def release_simulation_clock_after_transfer(session, wave: Wave) -> None:
+    if not runtime_context.is_simulation or not wave.simulation_transfer_clock_held:
+        return
+    try:
+        SimulatorAdminClient(runtime_context.simulator_base_url).control_clock(
+            wave.source.simulation_execution_id, "RELEASE"
+        )
+    finally:
+        wave.simulation_transfer_clock_held = False
+        session.flush()
+
+
+def require_new_restore_approval(session, wave: Wave, reason: str) -> None:
+    """Stop only this wave and retain clear evidence before another restore.
+
+    The operator must later approve reprocessing explicitly.  No automatic
+    re-submit is allowed because a second restore may incur AWS charges.
+    """
+    reason = reason[:8000]
+    for obj in session.scalars(select(ObjectRecord).where(
+        ObjectRecord.wave_id == wave.id,
+        ObjectRecord.state.notin_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]),
+    )):
+        obj.state = ObjectState.WAVE_ASSIGNED
+        obj.restored_at = obj.restore_expires_at = None
+    wave.status = "RESTORE_REAPPROVAL_REQUIRED"
+    wave.restore_reapproval_required = True
+    wave.restore_reapproval_reason = reason
+    wave.restore_reapproval_detected_at = utcnow()
+    release_simulation_clock_after_transfer(session, wave)
+    event(
+        session,
+        "RESTORE_REAPPROVAL_REQUIRED",
+        "Restored copy became unavailable before transfer. Operator approval is required before a new paid restore: " + reason,
+        source_id=wave.source_id,
+        wave_id=wave.id,
+    )
+    session.commit()
 
 
 def inventory_timestamp(value: str | None):
@@ -1177,6 +1237,7 @@ def poll_restore_simulated(
                 wave.first_restore_available_virtual_at or availability_virtual_at
             )
         if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
+            retain_simulation_clock_for_transfer(session, wave)
             ensure_transfer_task(session, wave)
             event(
                 session,
@@ -1231,6 +1292,10 @@ def poll_restore_simulated(
         source_id=source.id,
         wave_id=wave.id,
     )
+    # Keep a second hold beyond the polling context.  It is released only by
+    # the transfer worker, preventing a 3,600x virtual clock from expiring a
+    # freshly available object in the durable-queue hand-off.
+    retain_simulation_clock_for_transfer(session, wave)
     ensure_transfer_task(session, wave)
     succeed(session, task)
 
@@ -1923,8 +1988,20 @@ def transfer_object_simulated(
 def transfer_wave(session, task: Task, settings) -> None:
     wave = session.get(Wave, task.wave_id)
     if runtime_context.is_simulation:
-        with simulation_phase_clock_hold(wave.source, "wave transfer"):
-            _transfer_wave(session, task, settings)
+        # A full/partial availability poll may already have retained a hold.
+        # Acquire a local one only for older waves or recovered tasks.
+        held_by_handoff = bool(wave.simulation_transfer_clock_held)
+        if held_by_handoff:
+            try:
+                _transfer_wave(session, task, settings)
+            finally:
+                refreshed = session.get(Wave, task.wave_id)
+                if refreshed and refreshed.status != "RESTORE_REAPPROVAL_REQUIRED":
+                    release_simulation_clock_after_transfer(session, refreshed)
+                session.commit()
+        else:
+            with simulation_phase_clock_hold(wave.source, "wave transfer"):
+                _transfer_wave(session, task, settings)
         return
     _transfer_wave(session, task, settings)
 
@@ -1964,7 +2041,7 @@ def _transfer_wave(session, task: Task, settings) -> None:
         session.commit()
         rate = live_settings.max_throughput_mbps * 125000 / worker_count
         multipart_part_size = live_settings.multipart_part_size_mib * 1024 * 1024
-        errors: list[str] = []
+        errors: list[Exception] = []
         with ThreadPoolExecutor(max_workers=len(object_ids), thread_name_prefix="s3-oci-transfer") as executor:
             if runtime_context.is_simulation:
                 futures = [
@@ -1981,9 +2058,20 @@ def _transfer_wave(session, task: Task, settings) -> None:
                 try:
                     future.result()
                 except Exception as error:
-                    errors.append(f"{type(error).__name__}: {error}")
+                    errors.append(error)
         if errors:
-            raise RuntimeError(f"{len(errors)} object transfer(s) failed in parallel batch: {errors[0]}")
+            unavailable = next((error for error in errors if isinstance(error, SimulatorTransportError)
+                                and "HTTP 409" in str(error)), None)
+            if unavailable is not None:
+                require_new_restore_approval(session, wave, str(unavailable))
+                raise RestoreReapprovalRequired(
+                    "One or more restored objects became unavailable before transfer. "
+                    "A new restore requires explicit operator approval because it may incur AWS charges."
+                ) from unavailable
+            raise RuntimeError(
+                f"{len(errors)} object transfer(s) failed in parallel batch: "
+                f"{type(errors[0]).__name__}: {errors[0]}"
+            )
 
     session.expire_all()
     remaining = session.scalar(select(func.count(ObjectRecord.id)).where(

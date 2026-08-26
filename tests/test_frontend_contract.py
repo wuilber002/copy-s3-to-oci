@@ -480,3 +480,11 @@ def test_refresh_restores_the_current_view_and_selected_source_without_duplicate
     assert "url.searchParams.set('source',selectedSource)" in page
     assert "await Promise.all([loadSettings(),loadSources()])" in page
     assert "else if(view==='migrations'){await Promise.all([loadTasks(),loadEvents()])}" in page
+
+
+def test_reprocess_requires_a_second_explicit_confirmation_when_restore_cost_may_recur():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+
+    assert "Aprovar novo restore" in page
+    assert "approve_new_restore:true" in page
+    assert "pode gerar cobrança AWS" in page

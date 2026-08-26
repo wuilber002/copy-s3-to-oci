@@ -7,6 +7,7 @@ import http.client
 import json
 from typing import Iterable, Iterator, TypeVar
 from urllib.parse import urlparse
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from pydantic import BaseModel
@@ -61,6 +62,17 @@ class SimulatorHttpTransport:
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 return response_model.model_validate_json(response.read())
+        except HTTPError as error:
+            # Preserve the simulator's structured reason.  A bare HTTP 500/409
+            # in a wave report is not actionable enough for an operator.
+            try:
+                detail = error.read().decode("utf-8", errors="replace")
+            except Exception:
+                detail = ""
+            raise SimulatorTransportError(
+                f"Simulator request failed: {path}: HTTP {error.code}"
+                + (f": {detail}" if detail else "")
+            ) from error
         except Exception as error:
             raise SimulatorTransportError(f"Simulator request failed: {path}: {error}") from error
 

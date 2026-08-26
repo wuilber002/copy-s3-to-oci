@@ -404,6 +404,13 @@ class Wave(Base):
     last_restore_available_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     transfer_started_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     transfer_completed_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # A simulated transfer keeps one durable virtual-clock hold between the
+    # final availability poll and the worker claim.  Without it a fast
+    # simulation clock can expire the restored copy during that queue gap.
+    simulation_transfer_clock_held: Mapped[bool] = mapped_column(Boolean, default=False)
+    restore_reapproval_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    restore_reapproval_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    restore_reapproval_detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     source: Mapped[Source] = relationship(back_populates="waves")
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="wave")
@@ -946,6 +953,11 @@ class WaveCreate(BaseModel):
     restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
 
 
+class WaveReprocessRequest(BaseModel):
+    """Explicit approval is mandatory only when another paid restore is needed."""
+    approve_new_restore: bool = False
+
+
 class AutomaticWaveCreate(BaseModel):
     max_bytes: int = Field(gt=0, le=10 * 1024**4)
     restore_days: int = Field(ge=1, le=30)
@@ -1118,7 +1130,7 @@ def create_schema() -> None:
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
-    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE", "restore_requested_virtual_at": "TIMESTAMP WITH TIME ZONE", "first_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "last_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_started_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_completed_virtual_at": "TIMESTAMP WITH TIME ZONE"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE", "restore_requested_virtual_at": "TIMESTAMP WITH TIME ZONE", "first_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "last_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_started_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_completed_virtual_at": "TIMESTAMP WITH TIME ZONE", "simulation_transfer_clock_held": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_required": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_reason": "TEXT", "restore_reapproval_detected_at": "TIMESTAMP WITH TIME ZONE"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
@@ -4796,7 +4808,7 @@ def repackage_unsubmitted_dynamic_waves(session: Session, settings: RuntimeSetti
     # The objects are made eligible as one local transaction before selecting
     # the new deterministic slices. No external call is performed here.
     session.execute(update(ObjectRecord).where(ObjectRecord.wave_id.in_(mutable_ids)).values(
-        wave_id=None, state=ObjectState.DISCOVERED, planned_transfer_seconds=None
+        wave_id=None, state=ObjectState.DISCOVERED, planned_transfer_seconds=0
     ))
     session.flush()
     profiles = transfer_history_profiles(session, source.id, settings.multipart_part_size_mib)
@@ -5210,6 +5222,11 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                         "failed_objects": int(failed_objects or 0), "failed_tasks": failed_tasks,
                         "failures_or_errors": int(failed_objects or 0) + failed_tasks},
             "batch": {"job_id": wave.batch_job_id, "status": wave.batch_job_status, "manifest_key": wave.manifest_key, "last_poll_at": wave.last_poll_at, "poll_count": wave.poll_count},
+            "restore_reapproval": {
+                "required": bool(wave.restore_reapproval_required),
+                "reason": wave.restore_reapproval_reason,
+                "detected_at": wave.restore_reapproval_detected_at,
+            },
             "restore_diagnosis": restore_diagnosis,
             "restore_attempts": [{"id": attempt.id, "job_id": attempt.job_id, "region": attempt.aws_region, "status": attempt.job_status,
                                   "expected": attempt.expected_objects, "succeeded": attempt.succeeded_objects, "failed": attempt.failed_objects,
@@ -5378,9 +5395,15 @@ def queue_all_planned_waves(source_id: int, session: Session = Depends(get_sessi
 
 
 @app.post("/api/waves/{wave_id}/reprocess")
-def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
+def reprocess_wave(wave_id: int, payload: WaveReprocessRequest | None = None, session: Session = Depends(get_session)) -> dict:
     """Queue a new controlled restore submission; no external call is made here."""
     wave = wave_or_404(session, wave_id)
+    if wave.restore_reapproval_required and not (payload and payload.approve_new_restore):
+        raise HTTPException(
+            status_code=409,
+            detail=("A temporary restored copy is no longer available. A new restore may incur AWS charges; "
+                    "review the wave report and explicitly approve the new restore before reprocessing."),
+        )
     if wave.status == "PAUSED":
         raise HTTPException(status_code=409, detail="Resume the wave before reprocessing it")
     queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
@@ -5391,7 +5414,7 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
                                    job_status=wave.batch_job_status, manifest_key=wave.manifest_key,
                                    manifest_etag=wave.manifest_etag, expected_objects=session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id)) or 0,
                                    failure_summary="Historic Batch job retained while starting a new restore attempt"))
-    reset_states = [ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING]
+    reset_states = [ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED, ObjectState.RESTORING, ObjectState.RESTORED, ObjectState.TRANSFERRING]
     for obj in session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id, ObjectRecord.state.in_(reset_states))):
         obj.state, obj.restored_at = ObjectState.WAVE_ASSIGNED, None
     wave.status, wave.batch_job_id, wave.batch_job_status = "READY_FOR_RESTORE", None, None
@@ -5399,6 +5422,8 @@ def reprocess_wave(wave_id: int, session: Session = Depends(get_session)) -> dic
     wave.availability_head_requests, wave.availability_poll_elapsed_seconds = 0, 0
     wave.availability_throttle_retries = 0
     wave.last_availability_poll_objects, wave.last_availability_poll_seconds = 0, 0
+    wave.restore_reapproval_required, wave.restore_reapproval_reason = False, None
+    wave.restore_reapproval_detected_at = None
     session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
     record_event(session, "WAVE_REPROCESS_QUEUED", f"New restore submission queued for wave '{wave.name}' by operator", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
