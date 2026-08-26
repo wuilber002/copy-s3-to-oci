@@ -17,6 +17,8 @@ Este guia é a referência canônica para preparar uma conta AWS para uma conex�
 
 O operador cria os recursos AWS. O Terraform OCI não cria recursos na AWS.
 
+> **Valores a substituir:** todo texto entre sinais de menor e maior, como `<AWS_ACCOUNT_ID>`, é obrigatório e deve ser substituído pelo valor do cliente antes de aplicar a policy. Não altere nomes de ações AWS, efeitos, conditions ou principals de serviço.
+
 ## 2. Convenções recomendadas
 
 Use nomes previsíveis e únicos por conta:
@@ -45,6 +47,19 @@ BATCH_ROLE            = oracle-s3-batch-restore-role
 
 Para migrar o bucket inteiro, deixe `SOURCE_PREFIX` vazio e adapte os ARNs de objeto para `arn:aws:s3:::SOURCE_BUCKET/*`. Para vários prefixos, inclua somente os prefixos aprovados nas conditions e nos ARNs; não amplie para o bucket inteiro por conveniência.
 
+Nos exemplos JSON abaixo, use:
+
+| Placeholder | Valor a informar |
+|---|---|
+| `<AWS_ACCOUNT_ID>` | ID numérico da conta AWS, com 12 dígitos. |
+| `<BOOTSTRAP_USER>` | Nome do usuário IAM bootstrap. Exemplo: `oracle-bootstrap-prod`. |
+| `<MIGRATION_ROLE>` | Nome da role de migração. Exemplo: `oracle-s3-migration-role`. |
+| `<BATCH_ROLE>` | Nome da role S3 Batch Operations. Exemplo: `oracle-s3-batch-restore-role`. |
+| `<SOURCE_BUCKET>` | Nome do bucket S3 de origem, sem `s3://`. |
+| `<SOURCE_PREFIX>` | Prefixo aprovado, normalmente terminado em `/`. |
+| `<CONTROL_BUCKET>` | Nome do bucket S3 de controle, sem `s3://`. |
+| `<CONTROL_PREFIX>` | Prefixo exclusivo para artefatos do ODMT. Recomendação: `oracle/`. |
+
 ## 3. Criar e proteger o bucket de controle
 
 O bucket de controle não recebe dados de negócio; recebe manifestos CSV, relatórios de conclusão e evidências operacionais. Ainda assim, é parte do trilho de auditoria e deve ser tratado como dado operacional sensível.
@@ -59,12 +74,12 @@ O bucket de controle não recebe dados de negócio; recebe manifestos CSV, relat
 Exemplo AWS CLI:
 
 ```bash
-aws s3api create-bucket --bucket oracle-control-123456789012-us-east-1 --region us-east-1
-aws s3api put-public-access-block --bucket oracle-control-123456789012-us-east-1 \
+aws s3api create-bucket --bucket "<CONTROL_BUCKET>" --region "<AWS_REGION>"
+aws s3api put-public-access-block --bucket "<CONTROL_BUCKET>" \
   --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-aws s3api put-bucket-ownership-controls --bucket oracle-control-123456789012-us-east-1 \
+aws s3api put-bucket-ownership-controls --bucket "<CONTROL_BUCKET>" \
   --ownership-controls 'Rules=[{ObjectOwnership=BucketOwnerEnforced}]'
-aws s3api put-bucket-versioning --bucket oracle-control-123456789012-us-east-1 \
+aws s3api put-bucket-versioning --bucket "<CONTROL_BUCKET>" \
   --versioning-configuration Status=Enabled
 ```
 
@@ -78,6 +93,8 @@ O bootstrap user só pode chamar `sts:AssumeRole` para a role de migração. Nã
 4. Anexe a policy inline abaixo, substituindo conta e role.
 5. Armazene o access key ID e secret access key exclusivamente no Secret OCI da conexão.
 
+Substitua no JSON: `<AWS_ACCOUNT_ID>` pelo ID da conta e `<MIGRATION_ROLE>` pelo nome da role criada na próxima seção.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -86,7 +103,7 @@ O bootstrap user só pode chamar `sts:AssumeRole` para a role de migração. Nã
       "Sid": "AssumeOnlyOracleMigrationRole",
       "Effect": "Allow",
       "Action": "sts:AssumeRole",
-      "Resource": "arn:aws:iam::123456789012:role/oracle-s3-migration-role"
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/<MIGRATION_ROLE>"
     }
   ]
 }
@@ -101,6 +118,8 @@ O bootstrap user só pode chamar `sts:AssumeRole` para a role de migração. Nã
 3. Cole o documento abaixo, trocando conta e usuário bootstrap.
 4. Configure duração máxima de sessão de 1 hora como padrão inicial. A operação re-assume a role quando necessário.
 
+Substitua no JSON: `<AWS_ACCOUNT_ID>` e `<BOOTSTRAP_USER>`. O principal deve ser o usuário IAM criado na seção anterior.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -109,7 +128,7 @@ O bootstrap user só pode chamar `sts:AssumeRole` para a role de migração. Nã
       "Sid": "TrustOnlyOracleBootstrapUser",
       "Effect": "Allow",
       "Principal": {
-        "AWS": "arn:aws:iam::123456789012:user/oracle-bootstrap-prod"
+        "AWS": "arn:aws:iam::<AWS_ACCOUNT_ID>:user/<BOOTSTRAP_USER>"
       },
       "Action": "sts:AssumeRole"
     }
@@ -127,6 +146,12 @@ Anexe a policy inline abaixo. Ela cobre o fluxo atualmente usado pelo worker rea
 - criação e consulta do S3 Batch Operations job;
 - `iam:PassRole` limitado ao serviço S3 Batch Operations.
 
+Substitua somente estes valores no JSON:
+
+- `<SOURCE_BUCKET>` e `<SOURCE_PREFIX>` pelo bucket e prefixo que serão cadastrados como source;
+- `<CONTROL_BUCKET>` e `<CONTROL_PREFIX>` pelo bucket e prefixo de artefatos da conexão;
+- `<AWS_ACCOUNT_ID>` e `<BATCH_ROLE>` pelo destino correto do `iam:PassRole`.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -138,12 +163,12 @@ Anexe a policy inline abaixo. Ela cobre o fluxo atualmente usado pelo worker rea
         "s3:ListBucket",
         "s3:GetBucketLocation"
       ],
-      "Resource": "arn:aws:s3:::customer-finance-archive",
+      "Resource": "arn:aws:s3:::<SOURCE_BUCKET>",
       "Condition": {
         "StringLike": {
           "s3:prefix": [
-            "production/finance/",
-            "production/finance/*"
+            "<SOURCE_PREFIX>",
+            "<SOURCE_PREFIX>*"
           ]
         }
       }
@@ -157,7 +182,7 @@ Anexe a policy inline abaixo. Ela cobre o fluxo atualmente usado pelo worker rea
         "s3:GetObjectTagging",
         "s3:GetObjectVersionTagging"
       ],
-      "Resource": "arn:aws:s3:::customer-finance-archive/production/finance/*"
+      "Resource": "arn:aws:s3:::<SOURCE_BUCKET>/<SOURCE_PREFIX>*"
     },
     {
       "Sid": "ReadAndWriteOracleControlArtifacts",
@@ -166,7 +191,7 @@ Anexe a policy inline abaixo. Ela cobre o fluxo atualmente usado pelo worker rea
         "s3:ListBucket",
         "s3:GetBucketLocation"
       ],
-      "Resource": "arn:aws:s3:::oracle-control-123456789012-us-east-1"
+      "Resource": "arn:aws:s3:::<CONTROL_BUCKET>"
     },
     {
       "Sid": "ReadAndWriteOracleControlPrefix",
@@ -176,7 +201,7 @@ Anexe a policy inline abaixo. Ela cobre o fluxo atualmente usado pelo worker rea
         "s3:GetObjectVersion",
         "s3:PutObject"
       ],
-      "Resource": "arn:aws:s3:::oracle-control-123456789012-us-east-1/oracle/*"
+      "Resource": "arn:aws:s3:::<CONTROL_BUCKET>/<CONTROL_PREFIX>*"
     },
     {
       "Sid": "CreateAndInspectOwnBatchJobs",
@@ -191,7 +216,7 @@ Anexe a policy inline abaixo. Ela cobre o fluxo atualmente usado pelo worker rea
       "Sid": "PassOnlyTheOracleBatchRoleToS3Batch",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::123456789012:role/oracle-s3-batch-restore-role",
+      "Resource": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/<BATCH_ROLE>",
       "Condition": {
         "StringEquals": {
           "iam:PassedToService": "batchoperations.s3.amazonaws.com"
@@ -228,6 +253,8 @@ Essa role é assumida pelo serviço AWS S3 Batch Operations, não pelo bootstrap
 
 ### 6.2 Policy mínima da role Batch
 
+Substitua no JSON: `<SOURCE_BUCKET>`, `<SOURCE_PREFIX>`, `<CONTROL_BUCKET>` e `<CONTROL_PREFIX>`. Eles devem ser idênticos aos valores usados na policy da role de migração.
+
 ```json
 {
   "Version": "2012-10-17",
@@ -236,7 +263,7 @@ Essa role é assumida pelo serviço AWS S3 Batch Operations, não pelo bootstrap
       "Sid": "RestoreApprovedSourceObjects",
       "Effect": "Allow",
       "Action": "s3:RestoreObject",
-      "Resource": "arn:aws:s3:::customer-finance-archive/production/finance/*"
+      "Resource": "arn:aws:s3:::<SOURCE_BUCKET>/<SOURCE_PREFIX>*"
     },
     {
       "Sid": "ReadOracleManifest",
@@ -245,13 +272,13 @@ Essa role é assumida pelo serviço AWS S3 Batch Operations, não pelo bootstrap
         "s3:GetObject",
         "s3:GetObjectVersion"
       ],
-      "Resource": "arn:aws:s3:::oracle-control-123456789012-us-east-1/oracle/*"
+      "Resource": "arn:aws:s3:::<CONTROL_BUCKET>/<CONTROL_PREFIX>*"
     },
     {
       "Sid": "WriteBatchCompletionReport",
       "Effect": "Allow",
       "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::oracle-control-123456789012-us-east-1/oracle/*"
+      "Resource": "arn:aws:s3:::<CONTROL_BUCKET>/<CONTROL_PREFIX>*"
     }
   ]
 }
@@ -261,7 +288,7 @@ Valide que o completion report é habilitado pelo job. O ODMT grava e lê os art
 
 ## 7. S3 Inventory (recomendado para inventários grandes)
 
-Para sources com mais de 1 milhão de objetos, prefira S3 Inventory em vez de discovery remoto por API. O ODMT importa CSV UTF-8, opcionalmente GZIP, e somente precisa ler o prefixo de entrega; não precisa criar nem alterar a configuração de Inventory.
+Para sources com mais de 1 milhão de objetos, prefira S3 Inventory em vez de discovery remoto por API. O ODMT importa CSV UTF-8, opcionalmente GZIP, e somente precisa ler o prefixo de entrega; não precisa criar nem alterar a configuração de Inventory. Alternativamente, o operador pode enviar manualmente um inventário compatível pela interface.
 
 1. No bucket de origem, abra **Management → Inventory configurations → Create inventory configuration**.
 2. Nome sugerido: `oracle-daily-inventory`.
@@ -271,6 +298,8 @@ Para sources com mais de 1 milhão de objetos, prefira S3 Inventory em vez de di
 6. Conceda ao serviço S3 permissão de escrita no bucket de destino. Restrinja a policy por `aws:SourceAccount` e `aws:SourceArn`.
 7. Na role de migração, adicione somente leitura do prefixo de entrega:
 
+Substitua `<INVENTORY_BUCKET>` e `<INVENTORY_PREFIX>` pelo bucket e prefixo de entrega configurados no S3 Inventory.
+
 ```json
 {
   "Sid": "ReadApprovedInventoryDeliveryPrefix",
@@ -279,7 +308,7 @@ Para sources com mais de 1 milhão de objetos, prefira S3 Inventory em vez de di
     "s3:GetObject",
     "s3:GetObjectVersion"
   ],
-  "Resource": "arn:aws:s3:::customer-inventory-reports/oracle/customer-finance-archive/*"
+  "Resource": "arn:aws:s3:::<INVENTORY_BUCKET>/<INVENTORY_PREFIX>*"
 }
 ```
 
@@ -306,17 +335,19 @@ Depois de criar os recursos AWS:
 5. Em **Configurações → AWS connections**, execute **Refresh OCI Secrets**, escolha a Secret compatível e registre a conexão.
 6. Execute **Pre-check** antes de criar uma source.
 
+Substitua todos os valores entre `<...>`. `connection_name` é o rótulo imutável exibido ao operador; não é usado como identificador interno.
+
 ```json
 {
   "schema_version": "1",
-  "connection_name": "Financeiro Produção",
-  "aws_account_id": "123456789012",
-  "default_region": "us-east-1",
-  "bootstrap_access_key_id": "AKIA...",
-  "bootstrap_secret_access_key": "substitua-por-um-segredo",
-  "migration_role_arn": "arn:aws:iam::123456789012:role/oracle-s3-migration-role",
-  "batch_operations_role_arn": "arn:aws:iam::123456789012:role/oracle-s3-batch-restore-role",
-  "control_bucket": "oracle-control-123456789012-us-east-1"
+  "connection_name": "<CONNECTION_LABEL>",
+  "aws_account_id": "<AWS_ACCOUNT_ID>",
+  "default_region": "<AWS_REGION>",
+  "bootstrap_access_key_id": "<BOOTSTRAP_ACCESS_KEY_ID>",
+  "bootstrap_secret_access_key": "<BOOTSTRAP_SECRET_ACCESS_KEY>",
+  "migration_role_arn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/<MIGRATION_ROLE>",
+  "batch_operations_role_arn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/<BATCH_ROLE>",
+  "control_bucket": "<CONTROL_BUCKET>"
 }
 ```
 
@@ -329,7 +360,7 @@ Execute esses comandos a partir de uma estação autorizada, usando o perfil do 
 ```bash
 aws sts get-caller-identity
 aws sts assume-role \
-  --role-arn arn:aws:iam::123456789012:role/oracle-s3-migration-role \
+  --role-arn arn:aws:iam::<AWS_ACCOUNT_ID>:role/<MIGRATION_ROLE> \
   --role-session-name oracle-precheck
 ```
 
@@ -337,11 +368,11 @@ Com as credenciais temporárias retornadas, valide apenas o escopo aprovado:
 
 ```bash
 aws s3api list-objects-v2 \
-  --bucket customer-finance-archive \
-  --prefix production/finance/ \
+  --bucket "<SOURCE_BUCKET>" \
+  --prefix "<SOURCE_PREFIX>" \
   --max-keys 1
 
-aws s3api head-bucket --bucket oracle-control-123456789012-us-east-1
+aws s3api head-bucket --bucket "<CONTROL_BUCKET>"
 ```
 
 No ODMT, o **Pre-check** valida identidade AWS e AssumeRole sem listar, restaurar ou copiar objetos. Antes de produção, registre a aprovação das policies, o prefixo autorizado, o bucket de controle e o resultado do pre-check.
