@@ -1,19 +1,19 @@
-# AWS setup — padrão empresarial do Oracle Data Migration Tool
+# AWS setup — padrão empresarial
 
-Este guia é a referência canônica para preparar uma conta AWS para uma conexão do **Oracle Data Migration Tool (ODMT)**. O objetivo é conceder o **menor privilégio possível** para descobrir objetos, solicitar restores via S3 Batch Operations, transferir o conteúdo e manter evidências no bucket de controle.
+Este guia é a referência canônica para preparar uma conta AWS para uma conexão de migração. O objetivo é conceder o **menor privilégio possível** para descobrir objetos, solicitar restores via S3 Batch Operations, transferir o conteúdo e manter evidências no bucket de controle.
 
-> Não forneça credenciais root, não use `AdministratorAccess` e não reutilize a mesma credencial em contas AWS diferentes. Crie uma conexão ODMT por conta AWS; cada conexão usa um bucket de controle exclusivo.
+> Não forneça credenciais root, não use `AdministratorAccess` e não reutilize a mesma credencial em contas AWS diferentes. Crie uma conexão por conta AWS; cada conexão usa um bucket de controle exclusivo.
 
 ## 1. Arquitetura e responsabilidades
 
 | Componente | Responsabilidade | Criado por |
 |---|---|---|
-| Usuário bootstrap | Assume a role de migração. Sua access key/secret é o único segredo AWS entregue ao ODMT. | Cliente AWS |
+| Usuário bootstrap | Assume a role de migração. Sua access key/secret é o único segredo AWS entregue à aplicação. | Cliente AWS |
 | Role de migração | Discovery, leitura de objetos, leitura/gravação de artefatos de controle e criação/consulta de jobs Batch. | Cliente AWS |
 | Role S3 Batch Operations | Executa `RestoreObject` nos objetos do escopo e grava o completion report. | Cliente AWS |
 | Bucket de controle | Armazena manifestos, completion reports e evidências da conexão. | Cliente AWS |
 | Bucket de origem | Contém os objetos que serão descobertos e migrados. | Cliente AWS |
-| Secret OCI | Guarda o JSON da conexão; nunca é exibido pelo ODMT. | Cliente OCI |
+| Secret OCI | Guarda o JSON da conexão; nunca é exibido pela aplicação. | Cliente OCI |
 
 O operador cria os recursos AWS. O Terraform OCI não cria recursos na AWS.
 
@@ -43,9 +43,9 @@ Esta é a ficha de parâmetros da conexão. Preencha ou anote os valores abaixo 
 | `<SOURCE_BUCKET>` | Nome do bucket S3 de origem, sem `s3://`. | `customer-finance-archive` |
 | `<SOURCE_PREFIX>` | Prefixo S3 aprovado para a source; termine com `/` quando for uma pasta lógica. | `production/finance/` |
 | `<CONTROL_BUCKET>` | Nome do bucket de controle da conexão, sem `s3://`. | `oracle-control-bucket-us-east-1` |
-| `<CONTROL_PREFIX>` | Prefixo exclusivo dos artefatos do ODMT dentro do bucket de controle. | `oracle/` |
+| `<CONTROL_PREFIX>` | Prefixo exclusivo dos artefatos da conexão dentro do bucket de controle. | `oracle/` |
 | `<BOOTSTRAP_USER>` | Nome do usuário IAM que terá a access key usada pela conexão. | `oracle-bootstrap-prod` |
-| `<MIGRATION_ROLE>` | Nome da role assumida pelo ODMT para operar a source. | `oracle-s3-migration-role` |
+| `<MIGRATION_ROLE>` | Nome da role de operação da source. | `oracle-s3-migration-role` |
 | `<BATCH_ROLE>` | Nome da role assumida pelo S3 Batch Operations para restores. | `oracle-s3-batch-restore-role` |
 
 Para migrar o bucket inteiro, deixe `SOURCE_PREFIX` vazio e adapte os ARNs de objeto para `arn:aws:s3:::SOURCE_BUCKET/*`. Para vários prefixos, inclua somente os prefixos aprovados nas conditions e nos ARNs; não amplie para o bucket inteiro por conveniência.
@@ -134,7 +134,7 @@ Anexe a policy inline abaixo. Ela cobre o fluxo atualmente usado pelo worker rea
 
 - `ListObjectsV2` no discovery remoto e leitura dos artefatos de controle;
 - `HeadObject`, `GetObject` e range GET durante polling, transferência e retomada multipart;
-- tags, somente quando a preservação de tags estiver habilitada no ODMT;
+- tags, somente quando a preservação de tags estiver habilitada na aplicação;
 - criação e consulta do S3 Batch Operations job;
 - `iam:PassRole` limitado ao serviço S3 Batch Operations.
 
@@ -219,7 +219,7 @@ Substitua somente estes valores no JSON:
 }
 ```
 
-Se tags não forem preservadas, remova as duas ações `GetObject*Tagging`. Não inclua `s3:ListJobs`, `s3:UpdateJobPriority`, `s3:UpdateJobStatus`, `s3:*` ou `Resource: "*"` em S3 apenas para facilitar diagnóstico: eles não são necessários ao fluxo do ODMT.
+Se tags não forem preservadas, remova as duas ações `GetObject*Tagging`. Não inclua `s3:ListJobs`, `s3:UpdateJobPriority`, `s3:UpdateJobStatus`, `s3:*` ou `Resource: "*"` em S3 apenas para facilitar diagnóstico: eles não são necessários ao fluxo da aplicação.
 
 ## 6. Criar a role do S3 Batch Operations
 
@@ -276,11 +276,11 @@ Substitua no JSON: `<SOURCE_BUCKET>`, `<SOURCE_PREFIX>`, `<CONTROL_BUCKET>` e `<
 }
 ```
 
-Valide que o completion report é habilitado pelo job. O ODMT grava e lê os artefatos em `oracle/`; não use um bucket público para manifestos ou relatórios.
+Valide que o completion report é habilitado pelo job. A aplicação grava e lê os artefatos em `oracle/`; não use um bucket público para manifestos ou relatórios.
 
 ## 7. S3 Inventory (recomendado para inventários grandes)
 
-Para sources com mais de 1 milhão de objetos, prefira S3 Inventory em vez de discovery remoto por API. O ODMT importa CSV UTF-8, opcionalmente GZIP, e somente precisa ler o prefixo de entrega; não precisa criar nem alterar a configuração de Inventory. Alternativamente, o operador pode enviar manualmente um inventário compatível pela interface.
+Para sources com mais de 1 milhão de objetos, prefira S3 Inventory em vez de discovery remoto por API. A aplicação importa CSV UTF-8, opcionalmente GZIP, e somente precisa ler o prefixo de entrega; não precisa criar nem alterar a configuração de Inventory. Alternativamente, o operador pode enviar manualmente um inventário compatível pela interface.
 
 1. No bucket de origem, abra **Management → Inventory configurations → Create inventory configuration**.
 2. Nome sugerido: `oracle-daily-inventory`.
@@ -304,7 +304,7 @@ Substitua `<INVENTORY_BUCKET>` e `<INVENTORY_PREFIX>` pelo bucket e prefixo de e
 }
 ```
 
-O primeiro relatório não é imediato; aguarde a primeira entrega S3 antes de importar. Não conceda `s3:PutInventoryConfiguration` ao ODMT.
+O primeiro relatório não é imediato; aguarde a primeira entrega S3 antes de importar. Não conceda `s3:PutInventoryConfiguration` à aplicação.
 
 ## 8. Acesso entre contas AWS (opcional)
 
@@ -321,7 +321,7 @@ Não substitua os ARNs de objeto por `bucket/*` se a source aprovada for somente
 Depois de criar os recursos AWS:
 
 1. No Vault OCI, crie/atualize uma Secret com o JSON da conexão.
-2. Use `connection_name` como etiqueta imutável e amigável; o ODMT usa IDs internos para vínculos e histórico.
+2. Use `connection_name` como etiqueta imutável e amigável; a aplicação usa IDs internos para vínculos e histórico.
 3. Informe o `aws_account_id` correto. Ele é validado no pre-check.
 4. Use um `control_bucket` exclusivo para essa conta/conexão.
 5. Em **Configurações → AWS connections**, execute **Refresh OCI Secrets**, escolha a Secret compatível e registre a conexão.
@@ -343,7 +343,7 @@ Substitua todos os valores entre `<...>`. `connection_name` é o rótulo imutáv
 }
 ```
 
-Nunca envie o JSON a chat, e-mail, Git, logs ou navegador. O ODMT não exibe nem persiste os dois campos de credencial.
+Nunca envie o JSON a chat, e-mail, Git, logs ou navegador. A aplicação não exibe nem persiste os dois campos de credencial.
 
 ## 10. Validação operacional
 
@@ -367,7 +367,7 @@ aws s3api list-objects-v2 \
 aws s3api head-bucket --bucket "<CONTROL_BUCKET>"
 ```
 
-No ODMT, o **Pre-check** valida identidade AWS e AssumeRole sem listar, restaurar ou copiar objetos. Antes de produção, registre a aprovação das policies, o prefixo autorizado, o bucket de controle e o resultado do pre-check.
+O **Pre-check** valida identidade AWS e AssumeRole sem listar, restaurar ou copiar objetos. Antes de produção, registre a aprovação das policies, o prefixo autorizado, o bucket de controle e o resultado do pre-check.
 
 Checklist mínimo:
 
