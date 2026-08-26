@@ -28,7 +28,7 @@ Use nomes previsíveis e únicos por conta:
 | Usuário bootstrap | `oracle-bootstrap-prod` |
 | Role de migração | `oracle-s3-migration-role` |
 | Role Batch | `oracle-s3-batch-restore-role` |
-| Bucket de controle | `oracle-control-123456789012-us-east-1` |
+| Bucket de controle | `oracle-control-bucket-us-east-1` |
 | Prefixo de controle da conexão | `oracle/connections/<connection-id>/` |
 | Prefixo de uma source | `production/finance/` |
 
@@ -39,13 +39,15 @@ AWS_ACCOUNT_ID        = 123456789012
 AWS_REGION            = us-east-1
 SOURCE_BUCKET         = customer-finance-archive
 SOURCE_PREFIX         = production/finance/
-CONTROL_BUCKET        = oracle-control-123456789012-us-east-1
+CONTROL_BUCKET        = oracle-control-bucket-us-east-1
 BOOTSTRAP_USER        = oracle-bootstrap-prod
 MIGRATION_ROLE        = oracle-s3-migration-role
 BATCH_ROLE            = oracle-s3-batch-restore-role
 ```
 
 Para migrar o bucket inteiro, deixe `SOURCE_PREFIX` vazio e adapte os ARNs de objeto para `arn:aws:s3:::SOURCE_BUCKET/*`. Para vários prefixos, inclua somente os prefixos aprovados nas conditions e nos ARNs; não amplie para o bucket inteiro por conveniência.
+
+O nome de bucket S3 é globalmente único. Use `oracle-control-bucket-us-east-1` quando estiver disponível; se já existir em outra conta AWS, preserve esse padrão e acrescente um sufixo corporativo aprovado, por exemplo `oracle-control-bucket-us-east-1-<AWS_ACCOUNT_ID>`.
 
 Nos exemplos JSON abaixo, use:
 
