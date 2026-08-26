@@ -137,6 +137,23 @@ def classify_task_error(error: Exception) -> tuple[str, str]:
     return "failed", summary
 
 
+def restored_object_is_unavailable(error: Exception) -> bool:
+    """Return whether a transfer hit an expired/unavailable restored copy.
+
+    ``InvalidObjectState`` is the S3 response for an archived object that is
+    not currently restored.  It is deliberately narrower than generic 4xx
+    errors: permissions, deleted keys and malformed requests must remain
+    independently actionable and must never be misrepresented as a billable
+    restore re-approval.
+    """
+    if isinstance(error, SimulatorTransportError):
+        return "HTTP 409" in str(error)
+    if isinstance(error, ClientError):
+        code = ((error.response or {}).get("Error") or {}).get("Code")
+        return code in {"InvalidObjectState", "RestoreNotAvailable"}
+    return False
+
+
 def event(session, kind: str, message: str, source_id: int | None = None, wave_id: int | None = None) -> None:
     session.add(Event(kind=kind, message=message, source_id=source_id, wave_id=wave_id))
 
@@ -2060,8 +2077,7 @@ def _transfer_wave(session, task: Task, settings) -> None:
                 except Exception as error:
                     errors.append(error)
         if errors:
-            unavailable = next((error for error in errors if isinstance(error, SimulatorTransportError)
-                                and "HTTP 409" in str(error)), None)
+            unavailable = next((error for error in errors if restored_object_is_unavailable(error)), None)
             if unavailable is not None:
                 require_new_restore_approval(session, wave, str(unavailable))
                 raise RestoreReapprovalRequired(

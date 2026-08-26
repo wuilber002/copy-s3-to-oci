@@ -4,6 +4,8 @@ import os
 from datetime import timedelta
 from pathlib import Path
 
+from botocore.exceptions import ClientError
+
 
 # The worker imports the application module. These values make that import
 # deterministic in CI; these unit tests never open a database connection.
@@ -17,6 +19,7 @@ from app.real_worker import (
     AWS_CLIENT_CONFIG,
     batch_manifest_fields,
     classify_task_error,
+    restored_object_is_unavailable,
     WORKER_ID,
     effective_multipart_part_size,
     expected_part_size,
@@ -135,3 +138,16 @@ def test_unknown_worker_errors_fail_instead_of_looping_indefinitely():
     disposition, summary = classify_task_error(ValueError("bad local configuration"))
     assert disposition == "failed"
     assert "ValueError" in summary
+
+
+def test_only_expired_archived_object_errors_require_restore_reapproval():
+    unavailable = ClientError(
+        {"Error": {"Code": "InvalidObjectState"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+        "GetObject",
+    )
+    denied = ClientError(
+        {"Error": {"Code": "AccessDenied"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+        "GetObject",
+    )
+    assert restored_object_is_unavailable(unavailable)
+    assert not restored_object_is_unavailable(denied)
