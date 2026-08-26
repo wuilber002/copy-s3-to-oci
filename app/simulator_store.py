@@ -506,12 +506,11 @@ class SimulatorStore:
         return virtual + timedelta(seconds=(current - anchor).total_seconds() * clock.acceleration)
 
     def pause_running_clocks_after_startup(self) -> int:
-        """Fail-safe recovery for both accelerated clocks and in-flight holds.
+        """Recover orphaned phase holds without pausing the scenario clock.
 
-        A phase hold belongs to a live worker process.  After a restart that
-        process no longer exists, therefore preserving the hold would freeze a
-        scenario forever.  Convert its frozen virtual instant into a manual
-        pause and clear the orphaned reference count.
+        A phase hold belongs to a live worker process. After a restart it is
+        orphaned and must be cleared, but a simulator/API restart must not
+        silently change an actively running scenario into a manual pause.
         """
         self.require_current_schema()
         changed = 0
@@ -520,10 +519,15 @@ class SimulatorStore:
             now = datetime.now(timezone.utc)
             for clock in clocks:
                 current = self._clock_now(clock, now)
-                if not clock.paused or int(clock.hold_count or 0) > 0:
+                if int(clock.hold_count or 0) > 0:
                     changed += 1
-                clock.paused_virtual_at = current
-                clock.paused = True
+                    # Continue from the exact held instant after releasing
+                    # the orphaned hold. A manually paused scenario remains
+                    # paused; a running one remains running.
+                    if clock.paused:
+                        clock.paused_virtual_at = current
+                    else:
+                        clock.virtual_anchor_at, clock.real_anchor_at = current, now
                 clock.hold_count, clock.held_virtual_at = 0, None
             session.commit()
         return changed

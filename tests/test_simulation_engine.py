@@ -87,7 +87,9 @@ def test_startup_recovers_an_orphaned_phase_hold(virtual_cloud):
     assert store.clock_status(execution.id)["held"]
     assert store.pause_running_clocks_after_startup() >= 1
     recovered = store.clock_status(execution.id)
-    assert recovered["paused"] and not recovered["held"]
+    # Restart recovery releases only the orphaned worker hold.  It must not
+    # silently pause an actively running scenario clock.
+    assert not recovered["paused"] and not recovered["held"]
 
 
 def test_control_network_profile_uses_virtual_time_for_degradation_and_outage():

@@ -136,6 +136,7 @@ class TaskState(StrEnum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 ARCHIVE_STORAGE_CLASSES = {
@@ -2654,9 +2655,10 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
     now = utcnow()
     transfer_kinds = ("SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "TRANSFER_WAVE")
     tasks = list(session.scalars(
-        select(Task).join(Wave).where(
+        select(Task).join(Wave).join(Source).where(
             Task.kind.in_(transfer_kinds), Task.state.in_([TaskState.READY, TaskState.RUNNING]),
             Wave.status != "PAUSED",
+            Source.archived_at.is_(None),
         ).order_by(Task.available_at, Task.id)
     ))
     # At most one current task represents each wave.  Prefer a running task
@@ -3566,6 +3568,58 @@ def delete_unexecuted_source_data(session: Session, source_id: int) -> dict[str,
     return deleted
 
 
+def cancel_active_wave_tasks(session: Session, wave: Wave, reason: str) -> int:
+    """Durably remove pending work for an operator-paused wave.
+
+    A wave state alone is not enough: queued tasks survive restarts and used
+    to remain visible after a source had been archived.  Cancellation keeps
+    the immutable task record while making it ineligible for every worker.
+    """
+    tasks = list(session.scalars(select(Task).where(
+        Task.wave_id == wave.id,
+        Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+    )))
+    for task in tasks:
+        task.state = TaskState.CANCELLED
+        task.worker_id = None
+        task.lease_expires_at = None
+        task.error = f"Cancelled: {reason}"
+    return len(tasks)
+
+
+def deactivate_archived_source_work(session: Session, source: Source, reason: str) -> int:
+    """Stop all executable control-plane work owned by an archived source."""
+    cancelled = 0
+    terminal = {"COMPLETED", "VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"}
+    for wave in session.scalars(select(Wave).where(Wave.source_id == source.id)):
+        cancelled += cancel_active_wave_tasks(session, wave, reason)
+        if wave.status not in terminal:
+            wave.status = "PAUSED"
+    for job in session.scalars(select(DiscoveryJob).where(
+        DiscoveryJob.source_id == source.id,
+        DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
+    )):
+        job.state, job.worker_id, job.lease_expires_at = TaskState.CANCELLED, None, None
+        job.error = f"Cancelled: {reason}"
+        cancelled += 1
+    for run in session.scalars(select(DynamicPipelineRun).where(
+        DynamicPipelineRun.source_id == source.id,
+        DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
+    )):
+        run.status = "HISTORICAL"
+        run.scheduled_restores = False
+        run.completed_at = run.completed_at or utcnow()
+    return cancelled
+
+
+def reconcile_archived_source_work(session: Session) -> int:
+    """Backstop for sources archived by an earlier Raijin release."""
+    cancelled = 0
+    for source in session.scalars(select(Source).where(Source.archived_at.is_not(None))):
+        cancelled += deactivate_archived_source_work(session, source, "source is archived")
+    return cancelled
+
+
 @app.delete("/api/sources/{source_id}")
 def delete_source(source_id: int, session: Session = Depends(get_session)) -> dict:
     source = source_or_404(session, source_id)
@@ -3588,10 +3642,9 @@ def archive_source(source_id: int, session: Session = Depends(get_session)) -> d
     source = source_or_404(session, source_id)
     if not source_has_executed_wave(session, source_id):
         raise HTTPException(status_code=409, detail="A source without an executed wave must be deleted, not archived")
-    for wave in session.scalars(select(Wave).where(Wave.source_id == source_id, Wave.status.not_in(["COMPLETED", "VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS", "VERIFICATION_FAILED"]))):
-        wave.status = "PAUSED"
+    cancelled = deactivate_archived_source_work(session, source, "source archived by operator")
     source.archived_at, source.status = utcnow(), "ARCHIVED"
-    record_event(session, "SOURCE_ARCHIVED", f"Source '{source.name}' archived; historical data retained", source_id=source.id)
+    record_event(session, "SOURCE_ARCHIVED", f"Source '{source.name}' archived; {cancelled} pending task(s) cancelled and historical data retained", source_id=source.id)
     session.commit()
     return {"id": source.id, "status": source.status, "archived_at": source.archived_at}
 
@@ -5115,8 +5168,9 @@ def pause_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
     if wave.status == "PAUSED":
         return {"wave_id": wave.id, "status": wave.status}
+    cancelled = cancel_active_wave_tasks(session, wave, "wave paused by operator")
     wave.status = "PAUSED"
-    record_event(session, "WAVE_PAUSED", f"Wave '{wave.name}' paused by operator", source_id=wave.source_id, wave_id=wave.id)
+    record_event(session, "WAVE_PAUSED", f"Wave '{wave.name}' paused by operator; {cancelled} pending task(s) cancelled", source_id=wave.source_id, wave_id=wave.id)
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
@@ -5302,7 +5356,9 @@ def claim_task(payload: ClaimRequest, session: Session = Depends(get_session)) -
     now = utcnow()
     expired = Task.state == TaskState.RUNNING
     available = (Task.state == TaskState.READY) | (expired & (Task.lease_expires_at < now))
-    task = session.scalar(select(Task).join(Wave).where(available, Task.available_at <= now, Wave.status != "PAUSED").order_by(Task.available_at, Task.id).with_for_update(skip_locked=True).limit(1))
+    task = session.scalar(select(Task).join(Wave).join(Source).where(
+        available, Task.available_at <= now, Wave.status != "PAUSED", Source.archived_at.is_(None)
+    ).order_by(Task.available_at, Task.id).with_for_update(skip_locked=True).limit(1))
     if not task:
         return None
     task.state = TaskState.RUNNING

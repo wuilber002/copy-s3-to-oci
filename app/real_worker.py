@@ -13,6 +13,7 @@ import gzip
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import socket
@@ -51,7 +52,7 @@ from app.simulator_admin import SimulatorAdminClient
 from app.simulator_ports import SimulatedDestinationPort, SimulatedSourcePort, SimulatorTransportError
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows, source_key_in_scope, source_prefix_values,
-    DynamicPipelineRun, Wave, cloud_backend, materialize_dynamic_pipeline_horizon, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_context, runtime_settings, utcnow,
+    DynamicPipelineRun, Wave, cloud_backend, materialize_dynamic_pipeline_horizon, parse_aws_connection_payload, read_oci_runtime_config, reconcile_archived_source_work, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_context, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -249,7 +250,9 @@ def claim_task(session, lease_seconds: int, allowed_kinds: frozenset[str] | None
         Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING,
         Task.lease_expires_at >= now,
     ).limit(1))
-    query = select(Task).join(Wave).where(available, Task.available_at <= now, Wave.status != "PAUSED")
+    query = select(Task).join(Wave).join(Source).where(
+        available, Task.available_at <= now, Wave.status != "PAUSED", Source.archived_at.is_(None)
+    )
     if allowed_kinds is not None:
         query = query.where(Task.kind.in_(allowed_kinds))
     if live_transfer:
@@ -1191,14 +1194,30 @@ def poll_restore_simulated(
             transfer_strategy=source.transfer_strategy,
             pending_objects=pending,
         )
+        # The polling policy is expressed in operational (virtual) time. In
+        # simulation a 3,600x clock must not wait two real hours for a
+        # two-virtual-hour check: that would advance the virtual clock by 300
+        # days and make an otherwise valid restore expire. Convert it to wall
+        # time, retaining a one-second floor for the durable queue.
+        try:
+            clock = SimulatorAdminClient(runtime_context.simulator_base_url).clock_status(
+                source.simulation_execution_id
+            )
+            acceleration = max(1.0, float(clock.get("acceleration") or 1.0))
+            delay = max(1, math.ceil(delay / acceleration))
+        except Exception:
+            # A transient status-read failure must never turn a simulation
+            # retry into an hours-long wall-clock wait.
+            delay = max(1, min(delay, 5))
         if recommended_real_delays:
-            # Preserve the production polling policy in virtual time while
-            # converting its wait to real simulator time. Never busy-loop.
-            delay = max(1, min(delay, int(min(recommended_real_delays)) + 1))
+            # The simulated source can also tell us when the next object is
+            # expected. Use the earlier safe deadline, never a longer one.
+            delay = max(1, min(delay, math.ceil(min(recommended_real_delays))))
+        delay_label = f"{delay}s" if delay < 60 else f"{math.ceil(delay / 60)} minute(s)"
         retry(
             session,
             task,
-            f"SIMULATED: {pending} object(s) still unavailable; next poll in {delay // 60} minutes",
+            f"SIMULATED: {pending} object(s) still unavailable; next poll in {delay_label}",
             delay,
         )
         return
@@ -2215,6 +2234,10 @@ def run_once(role: str = WORKER_ROLE) -> None:
             return
         allowed_task_kinds = task_kinds_for_role(role)
         if role in {"governance", "all"}:
+            # Sources archived by an earlier release can still have READY
+            # polling tasks. Reconcile them before any planner/claim action.
+            if reconcile_archived_source_work(session):
+                session.commit()
             if runtime_context.is_real:
                 refresh_due_global_aws_pricing(session)
             if settings.dynamic_pipeline_enabled:
