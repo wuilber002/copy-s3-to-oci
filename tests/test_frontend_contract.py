@@ -403,8 +403,8 @@ def test_simulation_mode_keeps_the_regular_console_and_exposes_a_red_admin_page(
     assert simulation.index('class="simulation-active"') < simulation.index('class="gear"')
     assert ".simulation-nav{background:transparent!important" in page
     assert ".simulation-active{background:#b91c1c" in simulation
-    assert "body.simulation-mode #alerts{top:134px}" in page
-    assert "body.simulation-mode .notification-stack{top:138px}" in page
+    assert "body.simulation-mode #alerts,body.laboratory-mode #alerts{top:134px}" in page
+    assert "body.simulation-mode .notification-stack,body.laboratory-mode .notification-stack{top:138px}" in page
     assert "Open in Migrations" in simulation
     assert '>Discovery</button><button onclick="createWaves' not in simulation
     assert '>Create dynamic waves</button>' not in simulation

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
 class SimulatorAdminError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None, detail: str | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.detail = detail or message
 
 
 class SimulatorAdminClient:
@@ -26,6 +30,19 @@ class SimulatorAdminClient:
             with urlopen(request, timeout=self.timeout_seconds) as response:
                 body = response.read()
                 return json.loads(body) if body else None
+        except HTTPError as error:
+            detail = error.reason
+            try:
+                body = error.read()
+                decoded = json.loads(body) if body else {}
+                detail = decoded.get("detail") or detail
+            except Exception:
+                pass
+            raise SimulatorAdminError(
+                f"Simulator admin request failed: {path}: {detail}",
+                status_code=error.code,
+                detail=str(detail),
+            ) from error
         except Exception as error:
             raise SimulatorAdminError(f"Simulator admin request failed: {path}: {error}") from error
 

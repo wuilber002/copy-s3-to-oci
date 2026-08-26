@@ -108,6 +108,17 @@ def test_scenario_contract_rejects_invalid_values(store):
         )
 
 
+def test_scenario_contract_rejects_duplicate_name_with_actionable_error(store):
+    store.create_scenario(
+        ScenarioCreate(name="unique-name", fidelity="CONTROL", seed="first", logical_size_bytes=1)
+    )
+
+    with pytest.raises(ValueError, match="already exists"):
+        store.create_scenario(
+            ScenarioCreate(name="unique-name", fidelity="CONTROL", seed="second", logical_size_bytes=1)
+        )
+
+
 def test_housekeeping_uses_deprecation_and_quarantine_before_purge_eligibility(store):
     scenario = store.create_scenario(
         ScenarioCreate(name="lifecycle", fidelity="CONTROL", seed="life", logical_size_bytes=1)

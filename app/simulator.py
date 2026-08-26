@@ -13,12 +13,18 @@ import hashlib
 import json
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from sqlalchemy.exc import IntegrityError
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from app.runtime_context import SIMULATOR_CONTRACT_VERSION, SIMULATOR_SERVICE_VERSION
 from app.simulator_contract import SimulatorHandshake, SimulatorHealth
-from app.simulator_store import ScenarioCreate, SimulatorStore, TemplateWrite
+from app.simulator_store import (
+    ScenarioConflictError,
+    ScenarioCreate,
+    SimulatorStore,
+    TemplateWrite,
+)
 from app.simulation_engine import SimulationEngine
 from app.backend_contracts import (
     HeadObjectRequest,
@@ -248,7 +254,9 @@ def create_scenario(payload: ScenarioCreatePayload) -> dict:
     try:
         item = store().create_scenario(ScenarioCreate(**payload.model_dump()))
         return scenario_response(item)
-    except ValueError as error:
+    except ScenarioConflictError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except (ValueError, IntegrityError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except Exception as error:
         raise HTTPException(status_code=503, detail=str(error)) from error

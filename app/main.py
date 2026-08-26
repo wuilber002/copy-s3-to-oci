@@ -1951,21 +1951,25 @@ def create_simulation_scenario(
         raise HTTPException(status_code=409, detail="Simulation source name already exists")
     prefixes = normalize_source_prefixes(payload.prefixes)
     admin = SimulatorAdminClient(runtime_context.simulator_base_url, timeout_seconds=600)
-    scenario = admin.create_scenario(
-        {
-            "name": payload.name,
-            "fidelity": payload.fidelity,
-            "seed": payload.seed,
-            "logical_size_bytes": payload.logical_size_bytes,
-            "physical_budget_bytes": payload.physical_budget_bytes,
-            "clock_acceleration": payload.clock_acceleration,
-            "retention_days": payload.retention_days,
-            "quarantine_days": payload.quarantine_days,
-            "configuration": payload.configuration,
-            "fault_rules": payload.fault_rules,
-            "template_id": payload.template_id,
-        }
-    )
+    try:
+        scenario = admin.create_scenario(
+            {
+                "name": payload.name,
+                "fidelity": payload.fidelity,
+                "seed": payload.seed,
+                "logical_size_bytes": payload.logical_size_bytes,
+                "physical_budget_bytes": payload.physical_budget_bytes,
+                "clock_acceleration": payload.clock_acceleration,
+                "retention_days": payload.retention_days,
+                "quarantine_days": payload.quarantine_days,
+                "configuration": payload.configuration,
+                "fault_rules": payload.fault_rules,
+                "template_id": payload.template_id,
+            }
+        )
+    except SimulatorAdminError as error:
+        status_code = error.status_code if error.status_code and 400 <= error.status_code < 500 else 502
+        raise HTTPException(status_code=status_code, detail=error.detail) from error
     catalog = admin.materialize(
         scenario["id"],
         {

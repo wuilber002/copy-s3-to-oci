@@ -41,6 +41,10 @@ from app.simulation_schema import (
 )
 
 
+class ScenarioConflictError(ValueError):
+    """Raised when an immutable scenario name is already reserved."""
+
+
 def _canonical_json(value: dict | list) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -225,6 +229,13 @@ class SimulatorStore:
             raise ValueError("Retention and quarantine cannot be negative")
 
         with self.sessions() as session:
+            if session.scalar(
+                select(SimulationScenario.id).where(SimulationScenario.name == name)
+            ):
+                raise ScenarioConflictError(
+                    f"A simulation scenario named '{name}' already exists. "
+                    "Choose a unique scenario name or reuse the existing execution."
+                )
             template_snapshot = request.template_snapshot or {}
             configuration = request.configuration or {}
             fault_rules = request.fault_rules or []
