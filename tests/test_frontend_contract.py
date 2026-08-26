@@ -355,6 +355,8 @@ def test_banner_exposes_synchronized_system_and_simulation_clocks():
         assert 'id="virtual-banner-clock"' in document
         assert 'id="virtual-clock-rate"' in document
         assert "/api/runtime/clock" in document
+        assert "Boolean(data.held)" in document
+        assert "ACCELERATED" in document and "HELD" in document
 
 
 def test_operational_history_emphasizes_selected_source_in_title():

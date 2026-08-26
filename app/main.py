@@ -1926,6 +1926,11 @@ def runtime_clock(source_id: int | None = Query(default=None, ge=1),
         "virtual_now": clock.effective_now if runtime_context.is_simulation and source else None,
         "acceleration": clock.acceleration if clock else 1.0,
         "paused": clock.paused if clock else False,
+        # A held clock is deliberately different from a manually paused one:
+        # it protects a source's restore-retention window while the real
+        # worker streams or polls objects.  The browser must not extrapolate
+        # it at the configured acceleration rate.
+        "held": clock.held if clock else False,
         "clock_available": clock_available,
     }
 
@@ -2047,6 +2052,10 @@ def create_simulation_scenario(
         },
     )
     execution = admin.create_execution(scenario["id"])
+    # A source gets its own clock, but it does not start consuming virtual
+    # retention simply because it was created. The worker resumes it only
+    # when durable discovery or migration work is queued for this source.
+    admin.control_clock(execution["id"], "PAUSE")
     source = Source(
         name=payload.name,
         s3_bucket=payload.source_bucket,
@@ -2229,6 +2238,7 @@ def clone_simulation_source(
         payload.physical_budget_bytes,
     )
     scenario, execution, catalog = result["scenario"], result["execution"], result["catalog"]
+    SimulatorAdminClient(runtime_context.simulator_base_url).control_clock(execution["id"], "PAUSE")
     prefixes = source_prefix_values(original)
     source = Source(
         name=payload.name,
@@ -2782,7 +2792,26 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
             "elapsed_seconds": elapsed_seconds(objects), "workers": workers if active else [],
         })
     waves.sort(key=lambda item: (not item["active"], item["available_at"], item["wave_id"]))
-    return {"waves": waves, "generated_at": now}
+    # A dynamic horizon deliberately keeps one locally mutable look-ahead
+    # wave without a durable AWS task. Show it explicitly so operators do not
+    # mistake it for a missing queue entry.
+    queued_ids = set(by_wave)
+    planned = []
+    for wave, source in session.execute(
+        select(Wave, Source).join(Source).where(
+            Wave.planner_mode == "DYNAMIC",
+            Wave.status == "RESTORE_SCHEDULED",
+            Source.archived_at.is_(None),
+        ).order_by(Wave.pipeline_run_id, Wave.id)
+    ):
+        if wave.id in queued_ids:
+            continue
+        planned.append({
+            "wave_id": wave.id, "wave_name": wave.name, "source_id": source.id,
+            "source_name": source.name, "planned_restore_at": wave.planned_restore_at,
+            "planned_transfer_start_at": wave.planned_transfer_start_at,
+        })
+    return {"waves": waves, "planned_lookahead": planned, "generated_at": now}
 
 
 @app.get("/api/flight-board/availability")
@@ -4894,9 +4923,11 @@ def repackage_unsubmitted_dynamic_waves(session: Session, settings: RuntimeSetti
 def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: datetime | None = None) -> int:
     """Adapt only unsubmitted dynamic waves to durable observed timings.
 
-    Restore requests, active waves and their audit record are immutable.  The
-    recalculation only moves a future `RESTORE_SCHEDULED` wave that has no
-    Batch task yet, using completed transfer wall time whenever it exists.
+    Restore requests, active waves and their audit record are immutable. The
+    transfer *forecast* remains mutable: moving it never sends an AWS request
+    and is required to keep the serial transfer lane truthful after an
+    observed delay.  Simulation planning uses source-owned virtual milestones,
+    never wall-clock timestamps produced by a fast CONTROL transfer.
     """
     changed = 0
     runs = list(session.scalars(select(DynamicPipelineRun).where(
@@ -4919,9 +4950,10 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             run.historical_samples = latest_samples
             changed += repacked
             run_changed = bool(repacked)
-        waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
-            Wave.planned_transfer_start_at, Wave.id
-        )))
+        # Pipeline sequence is the materialization order. Ordering by an old
+        # forecast can put a corrupted/past transfer slot before its own
+        # restore request and recursively amplify the error.
+        waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(Wave.id)))
         cursor: datetime | None = None
         cursor_basis = "initial forecast"
         for wave in waves:
@@ -4930,6 +4962,9 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
                 func.sum(ObjectRecord.transfer_elapsed_seconds), func.max(ObjectRecord.transfer_elapsed_seconds),
             ).where(ObjectRecord.wave_id == wave.id)).one()
             planned_start = wave.planned_transfer_start_at or scheduler_now
+            simulated = runtime_context.is_simulation and wave.source.backend_kind == "SIMULATED"
+            observed_virtual_start = wave.transfer_started_virtual_at if simulated else None
+            observed_virtual_end = wave.transfer_completed_virtual_at if simulated else None
             duration_seconds = max(1, int(wave.predicted_transfer_seconds or 1))
             observed_basis = "prediction"
             # CONTROL transfers intentionally complete in milliseconds of real
@@ -4937,7 +4972,7 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             # Convert per-object logical work to one transfer-lane wall time so
             # degraded/oscillating profiles can move later restore windows.
             if (
-                wave.source.backend_kind == "SIMULATED"
+                simulated
                 and wave.source.simulation_fidelity == "CONTROL"
                 and elapsed_sum
             ):
@@ -4949,13 +4984,27 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
                     )),
                 )
                 observed_basis = "simulated logical transfer duration"
+            elif observed_virtual_start and observed_virtual_end and observed_virtual_end >= observed_virtual_start:
+                duration_seconds = max(1, int((observed_virtual_end - observed_virtual_start).total_seconds()))
+                observed_basis = "observed simulated virtual milestones"
             elif actual_start and actual_end and actual_end >= actual_start:
                 duration_seconds = max(1, int((actual_end - actual_start).total_seconds()))
                 observed_basis = "observed transfer timestamps"
-            constrained_by_prior_wave = bool(cursor and cursor > planned_start)
+            # Once a simulated wave begins, its virtual timestamp is the
+            # authoritative lane position.  Planned timestamps are merely
+            # forecasts and must not pull it backward.
+            lane_start = observed_virtual_start or planned_start
+            # A planned transfer is never allowed to precede the known or
+            # planned restore request. This is a hard chronology invariant.
+            restore_floor = wave.restore_requested_virtual_at or wave.planned_restore_at
+            if restore_floor:
+                lane_start = max(lane_start, restore_floor)
+            constrained_by_prior_wave = bool(cursor and cursor > lane_start)
             decision_basis = cursor_basis if constrained_by_prior_wave else observed_basis
-            start = max(planned_start, cursor) if cursor else planned_start
-            if observed_basis == "simulated logical transfer duration" and actual_end:
+            start = max(lane_start, cursor) if cursor else lane_start
+            if observed_virtual_end:
+                cursor = max(start, observed_virtual_end)
+            elif observed_basis == "simulated logical transfer duration" and actual_end:
                 cursor = start + timedelta(seconds=duration_seconds)
             elif actual_end:
                 cursor = max(start, actual_end)
@@ -4965,15 +5014,18 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             has_batch_task = session.scalar(select(Task.id).where(
                 Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
             ).limit(1)) is not None
-            if wave.status != "RESTORE_SCHEDULED" or has_batch_task:
-                continue
+            # A transfer forecast can safely be fixed even after its restore
+            # was submitted. The restore timestamp itself is immutable once a
+            # Batch task exists because changing it would falsify evidence.
             restore_lead = restore_service_window_seconds(wave.restore_tier) + int(run.restore_safety_seconds or settings.dynamic_restore_safety_seconds)
             new_restore_at = max(scheduler_now, start - timedelta(seconds=restore_lead))
             shifted = abs((wave.planned_transfer_start_at - start).total_seconds()) if wave.planned_transfer_start_at else float("inf")
             if shifted >= 60:
                 prior_transfer_at = wave.planned_transfer_start_at
                 prior_restore_at = wave.planned_restore_at
-                wave.planned_transfer_start_at, wave.planned_restore_at = start, new_restore_at
+                wave.planned_transfer_start_at = start
+                if not has_batch_task and wave.status == "RESTORE_SCHEDULED":
+                    wave.planned_restore_at = new_restore_at
                 changed += 1
                 run_changed = True
                 record_event(

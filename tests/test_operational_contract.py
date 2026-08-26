@@ -593,6 +593,11 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert '@app.get("/api/sources/{source_id}/pipeline-history")' in source
     assert 'id="pipeline-history-card"' in frontend
     assert 'function loadPipelineHistory()' in frontend
+    assert '"planned_lookahead": planned' in source
+    assert 'observed_virtual_start = wave.transfer_started_virtual_at if simulated else None' in source
+    assert 'lane_start = max(lane_start, restore_floor)' in source
+    assert 'simulation_transfer_task_active(session, wave)' in Path("app/real_worker.py").read_text()
+    assert 'synchronize_simulation_source_clocks(session)' in Path("app/real_worker.py").read_text()
 
 
 def test_dynamic_prediction_prefers_p75_history_then_conservative_link_model():

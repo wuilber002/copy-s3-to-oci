@@ -484,6 +484,55 @@ def release_simulation_clock_after_transfer(session, wave: Wave) -> None:
         session.flush()
 
 
+def simulation_transfer_task_active(session, wave: Wave) -> bool:
+    """Whether a real transfer worker currently owns this wave's lane."""
+    return session.scalar(select(Task.id).where(
+        Task.wave_id == wave.id,
+        Task.kind == "TRANSFER_WAVE",
+        Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+    ).limit(1)) is not None
+
+
+def synchronize_simulation_source_clocks(session) -> int:
+    """Run each source-owned virtual clock only while it has durable work.
+
+    A scenario execution is deliberately a separate simulated world.  Its
+    clock must not keep consuming virtual retention merely because another
+    source has a queued task.  READY work includes an availability-poll retry:
+    virtual AWS time has to progress while the source waits for that retry.
+    """
+    if not runtime_context.is_simulation:
+        return 0
+    admin = SimulatorAdminClient(runtime_context.simulator_base_url)
+    changed = 0
+    sources = list(session.scalars(select(Source).where(Source.backend_kind == "SIMULATED")))
+    for source in sources:
+        if not source.simulation_execution_id:
+            continue
+        has_task = session.scalar(select(Task.id).join(Wave).where(
+            Wave.source_id == source.id,
+            Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+        ).limit(1)) is not None
+        has_discovery = session.scalar(select(DiscoveryJob.id).where(
+            DiscoveryJob.source_id == source.id,
+            DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
+        ).limit(1)) is not None
+        should_run = source.archived_at is None and (has_task or has_discovery)
+        try:
+            clock = admin.clock_status(source.simulation_execution_id)
+            if should_run and clock.get("paused"):
+                admin.control_clock(source.simulation_execution_id, "RESUME")
+                changed += 1
+            elif not should_run and not clock.get("paused"):
+                admin.control_clock(source.simulation_execution_id, "PAUSE")
+                changed += 1
+        except Exception:
+            # A simulator status request is observability/control only.  The
+            # durable task must retain its normal retry/error behavior.
+            continue
+    return changed
+
+
 def require_new_restore_approval(session, wave: Wave, reason: str) -> None:
     """Stop only this wave and retain clear evidence before another restore.
 
@@ -1239,7 +1288,11 @@ def poll_restore_simulated(
     )
     wave.last_poll_at, wave.poll_count = utcnow(), wave.poll_count + 1
     if pending:
-        wave.status = "RESTORING"
+        # An early-release source can be polling remaining objects while a
+        # transfer batch owns the same wave. Do not overwrite the primary
+        # visible TRANSFERRING state during that overlap.
+        if not simulation_transfer_task_active(session, wave):
+            wave.status = "RESTORING"
         ready_for_transfer = int(
             session.scalar(
                 select(func.count(ObjectRecord.id)).where(
@@ -2011,9 +2064,25 @@ def transfer_wave(session, task: Task, settings) -> None:
         if held_by_handoff:
             try:
                 _transfer_wave(session, task, settings)
+            except Exception:
+                # A failed transfer task becomes terminal only after the outer
+                # task handler records the failure.  Release the hand-off hold
+                # here as well; otherwise a failed wave can leave its source
+                # clock held forever and make a later recovery appear frozen.
+                refreshed = session.get(Wave, task.wave_id)
+                if refreshed:
+                    release_simulation_clock_after_transfer(session, refreshed)
+                session.commit()
+                raise
             finally:
                 refreshed = session.get(Wave, task.wave_id)
-                if refreshed and refreshed.status != "RESTORE_REAPPROVAL_REQUIRED":
+                # Retain the durable hold across *all* partial batches. It is
+                # released only when the wave reaches a terminal state or an
+                # explicit paid re-restore approval is required.
+                if refreshed and refreshed.status in {
+                    "COMPLETED", "VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS",
+                    "FAILED", "VERIFICATION_FAILED", "RESTORE_REAPPROVAL_REQUIRED",
+                }:
                     release_simulation_clock_after_transfer(session, refreshed)
                 session.commit()
         else:
@@ -2418,8 +2487,15 @@ def run_once(role: str = WORKER_ROLE) -> None:
                 if allowed_task_kinds is None
                 else frozenset(allowed_task_kinds & simulation_kinds)
             )
+        if runtime_context.is_simulation:
+            synchronize_simulation_source_clocks(session)
+            session.commit()
         task = claim_task(session, settings.task_lease_seconds, allowed_task_kinds)
-        if not task: return
+        if not task:
+            if runtime_context.is_simulation:
+                synchronize_simulation_source_clocks(session)
+                session.commit()
+            return
         try:
             if task.kind == "SUBMIT_BATCH_RESTORE": submit_restore(session, task, settings)
             elif task.kind == "POLL_RESTORE": poll_restore(session, task, settings)
@@ -2432,6 +2508,10 @@ def run_once(role: str = WORKER_ROLE) -> None:
                 retry(session, task, summary)
             else:
                 fail_permanently(session, task, summary)
+        finally:
+            if runtime_context.is_simulation:
+                synchronize_simulation_source_clocks(session)
+                session.commit()
 
 
 if __name__ == "__main__":
