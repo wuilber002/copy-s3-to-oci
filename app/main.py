@@ -1288,6 +1288,42 @@ def create_schema() -> None:
             record_event(session, "DYNAMIC_SCHEDULE_SEMANTICS_UPGRADED",
                          f"Pipeline run {run.id} now separates the AWS service window from operational safety",
                          source_id=run.source_id)
+        # Before the simulator surfaced restore expiry as a typed 409, this
+        # exact condition appeared as an opaque logical-transfer HTTP 500.
+        # Upgrade only that known signature to the explicit paid-restore
+        # approval state; unrelated failed transfers retain their original
+        # failure diagnosis.
+        legacy_expiry_waves = list(session.scalars(
+            select(Wave)
+            .join(Source, Wave.source_id == Source.id)
+            .join(Task, Task.wave_id == Wave.id)
+            .where(
+                Source.backend_kind == "SIMULATED",
+                Wave.status == "FAILED",
+                Wave.restore_reapproval_required.is_(False),
+                Task.kind == "TRANSFER_WAVE",
+                Task.state == TaskState.FAILED,
+                Task.error.contains("logical-transfer"),
+                Task.error.contains("HTTP Error 500"),
+            )
+            .distinct()
+        ))
+        for wave in legacy_expiry_waves:
+            wave.status = "RESTORE_REAPPROVAL_REQUIRED"
+            wave.restore_reapproval_required = True
+            wave.restore_reapproval_reason = (
+                "A previous simulator logical-transfer response reported HTTP 500 while a restored "
+                "copy was being transferred. The current release treats this known condition as "
+                "restore unavailability; a new restore requires explicit approval because it may incur AWS charges."
+            )
+            wave.restore_reapproval_detected_at = migration_now
+            record_event(
+                session,
+                "RESTORE_REAPPROVAL_REQUIRED",
+                "Historic simulator restore-expiry failure converted to explicit operator reapproval required",
+                source_id=wave.source_id,
+                wave_id=wave.id,
+            )
         session.commit()
 
 
