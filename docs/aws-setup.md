@@ -32,35 +32,25 @@ Use nomes previsíveis e únicos por conta:
 | Prefixo de controle da conexão | `oracle/connections/<connection-id>/` |
 | Prefixo de uma source | `production/finance/` |
 
-Antes de criar policies, registre:
+### Informações a registrar antes de criar as policies
 
-```text
-AWS_ACCOUNT_ID        = 123456789012
-AWS_REGION            = us-east-1
-SOURCE_BUCKET         = customer-finance-archive
-SOURCE_PREFIX         = production/finance/
-CONTROL_BUCKET        = oracle-control-bucket-us-east-1
-BOOTSTRAP_USER        = oracle-bootstrap-prod
-MIGRATION_ROLE        = oracle-s3-migration-role
-BATCH_ROLE            = oracle-s3-batch-restore-role
-```
+Esta é a ficha de parâmetros da conexão. Preencha ou anote os valores abaixo **antes** de montar as policies: os mesmos códigos entre `<...>` serão reutilizados nos ARNs e JSONs das seções seguintes. A tabela é apenas uma referência; não deve ser executada como comando.
+
+| Código usado nas policies | O que informar | Exemplo |
+|---|---|---|
+| `<AWS_ACCOUNT_ID>` | ID numérico de 12 dígitos da conta AWS que possui as roles. | `123456789012` |
+| `<AWS_REGION>` | Região AWS do bucket de origem e do bucket de controle. | `us-east-1` |
+| `<SOURCE_BUCKET>` | Nome do bucket S3 de origem, sem `s3://`. | `customer-finance-archive` |
+| `<SOURCE_PREFIX>` | Prefixo S3 aprovado para a source; termine com `/` quando for uma pasta lógica. | `production/finance/` |
+| `<CONTROL_BUCKET>` | Nome do bucket de controle da conexão, sem `s3://`. | `oracle-control-bucket-us-east-1` |
+| `<CONTROL_PREFIX>` | Prefixo exclusivo dos artefatos do ODMT dentro do bucket de controle. | `oracle/` |
+| `<BOOTSTRAP_USER>` | Nome do usuário IAM que terá a access key usada pela conexão. | `oracle-bootstrap-prod` |
+| `<MIGRATION_ROLE>` | Nome da role assumida pelo ODMT para operar a source. | `oracle-s3-migration-role` |
+| `<BATCH_ROLE>` | Nome da role assumida pelo S3 Batch Operations para restores. | `oracle-s3-batch-restore-role` |
 
 Para migrar o bucket inteiro, deixe `SOURCE_PREFIX` vazio e adapte os ARNs de objeto para `arn:aws:s3:::SOURCE_BUCKET/*`. Para vários prefixos, inclua somente os prefixos aprovados nas conditions e nos ARNs; não amplie para o bucket inteiro por conveniência.
 
 O nome de bucket S3 é globalmente único. Use `oracle-control-bucket-us-east-1` quando estiver disponível; se já existir em outra conta AWS, preserve esse padrão e acrescente um sufixo corporativo aprovado, por exemplo `oracle-control-bucket-us-east-1-<AWS_ACCOUNT_ID>`.
-
-Nos exemplos JSON abaixo, use:
-
-| Placeholder | Valor a informar |
-|---|---|
-| `<AWS_ACCOUNT_ID>` | ID numérico da conta AWS, com 12 dígitos. |
-| `<BOOTSTRAP_USER>` | Nome do usuário IAM bootstrap. Exemplo: `oracle-bootstrap-prod`. |
-| `<MIGRATION_ROLE>` | Nome da role de migração. Exemplo: `oracle-s3-migration-role`. |
-| `<BATCH_ROLE>` | Nome da role S3 Batch Operations. Exemplo: `oracle-s3-batch-restore-role`. |
-| `<SOURCE_BUCKET>` | Nome do bucket S3 de origem, sem `s3://`. |
-| `<SOURCE_PREFIX>` | Prefixo aprovado, normalmente terminado em `/`. |
-| `<CONTROL_BUCKET>` | Nome do bucket S3 de controle, sem `s3://`. |
-| `<CONTROL_PREFIX>` | Prefixo exclusivo para artefatos do ODMT. Recomendação: `oracle/`. |
 
 ## 3. Criar e proteger o bucket de controle
 
