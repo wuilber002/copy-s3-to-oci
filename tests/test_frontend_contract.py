@@ -470,3 +470,13 @@ def test_flight_board_modal_has_only_one_vertical_scroll_container():
     assert "#flight-board-modal .modal-panel{display:flex;flex-direction:column" in page
     assert "max-height:calc(100vh - 2rem);overflow:hidden" in page
     assert "#flight-board-content{min-height:0;max-height:none;overflow-y:auto;overflow-x:hidden}" in page
+
+
+def test_refresh_restores_the_current_view_and_selected_source_without_duplicate_loads():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+
+    assert "showView(initialView,{persist:false,scroll:false,load:false})" in page
+    assert "const requested=new URLSearchParams(location.search).get('source')||''" in page
+    assert "url.searchParams.set('source',selectedSource)" in page
+    assert "await Promise.all([loadSettings(),loadSources()])" in page
+    assert "else if(view==='migrations'){await Promise.all([loadTasks(),loadEvents()])}" in page

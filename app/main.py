@@ -1852,7 +1852,16 @@ def runtime_clock(source_id: int | None = Query(default=None, ge=1),
                 DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
             ).order_by(DynamicPipelineRun.created_at.desc(), DynamicPipelineRun.id.desc()).limit(1)
         )
-    clock = source_scheduler_clock(source) if source else None
+    # The header clock is informational. Under an intentionally busy
+    # simulation backend it must never turn a transient simulator timeout into
+    # a failed page heartbeat or block the rest of the console from loading.
+    clock = None
+    clock_available = True
+    if source:
+        try:
+            clock = source_scheduler_clock(source)
+        except (OSError, TimeoutError, ValueError):
+            clock_available = False
     system_now = clock.real_now if clock else utcnow()
     return {
         "operation_mode": runtime_context.mode.value,
@@ -1863,6 +1872,7 @@ def runtime_clock(source_id: int | None = Query(default=None, ge=1),
         "virtual_now": clock.effective_now if runtime_context.is_simulation and source else None,
         "acceleration": clock.acceleration if clock else 1.0,
         "paused": clock.paused if clock else False,
+        "clock_available": clock_available,
     }
 
 
