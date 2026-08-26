@@ -437,3 +437,11 @@ def test_simulation_scenario_form_uses_grouped_integers_and_gb_units():
     assert "function prepareIntegerFields()" in simulation
     assert "stepIntegerInput(input,direction)" in simulation
     assert 'step="0.01"' not in simulation
+
+
+def test_public_project_links_use_current_repository_name():
+    repository_url = "github.com/wuilber002/raijin-data-migration"
+    assert repository_url in (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert repository_url in (ROOT / "README.md").read_text(encoding="utf-8")
+    assert repository_url in (ROOT / "terraform/orm/schema.yaml").read_text(encoding="utf-8")
+    assert repository_url in (ROOT / "terraform/orm/variables.tf").read_text(encoding="utf-8")

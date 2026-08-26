@@ -106,7 +106,7 @@ variables:
   bootstrap_repository:
     title: Bootstrap GitHub repository
     type: string
-    default: https://github.com/wuilber002/copy-s3-to-oci.git
+    default: https://github.com/wuilber002/raijin-data-migration.git
     required: true
   bootstrap_ref:
     title: Bootstrap release ref

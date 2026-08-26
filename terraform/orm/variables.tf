@@ -229,7 +229,7 @@ variable "backup_policy_compartment_ocid" {
 variable "bootstrap_repository" {
   description = "Public GitHub repository containing the signed/verified application release."
   type        = string
-  default     = "https://github.com/wuilber002/copy-s3-to-oci.git"
+  default     = "https://github.com/wuilber002/raijin-data-migration.git"
 }
 
 variable "bootstrap_ref" {
