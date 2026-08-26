@@ -163,6 +163,12 @@ continuarão processando fila, leases, polling, restores, streaming, multipart,
 retries, checkpoints, reconciliação e replanejamento. Somente as integrações
 externas são substituídas por implementações simuladas no modo isolado.
 
+Na criação de cenários, tamanhos lógicos e o orçamento físico do modo `DATA`
+são informados em GB e convertidos para bytes somente ao montar o contrato
+interno imutável. Quantidades, períodos e aceleração do relógio usam valores
+inteiros com separação visual de milhar, evitando a edição operacional de
+números extensos em bytes.
+
 Já estão disponíveis: modos exclusivos `REAL`/`SIMULATION`, banco lógico
 separado, handshake versionado, console dedicada, catálogo virtual, gerador de
 bytes determinístico, restore e Batch Operations simulados com evidência por

@@ -421,3 +421,19 @@ def test_simulation_admin_page_keeps_the_persistent_operational_footer():
     assert "function updateOperationalMessages(operations,platform,observability)" in simulation
     assert "async function refreshOperationalMessages()" in simulation
     assert "setInterval(refreshOperationalMessages,30000)" in simulation
+
+
+def test_simulation_scenario_form_uses_grouped_integers_and_gb_units():
+    simulation = (ROOT / "app/static/simulation.html").read_text(encoding="utf-8")
+
+    assert "Logical size (GB)" in simulation
+    assert "DATA physical budget (GB)" in simulation
+    assert 'value="100.000"' in simulation
+    assert 'value="1.000"' in simulation
+    assert 'value="3.600"' in simulation
+    assert "const GB_BYTES=1_000_000_000" in simulation
+    assert "logical_size_bytes:logicalSizeGb*GB_BYTES" in simulation
+    assert "physical_budget_bytes:physicalBudgetGb*GB_BYTES" in simulation
+    assert "function prepareIntegerFields()" in simulation
+    assert "stepIntegerInput(input,direction)" in simulation
+    assert 'step="0.01"' not in simulation
