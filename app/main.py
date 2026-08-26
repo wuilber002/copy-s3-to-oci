@@ -1061,7 +1061,13 @@ async def simulation_foundation_guard(request: FastAPIRequest, call_next):
                     "operation_mode": runtime_context.mode.value,
                 },
             )
-    return await call_next(request)
+    response = await call_next(request)
+    # Sources, waves and tasks are operational state.  A browser must never
+    # reuse an earlier /api/sources response after a scenario/source is
+    # created, archived or otherwise changed.
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.on_event("startup")

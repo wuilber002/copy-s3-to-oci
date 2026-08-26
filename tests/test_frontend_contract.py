@@ -425,6 +425,17 @@ def test_simulation_scenario_form_suggests_a_free_immutable_name():
     assert "simulation-${String(number).padStart(3,'0')}" in simulation
 
 
+def test_new_simulated_source_is_available_and_selected_in_migrations_without_reload():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    simulation = (ROOT / "app/static/simulation.html").read_text(encoding="utf-8")
+
+    assert "cache:'no-store'" in page
+    assert "cache:'no-store'" in simulation
+    assert "raijin:pending-simulation-source-id" in page
+    assert "sessionStorage.setItem('raijin:pending-simulation-source-id',String(created.source_id))" in simulation
+    assert "onclick=\"openMigrations(${s.id})\"" in simulation
+
+
 def test_operational_top_alerts_are_dismissible_without_removing_the_footer_condition():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
 

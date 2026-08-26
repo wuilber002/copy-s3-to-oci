@@ -240,6 +240,7 @@
 <script src="/static/i18n.js"></script>
 <script>
 let selectedSource = '', selectedWave = '', inventoryOffset = 0, inventoryCursor = null, inventoryCursorHistory = [], inventoryNextCursor = null, inventoryPage = 0, sources = [], ociBuckets = [], awsConnections = [], awsSecrets = [], editingSource = '';
+const pendingSimulationSourceId=sessionStorage.getItem('raijin:pending-simulation-source-id');if(pendingSimulationSourceId){const pendingUrl=new URL(window.location.href);if(!pendingUrl.searchParams.get('source')){pendingUrl.searchParams.set('source',pendingSimulationSourceId);window.history.replaceState({source:pendingSimulationSourceId},'',pendingUrl)}sessionStorage.removeItem('raijin:pending-simulation-source-id')}
 const $ = s => document.querySelector(s);
 const fmt = n => new Intl.NumberFormat('pt-BR').format(n || 0);
 let operationMode=null,runtimeIdentity=null,runtimeModeLoaded=false;
@@ -286,7 +287,7 @@ const dismissedTopAlerts=new Set();
 function dismissTopAlert(key){dismissedTopAlerts.add(key);document.querySelector(`#alerts [data-alert-key="${CSS.escape(key)}"]`)?.remove()}
 function renderTopAlerts(alerts){const activeKeys=new Set(alerts.map(([key])=>key));for(const key of dismissedTopAlerts){if(!activeKeys.has(key))dismissedTopAlerts.delete(key)}$('#alerts').innerHTML=alerts.filter(([key])=>!dismissedTopAlerts.has(key)).map(([key,type,message])=>`<div class="alert ${type}" data-alert-key="${escape(key)}"><span>${escape(message)}</span><button type="button" class="alert-dismiss" aria-label="Fechar alerta" title="Fechar" onclick="dismissTopAlert('${escape(key)}')">×</button></div>`).join('')}
 function apiErrorMessage(detail){if(Array.isArray(detail))return detail.map(issue=>{if(typeof issue==='string')return issue;const field=Array.isArray(issue?.loc)?issue.loc.filter(part=>part!=='query'&&part!=='body').join(' → '):'';return `${field?`${field}: `:''}${issue?.msg||'Dados inválidos.'}`}).join(' ');if(detail&&typeof detail==='object')return detail.message||detail.msg||JSON.stringify(detail);return String(detail||'A operação falhou.')}
-async function api(path, options={}){const r=await fetch(path,options);if(!r.ok){let d=await r.text();try{const body=JSON.parse(d);d=body.detail??body}catch{}throw new Error(apiErrorMessage(d))}return r.status===204?null:r.json()}
+async function api(path, options={}){const r=await fetch(path,{cache:'no-store',...options});if(!r.ok){let d=await r.text();try{const body=JSON.parse(d);d=body.detail??body}catch{}throw new Error(apiErrorMessage(d))}return r.status===204?null:r.json()}
 function escape(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 let laboratoryModeWasEnabled=false;
 function syncLaboratoryModeBanner(enabled){laboratoryModeWasEnabled=Boolean(enabled);document.body.classList.toggle('laboratory-mode',laboratoryModeWasEnabled);$('#laboratory-mode-banner')?.classList.toggle('hidden',!enabled)}
