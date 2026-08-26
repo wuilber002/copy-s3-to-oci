@@ -19,7 +19,7 @@ from app.runtime_context import SIMULATOR_CONTRACT_VERSION
 from app.simulated_data import GENERATOR_VERSION
 
 
-SIMULATION_SCHEMA_VERSION = 3
+SIMULATION_SCHEMA_VERSION = 4
 DEFAULT_DATA_PHYSICAL_BUDGET_BYTES = 1_000_000_000_000
 DEFAULT_RETENTION_DAYS = 60
 DEFAULT_QUARANTINE_DAYS = 30
@@ -156,6 +156,8 @@ class SimulationClock(SimulationBase):
     acceleration: Mapped[float] = mapped_column(Float, default=3600.0)
     paused: Mapped[bool] = mapped_column(Boolean, default=False)
     paused_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    hold_count: Mapped[int] = mapped_column(Integer, default=0)
+    held_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )

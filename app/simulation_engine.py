@@ -50,6 +50,8 @@ def aware(value: datetime) -> datetime:
 def virtual_now(clock: SimulationClock, real_now: datetime | None = None) -> datetime:
     if clock.paused and clock.paused_virtual_at:
         return aware(clock.paused_virtual_at)
+    if int(clock.hold_count or 0) > 0 and clock.held_virtual_at:
+        return aware(clock.held_virtual_at)
     current = real_now or datetime.now(timezone.utc)
     elapsed = (current - aware(clock.real_anchor_at)).total_seconds()
     return aware(clock.virtual_anchor_at) + timedelta(seconds=elapsed * clock.acceleration)

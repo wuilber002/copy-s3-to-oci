@@ -33,7 +33,7 @@ def test_simulation_migration_is_idempotent():
 
     with Session(engine) as session:
         revisions = session.scalars(select(SimulationSchemaRevision)).all()
-    assert [item.version for item in revisions] == [1, 2, 3]
+    assert [item.version for item in revisions] == [1, 2, 3, 4]
 
 
 def test_virtual_object_checksum_accepts_control_evidence_prefix():

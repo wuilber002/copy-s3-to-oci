@@ -53,6 +53,13 @@ de fazer** e **como ela organiza a operação**.
   registradas localmente.
 - Retoma uploads multipart interrompidos usando checkpoints persistidos de
   `upload_id` e partes já aceitas pelo OCI.
+- No modo de simulação, o relógio virtual é **orientado a fases**: ele avança
+  entre eventos planejados, mas fica congelado durante polling, streaming,
+  multipart e retries do worker real. Isso impede expiração artificial da
+  retenção enquanto o host executa trabalho local.
+- O inventário de bordo registra, para cada wave simulada, os marcos virtuais
+  de submissão, primeira e última disponibilidade, início e término da cópia;
+  a linha do tempo não mistura estes marcos com o relógio real da VM.
 
 ### Integridade, reconciliação e reprocessamento
 

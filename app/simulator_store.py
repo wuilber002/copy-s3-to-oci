@@ -494,6 +494,8 @@ class SimulatorStore:
     def _clock_now(clock: SimulationClock, now: datetime | None = None) -> datetime:
         if clock.paused and clock.paused_virtual_at:
             return clock.paused_virtual_at
+        if int(clock.hold_count or 0) > 0 and clock.held_virtual_at:
+            return clock.held_virtual_at
         current = _aware(now or datetime.now(timezone.utc))
         anchor = clock.real_anchor_at
         if anchor.tzinfo is None:
@@ -526,6 +528,8 @@ class SimulatorStore:
             return {
                 "execution_id": execution_id,
                 "paused": clock.paused,
+                "held": int(clock.hold_count or 0) > 0,
+                "hold_count": int(clock.hold_count or 0),
                 "acceleration": clock.acceleration,
                 "real_now": datetime.now(timezone.utc),
                 "virtual_now": self._clock_now(clock),
@@ -534,8 +538,8 @@ class SimulatorStore:
     def control_clock(self, execution_id: str, action: str, advance_seconds: float = 0) -> dict:
         self.require_current_schema()
         normalized = action.strip().upper()
-        if normalized not in {"PAUSE", "RESUME", "ADVANCE"}:
-            raise ValueError("Clock action must be PAUSE, RESUME or ADVANCE")
+        if normalized not in {"PAUSE", "RESUME", "ADVANCE", "HOLD", "RELEASE"}:
+            raise ValueError("Clock action must be PAUSE, RESUME, ADVANCE, HOLD or RELEASE")
         with self.sessions() as session:
             clock = session.get(SimulationClock, execution_id)
             if clock is None:
@@ -545,8 +549,27 @@ class SimulatorStore:
             if normalized == "PAUSE":
                 clock.paused, clock.paused_virtual_at = True, current
             elif normalized == "RESUME":
-                clock.virtual_anchor_at, clock.real_anchor_at = current, now
+                if int(clock.hold_count or 0) > 0:
+                    clock.held_virtual_at = current
+                else:
+                    clock.virtual_anchor_at, clock.real_anchor_at = current, now
                 clock.paused, clock.paused_virtual_at = False, None
+            elif normalized == "HOLD":
+                if int(clock.hold_count or 0) == 0:
+                    clock.held_virtual_at = current
+                clock.hold_count = int(clock.hold_count or 0) + 1
+            elif normalized == "RELEASE":
+                count = int(clock.hold_count or 0)
+                if count <= 0:
+                    raise ValueError("Clock hold is not active")
+                clock.hold_count = count - 1
+                if clock.hold_count == 0:
+                    released = clock.held_virtual_at or current
+                    clock.held_virtual_at = None
+                    if clock.paused:
+                        clock.paused_virtual_at = released
+                    else:
+                        clock.virtual_anchor_at, clock.real_anchor_at = released, now
             else:
                 if advance_seconds < 0:
                     raise ValueError("Clock advance cannot be negative")
@@ -554,6 +577,8 @@ class SimulatorStore:
                 clock.virtual_anchor_at, clock.real_anchor_at = advanced, now
                 if clock.paused:
                     clock.paused_virtual_at = advanced
+                if int(clock.hold_count or 0) > 0:
+                    clock.held_virtual_at = advanced
             session.commit()
         return self.clock_status(execution_id)
 

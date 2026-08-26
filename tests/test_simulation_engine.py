@@ -1,12 +1,13 @@
 import json
 import hashlib
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import create_engine, select
 
 from app.simulation_engine import SimulationEngine
 from app.simulation_migrations import migrate
-from app.simulation_schema import InjectedFault, VirtualBucket, VirtualObject
+from app.simulation_schema import InjectedFault, SimulationClock, VirtualBucket, VirtualObject
 from app.simulated_data import consume_and_discard
 from app.simulated_data import SimulatedDataIntegrityError
 from app.simulator_store import ScenarioCreate, SimulatorStore
@@ -62,6 +63,21 @@ def test_materialization_preserves_exact_logical_totals(virtual_cloud):
     assert len(objects) == 7
     assert sum(item.size_bytes for item in objects) == 10_001
     assert {item.key.split("/", 1)[0] for item in objects} == {"app", "archive"}
+
+
+def test_phase_hold_freezes_virtual_time_without_pausing_real_task_time(virtual_cloud):
+    _engine, execution, _materialized = virtual_cloud
+    store = _engine.store
+    store.control_clock(execution.id, "HOLD")
+    held = store.clock_status(execution.id)
+    assert held["held"] and held["hold_count"] == 1
+    with store.sessions() as session:
+        clock = session.get(SimulationClock, execution.id)
+        assert store._clock_now(clock, clock.real_anchor_at + timedelta(hours=1)) == held["virtual_now"]
+    store.control_clock(execution.id, "RELEASE")
+    released = store.clock_status(execution.id)
+    assert not released["held"]
+    assert released["virtual_now"].replace(tzinfo=None) >= held["virtual_now"].replace(tzinfo=None)
 
 
 def test_control_network_profile_uses_virtual_time_for_degradation_and_outage():

@@ -395,6 +395,14 @@ class Wave(Base):
     prediction_samples: Mapped[int] = mapped_column(Integer, default=0)
     planned_restore_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     planned_transfer_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    # Observed milestones use the simulator virtual clock only for simulated
+    # sources.  Real sources retain their existing object-level wall-clock
+    # evidence.  Keeping both avoids mixing time domains in the flight board.
+    restore_requested_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_restore_available_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_restore_available_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    transfer_started_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    transfer_completed_virtual_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     source: Mapped[Source] = relationship(back_populates="waves")
     objects: Mapped[list[ObjectRecord]] = relationship(back_populates="wave")
@@ -1109,7 +1117,7 @@ def create_schema() -> None:
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
-    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE", "restore_requested_virtual_at": "TIMESTAMP WITH TIME ZONE", "first_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "last_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_started_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_completed_virtual_at": "TIMESTAMP WITH TIME ZONE"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
@@ -2651,10 +2659,10 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
     if run_id is not None:
         filters.append(Wave.pipeline_run_id == run_id)
     rows = list(session.execute(
-        select(Wave, Source.name).join(Source).where(*filters)
+        select(Wave, Source).join(Source).where(*filters)
         .order_by(Wave.planned_transfer_start_at.nulls_last(), Wave.id).limit(500)
     ))
-    wave_ids = [wave.id for wave, _source_name in rows]
+    wave_ids = [wave.id for wave, _source in rows]
     if not wave_ids:
         return {"waves": [], "generated_at": now, "truncated": False, "source_id": source_id,
                 "source_name": source_name}
@@ -2678,6 +2686,13 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
     latest_tasks: dict[int, Task] = {}
     for task in session.scalars(select(Task).where(Task.wave_id.in_(wave_ids)).order_by(Task.wave_id, Task.id.desc())):
         latest_tasks.setdefault(task.wave_id, task)
+    source_clock_now: dict[int, datetime] = {}
+    for _wave, row_source in rows:
+        if runtime_context.is_simulation and row_source.simulation_execution_id:
+            source_clock_now.setdefault(
+                row_source.id,
+                cloud_backend.clock(row_source.simulation_execution_id).effective_now,
+            )
 
     def phase(kind: str, start: datetime | None, end: datetime | None, *, planned: bool = False) -> dict | None:
         if not start or not end or end <= start:
@@ -2685,12 +2700,16 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         return {"kind": kind, "start_at": start, "end_at": end, "planned": planned}
 
     board_waves = []
-    for wave, source_name in rows:
+    for wave, row_source in rows:
+        row_source_name = row_source.name
         times = object_times.get(wave.id, {})
-        request_at = times.get("restore_requested_at")
-        available_at = times.get("last_available_at")
-        transfer_started_at = times.get("transfer_started_at")
-        transfer_completed_at = times.get("transfer_completed_at")
+        simulated = runtime_context.is_simulation and bool(row_source.simulation_execution_id)
+        request_at = wave.restore_requested_virtual_at if simulated else times.get("restore_requested_at")
+        first_available_at = wave.first_restore_available_virtual_at if simulated else times.get("first_available_at")
+        available_at = wave.last_restore_available_virtual_at if simulated else times.get("last_available_at")
+        transfer_started_at = wave.transfer_started_virtual_at if simulated else times.get("transfer_started_at")
+        transfer_completed_at = wave.transfer_completed_virtual_at if simulated else times.get("transfer_completed_at")
+        effective_now = source_clock_now.get(row_source.id, now)
         task = latest_tasks.get(wave.id)
         phases = []
         queue_end = request_at or wave.planned_restore_at
@@ -2703,7 +2722,7 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             if restore_start else None
         )
         if request_at:
-            restore_end = available_at or transfer_started_at or now
+            restore_end = available_at or transfer_started_at or effective_now
         else:
             restore_end = expected_available_at
         restore = phase("RESTORE", restore_start, restore_end, planned=not bool(request_at))
@@ -2723,7 +2742,7 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
                 phases.append(ready)
         transfer_start = transfer_started_at or wave.planned_transfer_start_at
         if transfer_started_at:
-            transfer_end = transfer_completed_at or now
+            transfer_end = transfer_completed_at or effective_now
         elif transfer_start:
             transfer_end = transfer_start + timedelta(seconds=max(1, int(wave.predicted_transfer_seconds or 0)))
         else:
@@ -2739,10 +2758,10 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         elif available_at and not transfer_started_at:
             status = "RESTORED"
         board_waves.append({
-            "wave_id": wave.id, "wave_name": wave.name, "source_name": source_name,
+            "wave_id": wave.id, "wave_name": wave.name, "source_name": row_source_name,
             "pipeline_run_id": wave.pipeline_run_id,
             "status": status, "task_state": task.state if task else None,
-            "started_at": request_at or transfer_started_at,
+            "started_at": request_at or transfer_started_at or (wave.created_at if not simulated else None),
             "completed_at": transfer_completed_at if status in {"COMPLETED", "VERIFIED", "TRANSFERRED"} else None,
             "planned_restore_at": wave.planned_restore_at,
             "expected_restore_available_at": expected_available_at,

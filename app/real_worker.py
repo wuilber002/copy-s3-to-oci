@@ -404,6 +404,34 @@ def simulation_execution_context(source: Source) -> ExecutionContext:
     )
 
 
+def simulation_virtual_now(source: Source) -> datetime:
+    """Read the source-owned virtual clock as a durable phase timestamp."""
+    payload = SimulatorAdminClient(runtime_context.simulator_base_url).clock_status(
+        source.simulation_execution_id
+    )
+    value = datetime.fromisoformat(str(payload["virtual_now"]).replace("Z", "+00:00"))
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+@contextmanager
+def simulation_phase_clock_hold(source: Source, phase: str):
+    """Prevent accelerated virtual time from consuming retention during work.
+
+    PostgreSQL task leases and retry delays remain on wall-clock time.  Only
+    the virtual AWS/OCI behavior is paused, so a long local streaming pass or
+    many HeadObject calls cannot artificially expire a restored object.
+    """
+    if not runtime_context.is_simulation:
+        yield
+        return
+    admin = SimulatorAdminClient(runtime_context.simulator_base_url)
+    admin.control_clock(source.simulation_execution_id, "HOLD")
+    try:
+        yield
+    finally:
+        admin.control_clock(source.simulation_execution_id, "RELEASE")
+
+
 def inventory_timestamp(value: str | None):
     if not value:
         return None
@@ -949,6 +977,7 @@ def submit_restore_simulated(
     wave.manifest_key = manifest_key
     wave.manifest_etag = manifest_sha.hexdigest()
     wave.status = "RESTORE_REQUESTED"
+    wave.restore_requested_virtual_at = wave.restore_requested_virtual_at or simulation_virtual_now(source)
     requested_at = utcnow()
     for obj in archives:
         obj.state = ObjectState.RESTORE_REQUESTED
@@ -1098,6 +1127,7 @@ def poll_restore_simulated(
     wave.last_availability_poll_objects = len(pending_archives)
     wave.last_availability_poll_seconds = poll_elapsed
     availability_observed_at = utcnow()
+    availability_virtual_at = simulation_virtual_now(source)
     for obj in objects:
         if obj.storage_class not in ARCHIVE_CLASSES or obj.id in ready_expiries:
             if obj.state in {
@@ -1140,6 +1170,9 @@ def poll_restore_simulated(
             or 0
         )
         if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
+            wave.first_restore_available_virtual_at = (
+                wave.first_restore_available_virtual_at or availability_virtual_at
+            )
             ensure_transfer_task(session, wave)
             event(
                 session,
@@ -1169,6 +1202,8 @@ def poll_restore_simulated(
         )
         return
     wave.status = "RESTORED"
+    wave.first_restore_available_virtual_at = wave.first_restore_available_virtual_at or availability_virtual_at
+    wave.last_restore_available_virtual_at = availability_virtual_at
     event(
         session,
         "SIMULATED_RESTORE_AVAILABLE",
@@ -1183,7 +1218,8 @@ def poll_restore_simulated(
 def poll_restore(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
     if runtime_context.is_simulation:
-        poll_restore_simulated(session, task, settings, wave, source)
+        with simulation_phase_clock_hold(source, "restore availability polling"):
+            poll_restore_simulated(session, task, settings, wave, source)
         return
     # Keep the control-bucket layout in sync with submission.  The completion
     # report lives under the source-specific Raijin prefix, not the legacy
@@ -1865,12 +1901,23 @@ def transfer_object_simulated(
 
 
 def transfer_wave(session, task: Task, settings) -> None:
+    wave = session.get(Wave, task.wave_id)
+    if runtime_context.is_simulation:
+        with simulation_phase_clock_hold(wave.source, "wave transfer"):
+            _transfer_wave(session, task, settings)
+        return
+    _transfer_wave(session, task, settings)
+
+
+def _transfer_wave(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
     # Reflect the claimed transfer immediately.  Establishing AWS clients can
     # take a few seconds (or retry credentials), and leaving the wave as
     # READY_FOR_RESTORE during that interval is misleading for Standard data,
     # which never needs a restore request.
     wave.status = "TRANSFERRING"
+    if runtime_context.is_simulation:
+        wave.transfer_started_virtual_at = wave.transfer_started_virtual_at or simulation_virtual_now(source)
     session.commit()
     if runtime_context.is_real:
         s3, _, _ = aws_clients(settings, source.aws_region, source)
@@ -1936,6 +1983,8 @@ def transfer_wave(session, task: Task, settings) -> None:
         event(session, "PARTIAL_TRANSFER_COMPLETED", f"Transferred currently available objects; {waiting_restore} object(s) still await restore.", source_id=source.id, wave_id=wave.id)
     else:
         wave.status = "COMPLETED" if not remaining and not delivery_pending else "TRANSFERRED_WITH_ERRORS"
+        if runtime_context.is_simulation and wave.status == "COMPLETED":
+            wave.transfer_completed_virtual_at = simulation_virtual_now(source)
         event(session, "TRANSFER_COMPLETED", f"Wave transfer completed; {remaining} object(s) pending or failed and {delivery_pending} object(s) without OCI cryptographic delivery evidence.", source_id=source.id, wave_id=wave.id)
     if wave.pipeline_run_id:
         run = session.get(DynamicPipelineRun, wave.pipeline_run_id)

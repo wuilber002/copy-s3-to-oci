@@ -33,6 +33,7 @@ class BackendClock:
     effective_now: datetime
     acceleration: float = 1.0
     paused: bool = False
+    held: bool = False
 
 
 class CloudBackend(Protocol):
@@ -95,6 +96,7 @@ class SimulatedCloudBackend:
             effective_now=self._datetime(payload["virtual_now"]),
             acceleration=float(payload["acceleration"]),
             paused=bool(payload["paused"]),
+            held=bool(payload.get("held", False)),
         )
 
 

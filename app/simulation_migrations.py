@@ -81,4 +81,23 @@ def migrate(engine: Engine) -> int:
                 )
             )
             session.commit()
+        revision = 3
+    if revision < 4:
+        columns = {item["name"] for item in inspect(engine).get_columns("sim_clocks")}
+        with engine.begin() as connection:
+            if "hold_count" not in columns:
+                connection.execute(text(
+                    "ALTER TABLE sim_clocks ADD COLUMN hold_count INTEGER NOT NULL DEFAULT 0"
+                ))
+            if "held_virtual_at" not in columns:
+                timestamp_type = "TIMESTAMP WITH TIME ZONE" if engine.dialect.name == "postgresql" else "DATETIME"
+                connection.execute(text(
+                    f"ALTER TABLE sim_clocks ADD COLUMN held_virtual_at {timestamp_type}"
+                ))
+        with Session(engine) as session:
+            session.add(SimulationSchemaRevision(
+                version=4,
+                description="Phase-owned virtual clock holds",
+            ))
+            session.commit()
     return SIMULATION_SCHEMA_VERSION
