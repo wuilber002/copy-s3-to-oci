@@ -22,7 +22,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, list_sources, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, internal_rate_value, list_sources, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -877,6 +877,16 @@ def test_cost_pricing_keeps_rates_optional_but_non_negative():
     assert CostPricing.__tablename__ == "cost_pricing"
 
 
+def test_public_price_presentation_matches_aws_price_list_units_without_changing_internal_math():
+    # Existing calculation storage uses GiB and Batch/1,000.  The UI now
+    # exposes the public AWS units: decimal GB and Batch/1,000,000 objects.
+    public_data_rate = 0.023
+    internal_data_rate = internal_rate_value("aws_restore_temp_standard_usd_per_gib_month", public_data_rate)
+    assert public_rate_value("aws_restore_temp_standard_usd_per_gib_month", internal_data_rate) == pytest.approx(public_data_rate)
+    assert public_rate_value("aws_batch_object_usd_per_1000", 0.001) == pytest.approx(1.0)
+    assert internal_rate_value("aws_batch_object_usd_per_1000", 1.0) == pytest.approx(0.001)
+
+
 def test_public_aws_price_list_maps_only_supported_s3_rates():
     def product(sku, group, price):
         return ({"sku": sku, "attributes": {"group": group}}, {sku: {"term": {"priceDimensions": {"rate": {"pricePerUnit": {"USD": str(price)}}}}}})
@@ -971,8 +981,8 @@ def test_wave_cost_estimator_documents_transparent_unit_assumptions():
     for component in ("S3 Batch Operations job", "AWS data transfer out to OCI", "Optional deep SHA-256 audit OCI reads"):
         assert component in estimator
     assert "pricing.expected_restore_poll_cycles" in estimator
-    assert "if pricing.include_aws_transfer_out:" in estimator
-    assert "if pricing.include_oci_costs:" in estimator
+    assert "include_aws_transfer_out =" in estimator
+    assert "include_oci_costs =" in estimator
     assert '"total_completeness"' in estimator
     assert "never a promise" in estimator
 

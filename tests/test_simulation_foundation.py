@@ -191,6 +191,6 @@ def test_simulation_guard_exposes_operational_apis_but_blocks_real_cloud_configu
     assert 'path.startswith("/api/oci/")' in main
     assert 'path.startswith("/api/aws-secrets")' in main
     assert 'path.startswith("/api/aws-connections")' in main
-    assert 'path.startswith("/api/global-aws-pricing")' in main
+    assert 'path.startswith("/api/global-aws-pricing")' not in main
     assert 'path == "/api/sources" and request.method == "POST"' in main
     assert "This real-cloud configuration endpoint is unavailable in Simulation mode" in main

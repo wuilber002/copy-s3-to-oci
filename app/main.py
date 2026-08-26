@@ -1031,7 +1031,6 @@ async def simulation_foundation_guard(request: FastAPIRequest, call_next):
             or path.startswith("/api/oci/")
             or path.startswith("/api/aws-secrets")
             or path.startswith("/api/aws-connections")
-            or path.startswith("/api/global-aws-pricing")
         )
         # The regular source form creates cloud-backed sources. Simulated
         # sources are created from immutable scenarios on /simulation.
@@ -1441,6 +1440,58 @@ PRICING_RATE_FIELDS = (
     "oci_get_usd_per_10000", "oci_storage_usd_per_gib_month",
 )
 
+# The database retains the original calculation units (GiB and, for Batch
+# objects, per 1,000) so existing connection overrides remain correct.  The
+# operator-facing contract deliberately mirrors the AWS Price List: decimal
+# GB and one million Batch objects.  Conversion happens exactly at the API
+# boundary and is never hidden inside a displayed price.
+DECIMAL_GB_PER_GIB = 1024**3 / 1_000_000_000
+PUBLIC_GB_RATE_FIELDS = {
+    "aws_glacier_bulk_retrieval_usd_per_gib",
+    "aws_glacier_standard_retrieval_usd_per_gib",
+    "aws_deep_archive_bulk_retrieval_usd_per_gib",
+    "aws_deep_archive_standard_retrieval_usd_per_gib",
+    "aws_transfer_out_usd_per_gib",
+    "aws_restore_temp_standard_usd_per_gib_month",
+}
+PUBLIC_BATCH_MILLION_OBJECT_FIELD = "aws_batch_object_usd_per_1000"
+
+
+def public_rate_value(field: str, value: float | None) -> float | None:
+    """Convert an internal calculation rate to its AWS Price List unit."""
+    if value is None:
+        return None
+    if field in PUBLIC_GB_RATE_FIELDS:
+        return float(value) / DECIMAL_GB_PER_GIB
+    if field == PUBLIC_BATCH_MILLION_OBJECT_FIELD:
+        return float(value) * 1000
+    return float(value)
+
+
+def internal_rate_value(field: str, value: float | None) -> float | None:
+    """Convert an operator supplied Price List value to calculation units."""
+    if value is None:
+        return None
+    if field in PUBLIC_GB_RATE_FIELDS:
+        return float(value) * DECIMAL_GB_PER_GIB
+    if field == PUBLIC_BATCH_MILLION_OBJECT_FIELD:
+        return float(value) / 1000
+    return float(value)
+
+
+def public_rate_unit(field: str) -> str:
+    if field == "aws_batch_job_usd":
+        return "USD/job"
+    if field == PUBLIC_BATCH_MILLION_OBJECT_FIELD:
+        return "USD/1,000,000 objects"
+    if field in {"aws_s3_put_list_usd_per_1000", "aws_s3_get_usd_per_1000"}:
+        return "USD/1,000 requests"
+    if field == "aws_restore_temp_standard_usd_per_gib_month":
+        return "USD/GB-month"
+    if field in PUBLIC_GB_RATE_FIELDS:
+        return "USD/GB"
+    return "USD/unit"
+
 
 def pricing_or_create(session: Session, connection_id: int) -> CostPricing:
     pricing = session.scalar(select(CostPricing).where(CostPricing.aws_connection_id == connection_id))
@@ -1456,7 +1507,9 @@ def pricing_dict(pricing: CostPricing) -> dict:
             "reference": pricing.reference, "expected_restore_poll_cycles": pricing.expected_restore_poll_cycles,
             "include_aws_transfer_out": pricing.include_aws_transfer_out,
             "include_oci_costs": pricing.include_oci_costs,
-            **{field: getattr(pricing, field) for field in PRICING_RATE_FIELDS}, "updated_at": pricing.updated_at}
+            **{field: public_rate_value(field, getattr(pricing, field)) for field in PRICING_RATE_FIELDS},
+            "rate_units": {field: public_rate_unit(field) for field in PRICING_RATE_FIELDS},
+            "updated_at": pricing.updated_at}
 
 
 AWS_PUBLIC_S3_REGION_URL = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonS3/current/{region}/index.json"
@@ -1502,8 +1555,9 @@ def public_s3_rates_from_catalog(catalog: dict) -> dict[str, float]:
         price = first_on_demand_usd({"OnDemand": (catalog.get("terms") or {}).get("OnDemand", {}).get(sku, {})}) if sku else None
         if price is None:
             continue
-        # AWS publishes byte/GB prices in decimal GB. Raijin presents binary
-        # GiB, so normalize all data-sized rates here once.
+        # AWS publishes byte/GB prices in decimal GB. Keep calculation rates
+        # normalized to GiB; ``global_pricing_summary`` exposes the original
+        # AWS units separately for the operator-facing catalog.
         data_price = price * (1024**3 / 1_000_000_000)
         batch_fee = str(attributes.get("feeDescription") or "").lower()
         usage_type = str(attributes.get("usagetype") or "")
@@ -1585,6 +1639,8 @@ def global_pricing_summary(session: Session, aws_region: str) -> dict:
     row = session.scalar(select(GlobalAwsPricing).where(GlobalAwsPricing.aws_region == aws_region))
     rates = json.loads(row.rates_json or "{}") if row else {}
     return {"aws_region": aws_region, "currency": row.currency if row else "USD", "rates": rates,
+            "display_rates": {field: public_rate_value(field, value) for field, value in rates.items()},
+            "rate_units": {field: public_rate_unit(field) for field in rates},
             "source_url": row.source_url if row else None, "fetched_at": row.fetched_at if row else None,
             "error": row.error if row else None}
 
@@ -1597,7 +1653,7 @@ def active_pricing_regions(session: Session) -> list[str]:
     public price list as the S3 operations it records.
     """
     connection_regions = session.scalars(select(AwsConnection.default_region).where(AwsConnection.archived_at.is_(None)))
-    source_regions = session.scalars(select(Source.aws_region).where(Source.archived_at.is_(None), Source.aws_connection_id.is_not(None)))
+    source_regions = session.scalars(select(Source.aws_region).where(Source.archived_at.is_(None)))
     return sorted({region for region in [*connection_regions, *source_regions] if region})
 
 
@@ -1627,9 +1683,10 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     supplies their regional/contractual prices for the connection.
     """
     source = wave.source
-    if not source.aws_connection_id:
-        raise HTTPException(status_code=409, detail="Wave source has no AWS connection pricing profile")
-    pricing = pricing_or_create(session, source.aws_connection_id)
+    # Simulated sources intentionally have no Secret-backed AWS connection.
+    # They still use the same public catalog and billable-unit model, but do
+    # not offer per-account contractual overrides or OCI price overrides.
+    pricing = pricing_or_create(session, source.aws_connection_id) if source.aws_connection_id else None
     public = global_pricing_summary(session, source.aws_region)
     public_rates = public["rates"]
     settings = runtime_settings(session)
@@ -1654,10 +1711,11 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     def add(key: str, label: str, quantity: float, unit: str, rate_field: str, divisor: float = 1, category: str = "one_time") -> None:
         if not quantity:
             return
-        custom_rate = getattr(pricing, rate_field)
+        custom_rate = getattr(pricing, rate_field) if pricing is not None else None
         rate = custom_rate if custom_rate is not None else public_rates.get(rate_field)
         entry = {"key": key, "label": label, "quantity": quantity, "unit": unit,
                  "rate_field": rate_field, "rate": rate, "category": category,
+                 "rate_display": public_rate_value(rate_field, rate), "rate_unit": public_rate_unit(rate_field),
                  "rate_source": "connection" if custom_rate is not None else ("aws_public" if rate is not None else "missing")}
         if rate is None:
             entry["cost"] = None
@@ -1671,7 +1729,8 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
         add("batch_job", "S3 Batch Operations job", 1, "job", "aws_batch_job_usd")
         add("batch_objects", "S3 Batch Operations object tasks", len(archived), "objects", "aws_batch_object_usd_per_1000", 1000)
         add("manifest_put", "S3 manifest write", 1, "requests", "aws_s3_put_list_usd_per_1000", 1000)
-        add("restore_polling", "S3 restore availability checks (HeadObject)", len(archived) * pricing.expected_restore_poll_cycles, "requests", "aws_s3_get_usd_per_1000", 1000)
+        poll_cycles = pricing.expected_restore_poll_cycles if pricing is not None else 24
+        add("restore_polling", "S3 restore availability checks (HeadObject)", len(archived) * poll_cycles, "requests", "aws_s3_get_usd_per_1000", 1000)
         add("restore_temp", "Temporary S3 Standard restored copy", (glacier_gib + deep_gib) * wave.restore_days / 30, "GiB-month", "aws_restore_temp_standard_usd_per_gib_month")
         retrieval_field = "aws_glacier_bulk_retrieval_usd_per_gib" if wave.restore_tier == "BULK" else "aws_glacier_standard_retrieval_usd_per_gib"
         add("glacier_retrieval", f"S3 Glacier {wave.restore_tier} retrieval", glacier_gib, "GiB", retrieval_field)
@@ -1681,9 +1740,11 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     add("source_reads", "S3 object reads during transfer", len(objects), "requests", "aws_s3_get_usd_per_1000", 1000)
     if settings.preserve_s3_tags:
         add("tag_reads", "S3 object-tag reads", len(objects), "requests", "aws_s3_get_usd_per_1000", 1000)
-    if pricing.include_aws_transfer_out:
+    include_aws_transfer_out = pricing.include_aws_transfer_out if pricing is not None else True
+    include_oci_costs = pricing.include_oci_costs if pricing is not None else False
+    if include_aws_transfer_out:
         add("aws_transfer_out", "AWS data transfer out to OCI", total_gib, "GiB", "aws_transfer_out_usd_per_gib")
-    if pricing.include_oci_costs:
+    if include_oci_costs:
         add("oci_writes", "OCI Object Storage write operations", oci_put_operations, "operations", "oci_put_usd_per_10000", 10000)
         add("oci_storage", "OCI destination storage (one month)", total_gib, "GiB-month", "oci_storage_usd_per_gib_month", category="recurring")
         add("deep_audit", "Optional deep SHA-256 audit OCI reads", len(objects), "operations", "oci_get_usd_per_10000", 10000, category="optional")
@@ -1692,8 +1753,11 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     optional = [item["cost"] for item in components if item["category"] == "optional"]
     def estimated(values: list[float | None]) -> float:
         return round(sum(value for value in values if value is not None), 6)
-    return {"wave_id": wave.id, "connection_id": source.aws_connection_id, "connection_label": source.aws_connection.label,
-            "currency": pricing.currency.upper(), "pricing_reference": pricing.reference, "pricing_updated_at": pricing.updated_at,
+    return {"wave_id": wave.id, "connection_id": source.aws_connection_id,
+            "connection_label": source.aws_connection.label if source.aws_connection else "AWS public Price List (simulation)",
+            "currency": pricing.currency.upper() if pricing is not None else public["currency"].upper(),
+            "pricing_reference": pricing.reference if pricing is not None else "Public AWS Price List; no contractual overrides in Simulation mode",
+            "pricing_updated_at": pricing.updated_at if pricing is not None else public.get("fetched_at"),
             "global_pricing": public,
             "complete": not missing_by_category["one_time"] and not unpriced_archive_gib,
             "missing_rates": sorted(set(missing)), "unpriced_archive_gib": round(unpriced_archive_gib, 6),
@@ -1703,7 +1767,8 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
                                    "optional_deep_audit": not missing_by_category["optional"]},
             "quantities": {"objects": len(objects), "archive_objects": len(archived), "bytes": total_bytes,
                            "source_inventory_objects": int(source_objects), "multipart_part_mib": settings.multipart_part_size_mib,
-                           "estimated_poll_cycles": pricing.expected_restore_poll_cycles, "oci_write_operations": oci_put_operations},
+                           "estimated_poll_cycles": pricing.expected_restore_poll_cycles if pricing is not None else 24,
+                           "oci_write_operations": oci_put_operations},
             "components": components}
 
 
@@ -3088,6 +3153,8 @@ def update_cost_pricing(connection_id: int, payload: CostPricingUpdate, session:
     connection = connection_or_404(session, connection_id)
     pricing = pricing_or_create(session, connection_id)
     for field, value in payload.model_dump().items():
+        if field in PRICING_RATE_FIELDS:
+            value = internal_rate_value(field, value)
         setattr(pricing, field, value)
     record_event(session, "COST_PRICING_UPDATED", f"Cost pricing updated for AWS connection '{connection.label}'", source_id=None)
     session.commit()
@@ -3122,7 +3189,7 @@ def get_global_aws_pricing(session: Session = Depends(get_session)) -> list[dict
 def refresh_global_aws_pricing_now(session: Session = Depends(get_session)) -> dict:
     regions = active_pricing_regions(session)
     if not regions:
-        raise HTTPException(status_code=409, detail="No active AWS connections are available for public pricing refresh")
+        raise HTTPException(status_code=409, detail="No active source region is available for public pricing refresh")
     updated = []
     for region in regions:
         try:
