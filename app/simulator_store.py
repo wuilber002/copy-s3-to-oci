@@ -506,16 +506,25 @@ class SimulatorStore:
         return virtual + timedelta(seconds=(current - anchor).total_seconds() * clock.acceleration)
 
     def pause_running_clocks_after_startup(self) -> int:
-        """Fail-safe: a VM/service restart never advances scenarios silently."""
+        """Fail-safe recovery for both accelerated clocks and in-flight holds.
+
+        A phase hold belongs to a live worker process.  After a restart that
+        process no longer exists, therefore preserving the hold would freeze a
+        scenario forever.  Convert its frozen virtual instant into a manual
+        pause and clear the orphaned reference count.
+        """
         self.require_current_schema()
         changed = 0
         with self.sessions() as session:
-            clocks = list(session.scalars(select(SimulationClock).where(SimulationClock.paused.is_(False))))
+            clocks = list(session.scalars(select(SimulationClock)))
             now = datetime.now(timezone.utc)
             for clock in clocks:
-                clock.paused_virtual_at = self._clock_now(clock, now)
+                current = self._clock_now(clock, now)
+                if not clock.paused or int(clock.hold_count or 0) > 0:
+                    changed += 1
+                clock.paused_virtual_at = current
                 clock.paused = True
-                changed += 1
+                clock.hold_count, clock.held_virtual_at = 0, None
             session.commit()
         return changed
 

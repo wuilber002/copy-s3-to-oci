@@ -80,6 +80,16 @@ def test_phase_hold_freezes_virtual_time_without_pausing_real_task_time(virtual_
     assert released["virtual_now"].replace(tzinfo=None) >= held["virtual_now"].replace(tzinfo=None)
 
 
+def test_startup_recovers_an_orphaned_phase_hold(virtual_cloud):
+    _engine, execution, _materialized = virtual_cloud
+    store = _engine.store
+    store.control_clock(execution.id, "HOLD")
+    assert store.clock_status(execution.id)["held"]
+    assert store.pause_running_clocks_after_startup() >= 1
+    recovered = store.clock_status(execution.id)
+    assert recovered["paused"] and not recovered["held"]
+
+
 def test_control_network_profile_uses_virtual_time_for_degradation_and_outage():
     database = create_engine("sqlite+pysqlite:///:memory:")
     migrate(database)
