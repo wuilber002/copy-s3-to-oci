@@ -46,6 +46,15 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def source_scheduler_clock(source: "Source"):
+    """Return the source clock used only by migration planning.
+
+    Durable queue leases, retry delays and task availability deliberately keep
+    using the real system clock.  Only simulated cloud time is accelerated.
+    """
+    return cloud_backend.clock(source.simulation_execution_id)
+
+
 def restore_availability_poll_delay_seconds(accepted_at: datetime | None, now: datetime,
                                             restore_tier: str, partial_availability: bool = False,
                                             transfer_strategy: str = "AFTER_ALL_RESTORED",
@@ -412,6 +421,7 @@ class DynamicPipelineRun(Base):
     historical_samples: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    source: Mapped[Source] = relationship()
 
 
 class RestoreAttempt(Base):
@@ -1736,6 +1746,34 @@ def runtime_identity() -> dict:
             "backend_operations_enabled": readiness.operations_enabled,
             "backend_contract_version": readiness.contract_version,
             "backend_capabilities": list(readiness.capabilities)}
+
+
+@app.get("/api/runtime/clock")
+def runtime_clock(source_id: int | None = Query(default=None, ge=1),
+                  session: Session = Depends(get_session)) -> dict:
+    """Expose the real system clock and the active source's simulation clock."""
+    source = session.get(Source, source_id) if source_id else None
+    if source_id and source is None:
+        raise HTTPException(status_code=404, detail="Source not found")
+    if runtime_context.is_simulation and source is None:
+        source = session.scalar(
+            select(Source).join(DynamicPipelineRun, DynamicPipelineRun.source_id == Source.id).where(
+                Source.archived_at.is_(None),
+                DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
+            ).order_by(DynamicPipelineRun.created_at.desc(), DynamicPipelineRun.id.desc()).limit(1)
+        )
+    clock = source_scheduler_clock(source) if source else None
+    system_now = clock.real_now if clock else utcnow()
+    return {
+        "operation_mode": runtime_context.mode.value,
+        "source_id": source.id if source else None,
+        "source_name": source.name if source else None,
+        "execution_id": source.simulation_execution_id if source else None,
+        "system_now": system_now,
+        "virtual_now": clock.effective_now if runtime_context.is_simulation and source else None,
+        "acceleration": clock.acceleration if clock else 1.0,
+        "paused": clock.paused if clock else False,
+    }
 
 
 @app.post("/api/runtime/mode", status_code=202)
@@ -4307,7 +4345,7 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
     until the wave reaches a terminal success state; this avoids restoring an
     unbounded set of temporary copies while preserving the transfer pipeline.
     """
-    now = now or utcnow()
+    queue_now = utcnow()
     released = 0
     active_statuses = {"RESTORE_REQUESTED", "RESTORE_REQUEST_ACCEPTED", "RESTORING", "RESTORED", "TRANSFERRING"}
     runs = list(session.scalars(select(DynamicPipelineRun).where(
@@ -4315,6 +4353,7 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
         DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
     )))
     for run in runs:
+        scheduler_now = now or source_scheduler_clock(run.source).effective_now
         horizon = max(1, int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1))
         waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
             Wave.planned_restore_at, Wave.id
@@ -4327,14 +4366,16 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
         for wave in waves:
             if occupied >= horizon:
                 break
-            if wave.status != "RESTORE_SCHEDULED" or (wave.planned_restore_at and wave.planned_restore_at > now):
+            if wave.status != "RESTORE_SCHEDULED" or (wave.planned_restore_at and wave.planned_restore_at > scheduler_now):
                 continue
             exists = session.scalar(select(Task.id).where(
                 Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
             ).limit(1))
             if exists is not None:
                 continue
-            session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=now))
+            # Task leases always use wall time. A virtual timestamp here would
+            # make the real durable queue wait until that future date.
+            session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=queue_now))
             record_event(session, "DYNAMIC_RESTORE_RELEASED",
                          f"Dynamic pipeline run {run.id} released restore for wave '{wave.name}' within horizon {horizon}",
                          source_id=wave.source_id, wave_id=wave.id)
@@ -4351,13 +4392,13 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
     recalculation only moves a future `RESTORE_SCHEDULED` wave that has no
     Batch task yet, using completed transfer wall time whenever it exists.
     """
-    now = now or utcnow()
     changed = 0
     runs = list(session.scalars(select(DynamicPipelineRun).where(
         DynamicPipelineRun.scheduled_restores.is_(True),
         DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
     )))
     for run in runs:
+        scheduler_now = now or source_scheduler_clock(run.source).effective_now
         run_changed = False
         waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
             Wave.planned_transfer_start_at, Wave.id
@@ -4369,7 +4410,7 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
                 func.min(ObjectRecord.transfer_started_at), func.max(ObjectRecord.transferred_at),
                 func.sum(ObjectRecord.transfer_elapsed_seconds), func.max(ObjectRecord.transfer_elapsed_seconds),
             ).where(ObjectRecord.wave_id == wave.id)).one()
-            planned_start = wave.planned_transfer_start_at or now
+            planned_start = wave.planned_transfer_start_at or scheduler_now
             duration_seconds = max(1, int(wave.predicted_transfer_seconds or 1))
             observed_basis = "prediction"
             # CONTROL transfers intentionally complete in milliseconds of real
@@ -4408,7 +4449,7 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             if wave.status != "RESTORE_SCHEDULED" or has_batch_task:
                 continue
             restore_lead = restore_service_window_seconds(wave.restore_tier) + int(run.restore_safety_seconds or settings.dynamic_restore_safety_seconds)
-            new_restore_at = max(now, start - timedelta(seconds=restore_lead))
+            new_restore_at = max(scheduler_now, start - timedelta(seconds=restore_lead))
             shifted = abs((wave.planned_transfer_start_at - start).total_seconds()) if wave.planned_transfer_start_at else float("inf")
             if shifted >= 60:
                 prior_transfer_at = wave.planned_transfer_start_at
@@ -4436,14 +4477,15 @@ def preview_dynamic_waves(source_id: int, prefix: str = Query(default="", max_le
                           restore_days: int = Query(ge=1, le=30),
                           restore_tier: str = Query(default="BULK", pattern="^(BULK|STANDARD)$"),
                           session: Session = Depends(get_session)) -> dict:
-    active_source_or_409(session, source_id)
+    source = active_source_or_409(session, source_id)
     target_transfer_seconds, reserve_seconds = automatic_dynamic_duration_limit(restore_days)
     result = dynamic_wave_plan(session, source_id, DYNAMIC_PLATFORM_MAX_BYTES, target_transfer_seconds,
                                DYNAMIC_PLATFORM_MAX_OBJECTS, prefix)
     plans = result["waves"]
     for plan in plans:
         plan["restore_tier"] = restore_tier
-    times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
+    scheduler_now = source_scheduler_clock(source).effective_now
+    times = dynamic_schedule_times(scheduler_now, plans, result["settings"].dynamic_restore_safety_seconds)
     total_predicted_seconds = sum(int(plan["predicted_transfer_seconds"]) for plan in plans)
     historical_waves = sum(1 for plan in plans if plan["prediction_samples"] > 0)
     return {
@@ -4454,7 +4496,7 @@ def preview_dynamic_waves(source_id: int, prefix: str = Query(default="", max_le
         "platform_max_bytes": DYNAMIC_PLATFORM_MAX_BYTES,
         "platform_max_objects": DYNAMIC_PLATFORM_MAX_OBJECTS, "profiles": result["profiles"],
         "historical_samples": sum(value["samples"] for value in result["profiles"].values()),
-        "forecast": {"pipeline_completion_at": (times[-1][1] + timedelta(seconds=plans[-1]["predicted_transfer_seconds"])) if times else utcnow(),
+        "forecast": {"pipeline_completion_at": (times[-1][1] + timedelta(seconds=plans[-1]["predicted_transfer_seconds"])) if times else scheduler_now,
                      "total_predicted_transfer_seconds": total_predicted_seconds,
                      "restore_horizon_waves": result["settings"].dynamic_restore_horizon_waves,
                      "historical_waves": historical_waves, "cold_start_waves": len(plans) - historical_waves},
@@ -4484,7 +4526,7 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
     if payload.schedule_restores and not result["settings"].dynamic_pipeline_enabled:
         raise HTTPException(status_code=422, detail="Enable and save the dynamic restore pipeline in Settings before scheduling early restores.")
     schedule_restores = payload.schedule_restores
-    times = dynamic_schedule_times(utcnow(), plans, result["settings"].dynamic_restore_safety_seconds)
+    times = dynamic_schedule_times(source_scheduler_clock(source).effective_now, plans, result["settings"].dynamic_restore_safety_seconds)
     historical_samples = sum(value["samples"] for value in result["profiles"].values())
     run = DynamicPipelineRun(
         source_id=source.id, planner_version="v3-service-window",

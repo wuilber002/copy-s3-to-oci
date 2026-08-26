@@ -219,7 +219,11 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
 - Um fator configurável permitirá representar horas ou dias simulados em
   segundos reais.
 - Batch jobs, disponibilidade de restore, polling, retenção, expiração e
-  janelas planejadas usarão o relógio virtual por uma abstração única de tempo.
+  janelas planejadas usam o relógio virtual por uma abstração única de tempo.
+- Leases, retries e disponibilidade da fila durável permanecem no relógio real;
+  isso impede que uma data virtual futura bloqueie a reivindicação de tarefas.
+- O banner exibe, em linhas alinhadas, o relógio virtual acelerado e o relógio
+  real do sistema, incluindo o fator de aceleração e o estado pausado.
 - Depois de reiniciar a VM, o cenário voltará pausado no último checkpoint;
   somente uma retomada explícita poderá avançar o relógio novamente.
 

@@ -88,6 +88,37 @@ def test_simulated_backend_validates_remote_identity(monkeypatch):
     assert not readiness.operations_enabled
 
 
+def test_backend_clocks_distinguish_real_and_accelerated_simulation_time(monkeypatch):
+    real = RealCloudBackend().clock()
+    assert real.real_now == real.effective_now
+    assert real.acceleration == 1
+    assert not real.paused
+
+    payload = {
+        "execution_id": "execution-1",
+        "real_now": "2026-08-25T22:00:00Z",
+        "virtual_now": "2026-09-04T14:42:22+00:00",
+        "acceleration": 3600,
+        "paused": False,
+    }
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(payload).encode("utf-8")
+
+    monkeypatch.setattr("app.cloud_backends.urlopen", lambda *_args, **_kwargs: Response())
+    simulated = SimulatedCloudBackend(load_runtime_context(simulation_environment())).clock("execution-1")
+    assert simulated.effective_now.isoformat() == "2026-09-04T14:42:22+00:00"
+    assert simulated.acceleration == 3600
+    assert not simulated.paused
+
+
 def test_bootstrap_prepares_an_isolated_simulation_database_and_defaults_to_real():
     bootstrap = Path("scripts/bootstrap.sh").read_text(encoding="utf-8")
     runtime = Path("scripts/start-runtime.sh").read_text(encoding="utf-8")

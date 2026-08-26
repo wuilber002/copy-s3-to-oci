@@ -329,6 +329,16 @@ def test_buttons_use_content_width_and_standard_horizontal_spacing():
     assert 'id="source-edit-action"' in page
 
 
+def test_banner_exposes_synchronized_system_and_simulation_clocks():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    simulation = (ROOT / "app/static/simulation.html").read_text(encoding="utf-8")
+    for document in (page, simulation):
+        assert 'id="banner-clock"' in document
+        assert 'id="virtual-banner-clock"' in document
+        assert 'id="virtual-clock-rate"' in document
+        assert "/api/runtime/clock" in document
+
+
 def test_operational_history_emphasizes_selected_source_in_title():
     page = Path("app/static/index.html").read_text()
 
