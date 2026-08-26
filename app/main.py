@@ -1295,7 +1295,7 @@ def refresh_dynamic_pipeline_run(session: Session, run: DynamicPipelineRun) -> s
                 ObjectRecord.wave_id.in_(select(Wave.id).where(Wave.pipeline_run_id == run.id))
             ))
             run.status, run.completed_at = "COMPLETED", completed_at or utcnow()
-    elif any(status in {"TRANSFERRED_WITH_ERRORS", "RESTORE_REQUEST_FAILED", "VERIFICATION_FAILED"} for status in statuses):
+    elif any(status in {"FAILED", "TRANSFERRED_WITH_ERRORS", "RESTORE_REQUEST_FAILED", "VERIFICATION_FAILED"} for status in statuses):
         if run.status != "COMPLETED":
             run.status = "NEEDS_ATTENTION"
     elif any(status in {"RESTORING", "RESTORED", "TRANSFERRING"} for status in statuses):
@@ -4353,6 +4353,12 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
         DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
     )))
     for run in runs:
+        # A failed wave is a durable operator decision point.  Do not consume
+        # additional restore windows or costs by marching later waves forward
+        # after the transfer lane has already stopped.
+        refresh_dynamic_pipeline_run(session, run)
+        if run.status == "NEEDS_ATTENTION":
+            continue
         scheduler_now = now or source_scheduler_clock(run.source).effective_now
         horizon = max(1, int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1))
         waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
@@ -4398,6 +4404,9 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
         DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
     )))
     for run in runs:
+        refresh_dynamic_pipeline_run(session, run)
+        if run.status == "NEEDS_ATTENTION":
+            continue
         scheduler_now = now or source_scheduler_clock(run.source).effective_now
         run_changed = False
         waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(

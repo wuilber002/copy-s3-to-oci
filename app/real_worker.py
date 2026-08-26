@@ -29,7 +29,7 @@ import boto3
 import oci
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 
 from app.backend_contracts import (
     DescribeRestoreBatchRequest,
@@ -298,7 +298,31 @@ def succeed(session, task: Task, next_kind: str | None = None) -> None:
 
 
 def ensure_transfer_task(session, wave: Wave) -> bool:
-    """Ensure one eligible transfer task exists while restore polling continues."""
+    """Ensure one eligible transfer task exists while restore polling continues.
+
+    A source owns a single transfer lane.  ``AS_OBJECTS_AVAILABLE`` changes
+    *when* files from the current wave may start moving; it does not allow a
+    later wave to overtake an earlier wave.  Keeping this gate here (rather
+    than only in the task claimer) avoids a misleading pile of READY transfer
+    tasks and makes the persisted pipeline order authoritative.
+    """
+    terminal = {"COMPLETED", "VERIFIED", "TRANSFERRED"}
+    predecessor_filters = [Wave.id != wave.id, Wave.status.notin_(terminal)]
+    if wave.pipeline_run_id is not None:
+        predecessor_filters.append(Wave.pipeline_run_id == wave.pipeline_run_id)
+    else:
+        predecessor_filters.append(Wave.source_id == wave.source_id)
+
+    if wave.planned_transfer_start_at is not None:
+        predecessor_filters.append(or_(
+            Wave.planned_transfer_start_at < wave.planned_transfer_start_at,
+            and_(Wave.planned_transfer_start_at == wave.planned_transfer_start_at, Wave.id < wave.id),
+        ))
+    else:
+        predecessor_filters.append(Wave.id < wave.id)
+    predecessor = session.scalar(select(Wave.id).where(*predecessor_filters).limit(1))
+    if predecessor is not None:
+        return False
     existing = session.scalar(select(Task.id).where(
         Task.wave_id == wave.id,
         Task.kind == "TRANSFER_WAVE",

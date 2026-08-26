@@ -22,8 +22,8 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, list_sources, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
-from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, list_sources, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -740,6 +740,49 @@ def test_connection_api_limits_are_durable_and_used_by_workers():
     assert "/operational-limits" in source
     assert 'getattr(connection, "discovery_requests_per_second"' in worker
     assert 'getattr(connection, "restore_poll_requests_per_second"' in worker
+
+
+def test_transfer_lane_releases_only_the_earliest_nonterminal_wave():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    initial = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    with Session() as session:
+        source = Source(id=980, name="one-transfer-lane", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        run = DynamicPipelineRun(id=981, source_id=source.id, scheduled_restores=True)
+        first = Wave(id=982, source_id=source.id, pipeline_run_id=run.id, name="wave-001", max_bytes=1,
+                     restore_days=1, restore_tier="BULK", status="RESTORING", planner_mode="DYNAMIC",
+                     planned_transfer_start_at=initial)
+        later = Wave(id=983, source_id=source.id, pipeline_run_id=run.id, name="wave-002", max_bytes=1,
+                     restore_days=1, restore_tier="BULK", status="RESTORED", planner_mode="DYNAMIC",
+                     planned_transfer_start_at=initial + timedelta(hours=1))
+        session.add_all([source, run, first, later]); session.flush()
+        assert ensure_transfer_task(session, later) is False
+        assert session.scalar(select(Task.id).where(Task.wave_id == later.id)) is None
+        first.status = "COMPLETED"
+        assert ensure_transfer_task(session, later) is True
+        assert session.scalar(select(Task.id).where(Task.wave_id == later.id)) is not None
+
+
+def test_failed_dynamic_wave_stops_future_restore_releases():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    initial = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    with Session() as session:
+        source = Source(id=984, name="stop-on-failure", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        settings = RuntimeSettings(id=1, dynamic_pipeline_enabled=True, dynamic_restore_horizon_waves=2)
+        run = DynamicPipelineRun(id=985, source_id=source.id, scheduled_restores=True, restore_horizon_waves=2)
+        failed = Wave(id=986, source_id=source.id, pipeline_run_id=run.id, name="wave-001", max_bytes=1,
+                      restore_days=1, restore_tier="BULK", status="FAILED", planner_mode="DYNAMIC",
+                      planned_restore_at=initial, planned_transfer_start_at=initial + timedelta(hours=48))
+        future = Wave(id=987, source_id=source.id, pipeline_run_id=run.id, name="wave-002", max_bytes=1,
+                      restore_days=1, restore_tier="BULK", status="RESTORE_SCHEDULED", planner_mode="DYNAMIC",
+                      planned_restore_at=initial, planned_transfer_start_at=initial + timedelta(hours=49))
+        session.add_all([source, settings, run, failed, future]); session.flush()
+        assert refresh_dynamic_pipeline_run(session, run) == "NEEDS_ATTENTION"
+        assert release_dynamic_restore_horizon(session, settings, now=initial + timedelta(days=3)) == 0
+        assert session.scalar(select(Task.id).where(Task.wave_id == future.id, Task.kind == "SUBMIT_BATCH_RESTORE")) is None
 
 
 def test_long_restore_polling_heartbeats_its_lease_and_checkpoints_progress():
