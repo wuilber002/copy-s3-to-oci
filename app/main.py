@@ -2777,13 +2777,14 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             )
 
     def phase(kind: str, start: datetime | None, end: datetime | None, *, planned: bool = False,
-              expected_seconds: int | None = None) -> dict | None:
+              expected_seconds: int | None = None, elapsed_seconds: int | None = None) -> dict | None:
         if not start or not end or end <= start:
             return None
         return {
             "kind": kind, "start_at": start, "end_at": end, "planned": planned,
             "expected_seconds": expected_seconds,
-            "elapsed_seconds": max(0, int((end - start).total_seconds())),
+            "elapsed_seconds": max(0, int(elapsed_seconds)) if elapsed_seconds is not None
+            else (0 if planned else max(0, int((end - start).total_seconds()))),
         }
 
     board_waves = []
@@ -2812,8 +2813,10 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             restore_end = available_at or transfer_started_at or effective_now
         else:
             restore_end = expected_available_at
+        restore_progress_seconds = max(0, int((restore_end - restore_start).total_seconds())) if restore_start and restore_end else 0
         restore = phase("RESTORE", restore_start, restore_end, planned=not bool(request_at),
-                        expected_seconds=restore_service_window_seconds(wave.restore_tier))
+                        expected_seconds=restore_service_window_seconds(wave.restore_tier),
+                        elapsed_seconds=restore_progress_seconds)
         if restore:
             phases.append(restore)
         # The orange forecast ends at the tier service window. Safety and
@@ -2821,7 +2824,8 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         # gap, expose it separately as readiness/waiting time.
         if request_at and not available_at and expected_available_at:
             forecast_restore = phase("RESTORE", restore_end, expected_available_at, planned=True,
-                                     expected_seconds=restore_service_window_seconds(wave.restore_tier))
+                                     expected_seconds=restore_service_window_seconds(wave.restore_tier),
+                                     elapsed_seconds=restore_progress_seconds)
             if forecast_restore:
                 phases.append(forecast_restore)
         ready_start = available_at or expected_available_at
