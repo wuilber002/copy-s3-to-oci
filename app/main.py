@@ -2774,13 +2774,41 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
     latest_tasks: dict[int, Task] = {}
     for task in session.scalars(select(Task).where(Task.wave_id.in_(wave_ids)).order_by(Task.wave_id, Task.id.desc())):
         latest_tasks.setdefault(task.wave_id, task)
+    # The board is an observability endpoint and must remain available while a
+    # large simulation is busy.  In particular, do not perform one clock HTTP
+    # call per wave: ``dict.setdefault`` evaluates its value argument before
+    # deciding whether the key already exists.  One stalled simulator request
+    # must not turn an otherwise local, durable timeline into a 500 response.
     source_clock_now: dict[int, datetime] = {}
     for _wave, row_source in rows:
-        if runtime_context.is_simulation and row_source.simulation_execution_id:
-            source_clock_now.setdefault(
-                row_source.id,
-                cloud_backend.clock(row_source.simulation_execution_id).effective_now,
+        if (not runtime_context.is_simulation or not row_source.simulation_execution_id
+                or row_source.id in source_clock_now):
+            continue
+        persisted_virtual_points = [
+            item
+            for candidate_wave, candidate_source in rows
+            if candidate_source.id == row_source.id
+            for item in (
+                candidate_wave.restore_requested_virtual_at,
+                candidate_wave.first_restore_available_virtual_at,
+                candidate_wave.last_restore_available_virtual_at,
+                candidate_wave.transfer_started_virtual_at,
+                candidate_wave.transfer_completed_virtual_at,
+                candidate_wave.planned_restore_at,
+                candidate_wave.planned_transfer_start_at,
             )
+            if item is not None
+        ]
+        persisted_now = max(persisted_virtual_points) if persisted_virtual_points else now
+        try:
+            source_clock_now[row_source.id] = cloud_backend.clock(
+                row_source.simulation_execution_id
+            ).effective_now
+        except (OSError, TimeoutError, ValueError):
+            # The known virtual milestone is sufficient to render a stable,
+            # truthful snapshot.  The next dashboard refresh will use the
+            # live clock again once the simulator is responsive.
+            source_clock_now[row_source.id] = persisted_now
 
     def phase(kind: str, start: datetime | None, end: datetime | None, *, planned: bool = False,
               expected_seconds: int | None = None, elapsed_seconds: int | None = None) -> dict | None:
