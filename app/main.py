@@ -1713,7 +1713,10 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
             return
         custom_rate = getattr(pricing, rate_field) if pricing is not None else None
         rate = custom_rate if custom_rate is not None else public_rates.get(rate_field)
+        display_quantity = quantity * DECIMAL_GB_PER_GIB if rate_field in PUBLIC_GB_RATE_FIELDS else quantity
+        display_unit = unit.replace("GiB", "GB") if rate_field in PUBLIC_GB_RATE_FIELDS else unit
         entry = {"key": key, "label": label, "quantity": quantity, "unit": unit,
+                 "display_quantity": display_quantity, "display_unit": display_unit,
                  "rate_field": rate_field, "rate": rate, "category": category,
                  "rate_display": public_rate_value(rate_field, rate), "rate_unit": public_rate_unit(rate_field),
                  "rate_source": "connection" if custom_rate is not None else ("aws_public" if rate is not None else "missing")}
