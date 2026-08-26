@@ -411,6 +411,13 @@ def test_simulation_mode_keeps_the_regular_console_and_exposes_a_red_admin_page(
     assert '>Queue all</button>' not in simulation
 
 
+def test_simulation_scenario_form_suggests_a_free_immutable_name():
+    simulation = (ROOT / "app/static/simulation.html").read_text(encoding="utf-8")
+    assert "function refreshScenarioNameSuggestion(scenarios)" in simulation
+    assert "api('/api/simulation/scenarios')" in simulation
+    assert "simulation-${String(number).padStart(3,'0')}" in simulation
+
+
 def test_operational_top_alerts_are_dismissible_without_removing_the_footer_condition():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
 
