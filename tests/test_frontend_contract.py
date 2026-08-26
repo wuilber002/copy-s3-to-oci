@@ -227,6 +227,13 @@ def test_source_selector_uses_name_only_and_context_tags_are_in_the_heading():
     assert "<b>Prefixos S3</b>" in page
 
 
+def test_archiving_a_source_clears_the_migration_selection_and_url_state():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    handler = page[page.index("async function removeOrArchiveSource"):page.index("let sourceMessageRotationTimer")]
+    assert "sourceSelect.value=''" in handler
+    assert "await selectSource()" in handler
+
+
 def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="cost-pricing-modal"' in page
