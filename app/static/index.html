@@ -539,11 +539,16 @@ document.addEventListener('keydown',event=>{if(event.key==='Escape')closeSourceC
 startBannerClock();
 document.addEventListener('raijin:language-changed',()=>{if($('#view-dashboard').classList.contains('active')||$('#view-queue').classList.contains('active'))loadHealth();if($('#view-migrations').classList.contains('active'))refreshMigration();if($('#view-settings').classList.contains('active')){loadSettings();if(operationMode==='REAL'){loadOciBuckets();loadAwsConnections();loadAwsSecrets()}}});
 syncSourceDependentControls();
-syncStatusbarContext('dashboard');
+const requestedInitialView=new URLSearchParams(location.search).get('view');
+const initialView=['dashboard','queue','migrations','settings','about'].includes(requestedInitialView)?requestedInitialView:'dashboard';
+// Restore the requested view synchronously, before any asynchronous loaders
+// begin.  Otherwise a browser refresh briefly renders Status and only later
+// switches back to the route preserved in the URL.
+showView(initialView,{persist:false,scroll:false});
 renderOperationalTicker();
 setInterval(refreshOperationalMessages,30000);
 showWaveCreationMethod();
 loadActivityRefreshSettings();
-refreshAll().then(()=>{const requested=new URLSearchParams(location.search).get('view');if(['dashboard','queue','migrations','settings','about'].includes(requested))showView(requested,{persist:false,scroll:false})});
+refreshAll();
 </script>
 </body></html>
