@@ -140,7 +140,7 @@ recuperação de leases, Secrets, pré-check e tarifas públicas.
 Quando o pipeline dinâmico está ativo, o RAIJIN prevê a duração de cópia de cada
 objeto a partir de tamanho, limite de throughput e histórico real. A retenção
 define a janela operacional, descontada uma reserva para variações e retries.
-O Raijin materializa somente o horizonte inicial configurado (duas waves por
+O Raijin materializa somente o horizonte inicial configurado (três waves por
 padrão); conforme as waves observadas terminam, calcula e cria a próxima com
 as medições mais recentes. O agendamento de restore é obrigatório nesse modo.
 

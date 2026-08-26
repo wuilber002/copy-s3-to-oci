@@ -422,7 +422,7 @@ class DynamicPipelineRun(Base):
     target_transfer_seconds: Mapped[int] = mapped_column(Integer, default=0)
     max_objects: Mapped[int] = mapped_column(Integer, default=0)
     restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=0)
-    restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=2)
+    restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=3)
     restore_days: Mapped[int] = mapped_column(Integer, default=0)
     restore_tier: Mapped[str] = mapped_column(String(16), default="BULK")
     transfer_strategy: Mapped[str] = mapped_column(String(32), default="AFTER_ALL_RESTORED")
@@ -715,7 +715,7 @@ class RuntimeSettings(Base):
     dynamic_wave_target_seconds: Mapped[int] = mapped_column(Integer, default=12 * 3600)
     dynamic_wave_max_objects: Mapped[int] = mapped_column(Integer, default=50000)
     dynamic_restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=6 * 3600)
-    dynamic_restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=2)
+    dynamic_restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=3)
     dynamic_pipeline_enabled: Mapped[bool] = mapped_column(default=False)
     # A deliberate, highly visible exception for demonstrations and controlled
     # validation.  Production keeps source S3 scopes mutually exclusive.
@@ -985,7 +985,7 @@ class RuntimeSettingsUpdate(BaseModel):
     cost_pricing_auto_refresh_enabled: bool = True
     cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
-    dynamic_restore_horizon_waves: int = Field(default=2, ge=1, le=20)
+    dynamic_restore_horizon_waves: int = Field(default=3, ge=1, le=20)
     dynamic_pipeline_enabled: bool = False
     laboratory_mode_enabled: bool = False
 
@@ -1111,7 +1111,7 @@ def create_schema() -> None:
         "dynamic_wave_target_seconds": "INTEGER NOT NULL DEFAULT 43200",
         "dynamic_wave_max_objects": "INTEGER NOT NULL DEFAULT 50000",
         "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
-        "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2",
+        "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 3",
         "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "laboratory_mode_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
@@ -1171,7 +1171,7 @@ def create_schema() -> None:
             if column not in existing_connection_columns:
                 connection.execute(text(f"ALTER TABLE aws_connections ADD COLUMN {column} {sql_type}"))
         for column, sql_type in {
-            "restore_horizon_waves": "INTEGER NOT NULL DEFAULT 2",
+            "restore_horizon_waves": "INTEGER NOT NULL DEFAULT 3",
             "selection_prefix": "VARCHAR(1024) NOT NULL DEFAULT ''",
             "next_sequence": "INTEGER NOT NULL DEFAULT 1",
         }.items():
