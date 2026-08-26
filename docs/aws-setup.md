@@ -419,7 +419,7 @@ A auditoria de 26/08/2026 confirmou no ambiente de testes que:
 - a role Batch confia somente em S3 Batch Operations;
 - as permissões essenciais de discovery, leitura, controle, Batch restore e `PassRole` existem.
 
-Também foi encontrada uma policy adicional de `s3:ListBucket` no bucket de teste sem condition de prefixo, criada para validações anteriores. Ela **não** integra o padrão empresarial deste documento e deve ser removida ou reduzida ao prefixo aprovado antes de produção.
+Na mesma auditoria foram revogadas sete policies exclusivas de testes concluídos — Inventory, leitura, restore e bucket de controle dos testes Dynamic Archive e US East validation — e a policy adicional de `s3:ListBucket` sem condição de prefixo. A policy remanescente foi reduzida a `CreateJob` e `DescribeJob`; `iam:PassRole` passou a exigir `iam:PassedToService = batchoperations.s3.amazonaws.com`.
 
 ## Referências AWS
 
