@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import BigInteger, create_engine, select
+from sqlalchemy import BigInteger, create_engine, func, select
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.orm import sessionmaker
 
@@ -22,7 +22,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, internal_rate_value, list_sources, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -550,12 +550,13 @@ def test_dynamic_planner_uses_scalar_boundaries_and_assigns_every_object_once():
         assert sum(item["object_count"] for item in plan["waves"]) == 37
         assert all("objects" not in item for item in plan["waves"])
 
+        session.get(RuntimeSettings, 1).dynamic_pipeline_enabled = True
+        session.flush()
         response = create_dynamic_waves(
             source.id,
             DynamicWaveCreate(
                 restore_days=1,
                 restore_tier="BULK",
-                schedule_restores=False,
             ),
             session,
         )
@@ -576,15 +577,15 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert '@app.get("/api/flight-board")' in source
     assert '@app.get("/api/flight-board/availability")' in source
     assert 'Wave.planner_mode == "DYNAMIC"' in source
-    assert '"QUEUE"' in source and '"RESTORE"' in source and '"READY"' in source and '"TRANSFER"' in source
+    assert '"QUEUE"' in source and '"RESTORE"' in source and '"BUFFER"' in source and '"TRANSFER"' in source
     assert 'id="flight-board-button"' in frontend
     assert 'function showFlightBoard()' in frontend
     assert 'flight-board-legend' in frontend
-    assert 'forecast_restore = phase("RESTORE", restore_end, expected_available_at, planned=True)' in source
+    assert 'forecast_restore = phase("RESTORE", restore_end, expected_available_at, planned=True,' in source
     assert 'timeline_start = min(submitted_points)' in source
     assert '#flight-board-modal .modal-panel{display:flex;flex-direction:column;width:min(1500px,calc(100vw - 2rem));max-height:calc(100vh - 2rem);overflow:hidden}' in frontend
     assert '.flight-board-chart{overflow:hidden;max-height:none}' in frontend
-    assert '.flight-board-track{position:relative;height:30px;border-radius:4px;background:#0b1220;min-width:0}' in frontend
+    assert '.flight-board-track{position:relative;height:20px;border-radius:4px;background:#0b1220;min-width:0}' in frontend
     assert '.flight-board-tick.last{left:auto!important;right:0;transform:none' in frontend
     assert '.flight-board-tick.last .flight-board-tick-label{left:auto;right:.25rem}' in frontend
     assert '@app.get("/api/sources/{source_id}/pipeline-history")' in source
@@ -627,8 +628,38 @@ def test_dynamic_scheduler_uses_a_durable_restore_horizon_and_not_all_jobs_at_on
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert "def release_dynamic_restore_horizon" in source
     assert "restore_horizon_waves" in source
-    assert "release_dynamic_restore_horizon(session, result[\"settings\"])" in source
+    assert "materialize_dynamic_pipeline_horizon" in source
+    assert "release_dynamic_restore_horizon(session, settings)" in source
     assert "release_dynamic_restore_horizon(session, settings)" in worker
+
+
+def test_dynamic_pipeline_materializes_only_the_horizon_then_adapts_next_wave():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    now = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    with Session() as session:
+        source = Source(id=965, name="adaptive-horizon", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        settings = RuntimeSettings(id=1, dynamic_pipeline_enabled=True, dynamic_restore_horizon_waves=2)
+        run = DynamicPipelineRun(id=966, source_id=source.id, status="SCHEDULED", scheduled_restores=True,
+                                 target_max_bytes=100, target_transfer_seconds=3600, max_objects=100,
+                                 restore_days=1, restore_tier="BULK", restore_horizon_waves=2)
+        session.add_all([source, settings, run])
+        session.add_all([
+            ObjectRecord(id=967 + index, source_id=source.id, object_key=f"file-{index}", size_bytes=60,
+                         state=ObjectState.DISCOVERED)
+            for index in range(5)
+        ])
+        session.flush()
+        first_batch = materialize_dynamic_pipeline_horizon(session, settings, run, now=now)
+        assert len(first_batch) == 2
+        assert session.scalar(select(func.count(Wave.id)).where(Wave.pipeline_run_id == run.id)) == 2
+        assert session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id.is_not(None))) == 2
+        first_batch[0].status = "COMPLETED"
+        second_batch = materialize_dynamic_pipeline_horizon(session, settings, run, now=now)
+        assert len(second_batch) == 1
+        assert session.scalar(select(func.count(Wave.id)).where(Wave.pipeline_run_id == run.id)) == 3
+        assert session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id.is_not(None))) == 3
 
 
 def test_dynamic_replan_preserves_submitted_waves_and_exposes_forecast():

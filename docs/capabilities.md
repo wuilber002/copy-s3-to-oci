@@ -35,8 +35,9 @@ de fazer** e **como ela organiza a operação**.
 
 - Cria waves manualmente por volume, em massa por limite de tamanho ou por
   prefixo; uma wave nunca excede 10 TB.
-- Cria waves dinâmicas com previsão por objeto, limite de quantidade de objetos,
-  dados históricos de transferência e horizonte de restore antecipado.
+- Cria waves dinâmicas de forma adaptativa: a retenção define a janela útil de
+  cópia, a reserva operacional protege a expiração e cada próxima wave é
+  empacotada com previsão por objeto e histórico real de transferência.
 - Submete restores arquivados por S3 Batch Operations, com manifesto e relatório
   de conclusão persistidos no bucket de controle.
 - Registra tentativa, aceite AWS, Batch job, polling, disponibilidade parcial e
@@ -137,14 +138,17 @@ recuperação de leases, Secrets, pré-check e tarifas públicas.
 ### Pipeline dinâmico e inventário de bordo
 
 Quando o pipeline dinâmico está ativo, o RAIJIN prevê a duração de cópia de cada
-objeto a partir de tamanho, limite de throughput e histórico real. Com essas
-previsões, cria waves dentro de um alvo de tempo e quantidade de objetos e
-solicita restores antecipadamente dentro do horizonte configurado.
+objeto a partir de tamanho, limite de throughput e histórico real. A retenção
+define a janela operacional, descontada uma reserva para variações e retries.
+O Raijin materializa somente o horizonte inicial configurado (duas waves por
+padrão); conforme as waves observadas terminam, calcula e cria a próxima com
+as medições mais recentes. O agendamento de restore é obrigatório nesse modo.
 
 O **inventário de bordo**, acessível em **Queue**, apresenta:
 
-- linha do tempo colorida com períodos planejados e observados de fila, restore
-  e transferência;
+- linha do tempo colorida com períodos planejados e observados de fila, restore,
+  gordura operacional e transferência; o hover de cada bloco mostra tipo,
+  data/hora prevista ou iniciada e tempo decorrido/esperado;
 - legenda dos estados;
 - lista de waves com estado e datas de início e término;
 - histórico persistente, consultável depois da conclusão da source.

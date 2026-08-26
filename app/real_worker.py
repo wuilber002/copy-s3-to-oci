@@ -51,7 +51,7 @@ from app.simulator_admin import SimulatorAdminClient
 from app.simulator_ports import SimulatedDestinationPort, SimulatedSourcePort, SimulatorTransportError
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows, source_key_in_scope, source_prefix_values,
-    DynamicPipelineRun, Wave, cloud_backend, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_context, runtime_settings, utcnow,
+    DynamicPipelineRun, Wave, cloud_backend, materialize_dynamic_pipeline_horizon, parse_aws_connection_payload, read_oci_runtime_config, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_context, runtime_settings, utcnow,
 )
 
 # The bootstrap supplies a stable identity for the one real worker on the VM.
@@ -2219,6 +2219,11 @@ def run_once(role: str = WORKER_ROLE) -> None:
                 refresh_due_global_aws_pricing(session)
             if settings.dynamic_pipeline_enabled:
                 replan_dynamic_pipeline(session, settings)
+                for run in session.scalars(select(DynamicPipelineRun).where(
+                    DynamicPipelineRun.scheduled_restores.is_(True),
+                    DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL", "NEEDS_ATTENTION"]),
+                )):
+                    materialize_dynamic_pipeline_horizon(session, settings, run)
                 release_dynamic_restore_horizon(session, settings)
                 session.commit()
         # There is exactly one real worker per VM.  If it was interrupted while
