@@ -90,7 +90,6 @@
 
   <main id="view-settings" class="view">
   <section id="operation-mode-card" class="card"><h2>Modo de operação</h2><p id="operation-mode-description" class="hint">O modo REAL usa AWS e OCI. A troca para SIMULATION só é aceita quando não existem tarefas ou discoveries na fila; o host reinicia o RAIJIN com banco isolado e sem credenciais de nuvem.</p><button id="operation-mode-action" type="button" class="secondary" onclick="requestOperationMode('SIMULATION')">Ativar modo Simulation</button></section>
-  <section class="card simulation-only hidden"><h2>Configurações de integração</h2><p class="hint">Conexões AWS, Secrets OCI, inventário de buckets OCI, pré-check das integrações e Price List pública permanecem indisponíveis enquanto o modo SIMULATION estiver ativo. Essa separação impede qualquer leitura de credenciais ou chamada a AWS/OCI; os equivalentes virtuais são configurados na página <b>Simulation</b>.</p><p class="hint">Os parâmetros operacionais abaixo — workers, throughput, multipart, retenção, leases, pipeline dinâmico e modo de laboratório — continuam disponíveis e são persistidos no banco isolado da simulação.</p></section>
   <section class="card"><h2>Configuração operacional</h2>
     <form id="settings-form" class="grid settings-grid">
       <label class="field"><span class="field-label"><span class="with-help">Workers de<br>transferência <span class="help" tabindex="0" data-help="Quantidade máxima de arquivos copiados em paralelo dentro da única onda que está em execução. A alteração é aplicada no próximo lote de arquivos, sem reiniciar a VM; cópias já em andamento continuam com a configuração anterior. Mais workers aumentam concorrência e consumo de CPU/memória.">i</span></span></span><input id="set-workers" type="number" min="1" max="64" required></label>
@@ -112,9 +111,11 @@
   </section>
 
   <section id="global-pricing-settings" class="card hidden"><h2>Lista pública de preços AWS</h2><p class="hint">Tarifas públicas AWS por região, usadas como padrão quando a conexão não define uma sobreposição contratual. A coleta não usa credenciais AWS.</p><div class="row"><label class="toggle-box"><input id="set-cost-pricing-auto-refresh" type="checkbox"> Atualizar automaticamente</label><label class="field"><span>Dias entre atualizações</span><input id="set-cost-pricing-refresh-days" type="number" min="1" max="90" value="7"></label><button type="button" class="secondary" onclick="refreshGlobalAwsPricing()">Atualizar agora</button><button type="button" class="secondary" onclick="showCollectedPublicPricing()">Ver valores coletados</button></div><div id="global-pricing-status" class="hint">Carregando estado da Price List…</div></section>
+  <section class="card simulation-only hidden"><h2>Lista pública de preços AWS</h2><p class="hint">Configurações indisponíveis no modo de simulação.</p></section>
 
   <section class="card"><h2>Interface</h2><div class="settings-grid grid"><label class="field"><span class="field-label"><span class="with-help">Idioma da interface <span class="help" tabindex="0" data-help="Define o idioma da interface neste navegador. A escolha é armazenada localmente e não altera a configuração operacional da plataforma.">i</span></span></span><select id="language-selector" aria-label="Idioma da interface" onchange="setLanguage(this.value)"><option value="pt">Português</option><option value="en">English</option></select></label></div></section>
 
+  <section class="card simulation-only hidden"><h2>Conexões AWS</h2><p class="hint">Configurações indisponíveis no modo de simulação.</p></section>
   <section class="card real-only"><h2>Conexões AWS</h2>
     <p class="hint">Atualize a descoberta para verificar todos os Secrets OCI aos quais a VM tem acesso. Apenas Secrets com o JSON da versão suportada aparecem no cadastro. O conteúdo nunca é exibido, persistido ou enviado ao navegador; conexões já cadastradas são mantidas mesmo se uma versão futura do Secret deixar de ser compatível.</p>
     <div class="row"><button type="button" class="secondary" onclick="refreshAwsSecrets()">Atualizar Secrets OCI</button><span id="aws-secret-cache-status" class="hint">Carregando Secrets compatíveis…</span></div>
@@ -124,11 +125,13 @@
   </section>
 
 
+  <section class="card simulation-only hidden"><h2>Inventário de buckets OCI</h2><p class="hint">Configurações indisponíveis no modo de simulação.</p></section>
   <section class="card real-only"><h2>Inventário de buckets OCI</h2>
     <p class="hint">Consulta manualmente o OCI Resource Search no tenancy inteiro e guarda a lista localmente. A consulta não concede acesso a objetos; a policy da VM continua determinando quais buckets podem ser usados como destino.</p>
     <div class="row"><button type="button" class="secondary" onclick="refreshOciBuckets()">Atualizar buckets OCI</button><span id="oci-bucket-cache-status" class="hint">Carregando inventário local…</span></div>
   </section>
 
+  <section class="card simulation-only hidden"><h2>Prontidão das integrações</h2><p class="hint">Configurações indisponíveis no modo de simulação.</p></section>
   <section class="card real-only"><h2>Prontidão das integrações</h2>
     <p class="hint">Usa a identidade dinâmica da VM para OCI e, quando configurada, valida AWS por STS/AssumeRole. Não revela Secrets, lista objetos nem grava no bucket.</p>
     <button class="secondary" onclick="runReadiness()">Executar pré-check</button>
