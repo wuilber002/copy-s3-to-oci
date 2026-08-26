@@ -1,4 +1,4 @@
-# AWS setup — padrão empresarial
+# AWS Setup
 
 Este guia é a referência canônica para preparar uma conta AWS para uma conexão de migração. O objetivo é conceder o **menor privilégio possível** para descobrir objetos, solicitar restores via S3 Batch Operations, transferir o conteúdo e manter evidências no bucket de controle.
 
