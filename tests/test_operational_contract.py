@@ -582,7 +582,7 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert 'flight-board-legend' in frontend
     assert 'forecast_restore = phase("RESTORE", restore_end, expected_available_at, planned=True)' in source
     assert 'timeline_start = min(submitted_points)' in source
-    assert '#flight-board-modal .modal-panel{width:min(1500px,calc(100vw - 2rem));overflow-x:hidden}' in frontend
+    assert '#flight-board-modal .modal-panel{display:flex;flex-direction:column;width:min(1500px,calc(100vw - 2rem));max-height:calc(100vh - 2rem);overflow:hidden}' in frontend
     assert '.flight-board-chart{overflow:hidden;max-height:none}' in frontend
     assert '.flight-board-track{position:relative;height:30px;border-radius:4px;background:#0b1220;min-width:0}' in frontend
     assert '.flight-board-tick.last{left:auto!important;right:0;transform:none' in frontend

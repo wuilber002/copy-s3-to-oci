@@ -445,3 +445,11 @@ def test_public_project_links_use_current_repository_name():
     assert repository_url in (ROOT / "README.md").read_text(encoding="utf-8")
     assert repository_url in (ROOT / "terraform/orm/schema.yaml").read_text(encoding="utf-8")
     assert repository_url in (ROOT / "terraform/orm/variables.tf").read_text(encoding="utf-8")
+
+
+def test_flight_board_modal_has_only_one_vertical_scroll_container():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+
+    assert "#flight-board-modal .modal-panel{display:flex;flex-direction:column" in page
+    assert "max-height:calc(100vh - 2rem);overflow:hidden" in page
+    assert "#flight-board-content{min-height:0;max-height:none;overflow-y:auto;overflow-x:hidden}" in page
