@@ -5279,11 +5279,34 @@ def resume_wave(wave_id: int, session: Session = Depends(get_session)) -> dict:
     wave = wave_or_404(session, wave_id)
     if wave.status != "PAUSED":
         raise HTTPException(status_code=409, detail="Only a paused wave can be resumed")
-    wave.status = "READY_FOR_RESTORE"
-    queued = session.scalar(select(Task.id).where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING])))
-    if not queued:
+    active_task = session.scalar(
+        select(Task)
+        .where(Task.wave_id == wave.id, Task.state.in_([TaskState.READY, TaskState.RUNNING]))
+        .order_by(Task.id.desc())
+    )
+    # A pause can happen while restore polling or copy work is already queued.
+    # Preserve that durable step: submitting another Batch restore would be both
+    # unnecessary and potentially billable.
+    status_by_task = {
+        "SUBMIT_BATCH_RESTORE": "READY_FOR_RESTORE",
+        "POLL_RESTORE": "RESTORING",
+        "TRANSFER_WAVE": "TRANSFERRING",
+        "VERIFY_WAVE": "VERIFICATION_QUEUED",
+    }
+    if active_task:
+        wave.status = status_by_task.get(active_task.kind, "READY_FOR_RESTORE")
+        resumed_step = active_task.kind
+    else:
+        wave.status = "READY_FOR_RESTORE"
         session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE"))
-    record_event(session, "WAVE_RESUMED", f"Wave '{wave.name}' resumed by operator", source_id=wave.source_id, wave_id=wave.id)
+        resumed_step = "SUBMIT_BATCH_RESTORE"
+    record_event(
+        session,
+        "WAVE_RESUMED",
+        f"Wave '{wave.name}' resumed at durable step {resumed_step}",
+        source_id=wave.source_id,
+        wave_id=wave.id,
+    )
     session.commit()
     return {"wave_id": wave.id, "status": wave.status}
 
