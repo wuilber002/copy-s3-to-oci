@@ -32,7 +32,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, case, create_engine, func, inspect, or_, select, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, case, create_engine, func, inspect, or_, select, text, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
@@ -4676,6 +4676,11 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
             continue
         scheduler_now = now or source_scheduler_clock(run.source).effective_now
         horizon = max(1, int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1))
+        # Keep the last materialized wave locally mutable.  With the default
+        # horizon of three this yields two restore requests in flight and one
+        # future slice that can absorb observed delay, throughput changes or
+        # new history before any charged AWS request is sent.
+        release_capacity = max(1, horizon - 1)
         waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
             Wave.planned_restore_at, Wave.id
         )))
@@ -4685,7 +4690,7 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
             ).limit(1)) is not None
         ))
         for wave in waves:
-            if occupied >= horizon:
+            if occupied >= release_capacity:
                 break
             if wave.status != "RESTORE_SCHEDULED" or (wave.planned_restore_at and wave.planned_restore_at > scheduler_now):
                 continue
@@ -4698,12 +4703,96 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
             # make the real durable queue wait until that future date.
             session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=queue_now))
             record_event(session, "DYNAMIC_RESTORE_RELEASED",
-                         f"Dynamic pipeline run {run.id} released restore for wave '{wave.name}' within horizon {horizon}",
+                         f"Dynamic pipeline run {run.id} released restore for wave '{wave.name}' within release capacity {release_capacity} of materialized horizon {horizon}",
                          source_id=wave.source_id, wave_id=wave.id)
             occupied += 1
             released += 1
         refresh_dynamic_pipeline_run(session, run)
     return released
+
+
+def repackage_unsubmitted_dynamic_waves(session: Session, settings: RuntimeSettings,
+                                        run: DynamicPipelineRun, scheduler_now: datetime) -> int:
+    """Repack only future waves after the planner receives new observations.
+
+    A materialized wave is still editable until a Batch restore task exists.
+    At that point AWS has not been called and every object is only in the
+    local ``WAVE_ASSIGNED`` state, so returning the future slices to
+    ``DISCOVERED`` and packing them again is safe, deterministic and fully
+    auditable.  Anything submitted to AWS is deliberately excluded.
+    """
+    source = session.get(Source, run.source_id)
+    if source is None or source.archived_at:
+        return 0
+    waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
+        Wave.planned_transfer_start_at, Wave.id
+    )))
+    mutable: list[Wave] = []
+    for wave in waves:
+        if wave.status != "RESTORE_SCHEDULED":
+            continue
+        submitted = session.scalar(select(Task.id).where(
+            Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
+        ).limit(1))
+        progressed = session.scalar(select(ObjectRecord.id).where(
+            ObjectRecord.wave_id == wave.id,
+            ObjectRecord.state != ObjectState.WAVE_ASSIGNED,
+        ).limit(1))
+        if submitted is None and progressed is None:
+            mutable.append(wave)
+    if not mutable:
+        return 0
+
+    mutable_ids = [wave.id for wave in mutable]
+    previous = {
+        wave.id: (wave.predicted_transfer_seconds, wave.prediction_samples,
+                  tuple(session.scalars(select(ObjectRecord.id).where(
+                      ObjectRecord.wave_id == wave.id
+                  ).order_by(ObjectRecord.object_key, ObjectRecord.id))))
+        for wave in mutable
+    }
+    # The objects are made eligible as one local transaction before selecting
+    # the new deterministic slices. No external call is performed here.
+    session.execute(update(ObjectRecord).where(ObjectRecord.wave_id.in_(mutable_ids)).values(
+        wave_id=None, state=ObjectState.DISCOVERED, planned_transfer_seconds=None
+    ))
+    session.flush()
+    profiles = transfer_history_profiles(session, source.id, settings.multipart_part_size_mib)
+    preceding = [wave for wave in waves if wave.id not in set(mutable_ids)]
+    changed = 0
+    for wave in mutable:
+        plan, latest_profiles, planner_settings = next_dynamic_wave_plan(
+            session, source.id, run.target_max_bytes, run.target_transfer_seconds,
+            run.max_objects, run.selection_prefix,
+        )
+        if plan is None:
+            # A concurrent discovery/operation should not silently delete a
+            # planned wave. Keep it empty and let the next governance cycle
+            # resolve it with the durable inventory state.
+            continue
+        restore_at, transfer_at = dynamic_wave_schedule(run, preceding, scheduler_now)
+        wave.max_bytes = run.target_max_bytes
+        wave.predicted_transfer_seconds = plan["predicted_transfer_seconds"]
+        wave.prediction_samples = plan["prediction_samples"]
+        wave.planned_restore_at, wave.planned_transfer_start_at = restore_at, transfer_at
+        assign_dynamic_wave_objects(session, wave, source.id, run.selection_prefix,
+                                    plan, planner_settings, latest_profiles or profiles)
+        current_ids = tuple(session.scalars(select(ObjectRecord.id).where(
+            ObjectRecord.wave_id == wave.id
+        ).order_by(ObjectRecord.object_key, ObjectRecord.id)))
+        prior_duration, prior_samples, prior_ids = previous[wave.id]
+        if (prior_ids != current_ids or prior_duration != wave.predicted_transfer_seconds
+                or prior_samples != wave.prediction_samples):
+            changed += 1
+            record_event(
+                session, "DYNAMIC_WAVE_REPACKED",
+                f"Wave '{wave.name}' repacked before AWS submission using updated transfer observations; "
+                f"{len(prior_ids)} -> {len(current_ids)} object(s), predicted transfer "
+                f"{prior_duration}s -> {wave.predicted_transfer_seconds}s",
+                source_id=source.id, wave_id=wave.id,
+            )
+        preceding.append(wave)
+    return changed
 
 
 def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: datetime | None = None) -> int:
@@ -4724,6 +4813,16 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             continue
         scheduler_now = now or source_scheduler_clock(run.source).effective_now
         run_changed = False
+        latest_profiles = transfer_history_profiles(session, run.source_id, settings.multipart_part_size_mib)
+        latest_samples = sum(value["samples"] for value in latest_profiles.values())
+        # A new completed transfer gives the packing model new evidence. Only
+        # then recompose unsubmitted waves; routine scheduler cycles merely
+        # adjust their times and do not churn object assignments.
+        if latest_samples != int(run.historical_samples or 0):
+            repacked = repackage_unsubmitted_dynamic_waves(session, settings, run, scheduler_now)
+            run.historical_samples = latest_samples
+            changed += repacked
+            run_changed = bool(repacked)
         waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
             Wave.planned_transfer_start_at, Wave.id
         )))
