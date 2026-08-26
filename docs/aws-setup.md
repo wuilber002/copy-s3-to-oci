@@ -29,8 +29,6 @@ Use nomes previsíveis e únicos por conta:
 | Role de migração | `oracle-s3-migration-role` |
 | Role Batch | `oracle-s3-batch-restore-role` |
 | Bucket de controle | `oracle-control-bucket-us-east-1` |
-| Prefixo de controle da conexão | `oracle/connections/<connection-id>/` |
-| Prefixo de uma source | `production/finance/` |
 
 ### Informações a registrar antes de criar as policies
 
