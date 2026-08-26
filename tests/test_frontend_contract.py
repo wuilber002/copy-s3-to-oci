@@ -324,6 +324,17 @@ def test_wave_creation_uses_one_shared_action_for_every_method():
     assert "<h3>Criação dinâmica</h3>" not in page
 
 
+def test_dynamic_wave_creation_gives_immediate_busy_feedback():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "function setDynamicWaveCreationBusy(busy)" in page
+    assert "Criando waves…" in page
+    assert "Criando waves dinâmicas e preparando o pipeline" in page
+    handler = page[page.rindex("async function submitDynamicWaves"):page.index("saveSettings=", page.rindex("async function submitDynamicWaves"))]
+    assert "setDynamicWaveCreationBusy(true)" in handler
+    assert "finally{setDynamicWaveCreationBusy(false)}" in handler
+    assert ".wave-create-busy::before" in page
+
+
 def test_buttons_use_content_width_and_standard_horizontal_spacing():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "width:max-content!important" in page
