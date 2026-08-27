@@ -30,7 +30,7 @@ import boto3
 import oci
 from botocore.config import Config
 from botocore.exceptions import ClientError
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 
 from app.backend_contracts import (
     DescribeRestoreBatchRequest,
@@ -399,6 +399,25 @@ def ensure_transfer_task(session, wave: Wave) -> bool:
     session.add(Task(wave_id=wave.id, kind="TRANSFER_WAVE"))
     event(session, "TRANSFER_RELEASED", "Transfer task released for restored objects", source_id=wave.source_id, wave_id=wave.id)
     return True
+
+
+def early_transfer_threshold_reached(session, source: Source, wave: Wave) -> tuple[bool, int, int, float]:
+    """Return whether a source's byte-based early-release threshold is met.
+
+    States already copied remain part of the available total so a later poll
+    cannot retract eligibility after Raiju has started moving the first files.
+    """
+    total_bytes, available_bytes = session.execute(select(
+        func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
+        func.coalesce(func.sum(case((ObjectRecord.state.in_([
+            ObjectState.RESTORED, ObjectState.TRANSFERRING,
+            ObjectState.TRANSFERRED, ObjectState.VERIFIED,
+        ]), ObjectRecord.size_bytes), else_=0)), 0),
+    ).where(ObjectRecord.wave_id == wave.id)).one()
+    total, available = int(total_bytes or 0), int(available_bytes or 0)
+    percent = (available * 100 / total) if total else 100.0
+    threshold = float(source.early_transfer_minimum_percent or 15)
+    return percent >= threshold, available, total, percent
 
 
 def reconcile_restored_transfer_lane(session) -> int:
@@ -1491,13 +1510,14 @@ def poll_restore_simulated(
             wave.first_restore_available_virtual_at = (
                 wave.first_restore_available_virtual_at or availability_virtual_at
             )
-        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
+        threshold_reached, available_bytes, total_bytes, available_percent = early_transfer_threshold_reached(session, source, wave)
+        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and threshold_reached:
             retain_simulation_clock_for_transfer(session, wave)
             ensure_transfer_task(session, wave)
             event(
                 session,
                 "SIMULATED_RESTORE_PARTIALLY_AVAILABLE",
-                f"SIMULATED: {ready_for_transfer} restored object(s) released while {pending} remain unavailable",
+                f"SIMULATED: {ready_for_transfer} restored object(s) / {available_bytes} of {total_bytes} byte(s) ({available_percent:.2f}%) released while {pending} remain unavailable; threshold {source.early_transfer_minimum_percent:g}%",
                 source_id=source.id,
                 wave_id=wave.id,
             )
@@ -1713,9 +1733,10 @@ def poll_restore(session, task: Task, settings) -> None:
             ObjectRecord.wave_id == wave.id,
             ObjectRecord.state == ObjectState.RESTORED,
         )) or 0
-        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and ready_for_transfer:
+        threshold_reached, available_bytes, total_bytes, available_percent = early_transfer_threshold_reached(session, source, wave)
+        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and threshold_reached:
             ensure_transfer_task(session, wave)
-            event(session, "RESTORE_PARTIALLY_AVAILABLE", f"{ready_for_transfer} restored object(s) released for transfer while {pending} remain unavailable", source_id=source.id, wave_id=wave.id)
+            event(session, "RESTORE_PARTIALLY_AVAILABLE", f"{ready_for_transfer} restored object(s) / {available_bytes} of {total_bytes} byte(s) ({available_percent:.2f}%) released for transfer while {pending} remain unavailable; threshold {source.early_transfer_minimum_percent:g}%", source_id=source.id, wave_id=wave.id)
         session.commit()
         delay = restore_availability_poll_delay_seconds(
             attempt.completed_at if wave.batch_job_id else None,
@@ -2003,6 +2024,7 @@ def transfer_object(s3, namespace: str, source_bucket: str, destination_bucket: 
 def transfer_object_simulated(
     object_id: int,
     rate_bytes_per_second: float,
+    active_workers: int,
     configured_multipart_part_size: int = DEFAULT_MULTIPART_PART_SIZE,
 ) -> None:
     """Run the production object state machine against typed simulator ports.
@@ -2065,6 +2087,9 @@ def transfer_object_simulated(
                     source=identity,
                     destination_bucket=source.destination_bucket,
                     size_bytes=obj.size_bytes,
+                    allocated_rate_mbps=rate_bytes_per_second * 8 / 1_000_000,
+                    active_workers=active_workers,
+                    network_operation_key=f"wave:{obj.wave_id}",
                     idempotency_key=uuid5(
                         NAMESPACE_URL,
                         f"raijin:simulation:logical-transfer:{context.execution_id}:{obj.id}",
@@ -2384,7 +2409,7 @@ def _transfer_wave(session, task: Task, settings) -> None:
             if runtime_context.is_simulation:
                 futures = [
                     executor.submit(
-                        transfer_object_simulated, object_id, rate, multipart_part_size
+                        transfer_object_simulated, object_id, rate, worker_count, multipart_part_size
                     )
                     for object_id in object_ids
                 ]

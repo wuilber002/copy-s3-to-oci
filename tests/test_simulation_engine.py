@@ -131,18 +131,18 @@ def test_control_network_profile_uses_virtual_time_for_degradation_and_outage():
     item = engine.list_objects(execution.id, "source", "", None, 1).objects[0]
 
     fast = engine.transfer_logically(
-        execution.id, "source", "destination", item.key, item.size_bytes, "fast"
+        execution.id, "source", "destination", item.key, item.size_bytes, 100, 1, "test", "fast"
     )
     store.control_clock(execution.id, "ADVANCE", 3600)
     slow = engine.transfer_logically(
-        execution.id, "source", "destination", item.key, item.size_bytes, "slow"
+        execution.id, "source", "destination", item.key, item.size_bytes, 100, 1, "test", "slow"
     )
     assert slow.simulated_elapsed_seconds > fast.simulated_elapsed_seconds * 5
 
     store.control_clock(execution.id, "ADVANCE", 3600)
     with pytest.raises(ConnectionError, match="network profile"):
         engine.transfer_logically(
-            execution.id, "source", "destination", item.key, item.size_bytes, "down"
+            execution.id, "source", "destination", item.key, item.size_bytes, 100, 1, "test", "down"
         )
 
 

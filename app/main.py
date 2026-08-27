@@ -175,6 +175,9 @@ class Source(Base):
     # The conservative default is durable and explicit. The governance worker
     # will later interpret AS_OBJECTS_AVAILABLE without changing source history.
     transfer_strategy: Mapped[str] = mapped_column(String(32), default="AFTER_ALL_RESTORED")
+    # Early release is deliberately expressed as restored *bytes*, rather
+    # than objects.  A few tiny files must not unlock a multi-terabyte wave.
+    early_transfer_minimum_percent: Mapped[float] = mapped_column(Float, default=15.0)
     status: Mapped[str] = mapped_column(String(32), default="CONFIGURED")
     discovery_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # ``discovery_elapsed_seconds`` is durable work time, rather than wall-clock
@@ -826,6 +829,7 @@ class SourceCreate(BaseModel):
     aws_connection_id: int | None = None
     destination_bucket: str
     transfer_strategy: str = Field(default="AFTER_ALL_RESTORED", pattern="^(AFTER_ALL_RESTORED|AS_OBJECTS_AVAILABLE)$")
+    early_transfer_minimum_percent: float = Field(default=15.0, ge=1, le=100)
 
 
 class SourceUpdate(SourceCreate):
@@ -834,6 +838,7 @@ class SourceUpdate(SourceCreate):
 
 class SourceTransferStrategyUpdate(BaseModel):
     transfer_strategy: str = Field(pattern="^(AFTER_ALL_RESTORED|AS_OBJECTS_AVAILABLE)$")
+    early_transfer_minimum_percent: float = Field(default=15.0, ge=1, le=100)
 
 
 class SimulationScenarioBootstrap(BaseModel):
@@ -1136,7 +1141,7 @@ def create_schema() -> None:
         "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
         "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 3",
     }
-    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
+    source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "early_transfer_minimum_percent": "DOUBLE PRECISION NOT NULL DEFAULT 15", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
     wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "active_transfer_workers": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE", "restore_requested_virtual_at": "TIMESTAMP WITH TIME ZONE", "first_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "last_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_started_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_completed_virtual_at": "TIMESTAMP WITH TIME ZONE", "simulation_transfer_clock_held": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_required": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_reason": "TEXT", "restore_reapproval_detected_at": "TIMESTAMP WITH TIME ZONE"}
@@ -2564,6 +2569,7 @@ def oci_readiness(session: Session = Depends(get_session)) -> dict:
 def operations_overview(session: Session = Depends(get_session)) -> dict:
     """Local operational status; deliberately does not contact AWS or OCI."""
     session.execute(select(1))
+    settings = runtime_settings(session)
     source_count = session.scalar(select(func.count(Source.id))) or 0
     object_count, bytes_total = session.execute(
         select(func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0))
@@ -2616,6 +2622,16 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
         ObjectRecord.state == ObjectState.TRANSFERRING,
         ObjectRecord.wave_id.in_(select(Task.wave_id).where(Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING)),
     )) or 0)
+    control_logical_recent = session.scalar(select(ObjectRecord.id).join(Source).where(
+        ObjectRecord.transferred_at >= since,
+        Source.backend_kind == "SIMULATED",
+        Source.simulation_fidelity == "CONTROL",
+    ).limit(1)) is not None
+    control_logical_active = session.scalar(select(ObjectRecord.id).join(Wave).join(Source).where(
+        ObjectRecord.state == ObjectState.TRANSFERRING,
+        Source.backend_kind == "SIMULATED",
+        Source.simulation_fidelity == "CONTROL",
+    ).limit(1)) is not None
     # Tiny objects can finish before a two-second in-flight sample exists. Add
     # their completion throughput from a short fixed window so current activity
     # remains meaningful for workloads with many small files.
@@ -2624,7 +2640,20 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     recently_completed_bytes = int(session.scalar(select(func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(
         ObjectRecord.transferred_at >= live_since,
     )) or 0)
-    live_transfer_mbps += (recently_completed_bytes * 8) / live_window_seconds / 1_000_000
+    if not control_logical_active:
+        live_transfer_mbps += (recently_completed_bytes * 8) / live_window_seconds / 1_000_000
+    if control_logical_active:
+        # CONTROL promotes catalog evidence immediately. Display the bounded
+        # simulated link allocation, never an impossible wall-clock rate.
+        live_transfer_mbps = min(float(settings.max_throughput_mbps), live_transfer_mbps)
+    if control_logical_recent:
+        logical_elapsed = float(session.scalar(select(func.coalesce(func.sum(ObjectRecord.transfer_elapsed_seconds), 0)).join(Source).where(
+            ObjectRecord.transferred_at >= since,
+            Source.backend_kind == "SIMULATED",
+            Source.simulation_fidelity == "CONTROL",
+        )) or 0)
+        if logical_elapsed > 0:
+            transfer_seconds = max(1, logical_elapsed / max(1, RAIJU_MIN_WORKERS))
     active_transfer_rows = session.execute(
         select(
             Wave.id, Wave.name, Source.name,
@@ -2684,6 +2713,7 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "transferred_per_hour": round(transferred_files / (transfer_seconds / 3600), 2),
             "transfer_mbps": round((transferred_bytes * 8) / transfer_seconds / 1_000_000, 2),
             "transfer_live_mbps": round(live_transfer_mbps, 2),
+            "simulation_logical_metrics": bool(control_logical_recent or control_logical_active),
             "transfer_live_window_seconds": live_window_seconds,
             "restored_files": restored_files,
             "restore_requested_total": int(restore_requested_total or 0),
@@ -3544,7 +3574,8 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
         return "CONFIGURED"
     return [{"id": s.id, "name": s.name, "s3_bucket": s.s3_bucket, "s3_prefix": s.s3_prefix,
              "s3_prefixes": source_prefix_values(s),
-             "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "transfer_strategy": s.transfer_strategy, "status": s.status,
+             "aws_region": s.aws_region, "destination_bucket": s.destination_bucket, "transfer_strategy": s.transfer_strategy,
+             "early_transfer_minimum_percent": float(s.early_transfer_minimum_percent or 15), "status": s.status,
              "aws_bucket_region": s.aws_bucket_region,
              "aws_connection_id": s.aws_connection_id,
              "aws_connection_label": (s.aws_connection.label if s.aws_connection else
@@ -3636,8 +3667,10 @@ def update_source_transfer_strategy(source_id: int, payload: SourceTransferStrat
                                     session: Session = Depends(get_session)) -> dict:
     """Update the durable transfer-release policy without editing source identity."""
     source = active_source_or_409(session, source_id)
-    if source.transfer_strategy == payload.transfer_strategy:
+    if (source.transfer_strategy == payload.transfer_strategy and
+            float(source.early_transfer_minimum_percent or 15) == float(payload.early_transfer_minimum_percent)):
         return {"id": source.id, "transfer_strategy": source.transfer_strategy,
+                "early_transfer_minimum_percent": float(source.early_transfer_minimum_percent or 15),
                 "transfer_strategy_locked": source_transfer_strategy_locked(session, source.id)}
     if source_transfer_strategy_locked(session, source.id):
         raise HTTPException(
@@ -3645,11 +3678,13 @@ def update_source_transfer_strategy(source_id: int, payload: SourceTransferStrat
             detail="Transfer strategy is locked because at least one wave has entered the migration pipeline",
         )
     source.transfer_strategy = payload.transfer_strategy
+    source.early_transfer_minimum_percent = payload.early_transfer_minimum_percent
     record_event(session, "SOURCE_TRANSFER_STRATEGY_UPDATED",
-                 f"Source '{source.name}' transfer strategy set to {payload.transfer_strategy}",
+                 f"Source '{source.name}' transfer strategy set to {payload.transfer_strategy}; early-release threshold {payload.early_transfer_minimum_percent:g}% of restored bytes",
                  source_id=source.id)
     session.commit()
     return {"id": source.id, "transfer_strategy": source.transfer_strategy,
+            "early_transfer_minimum_percent": float(source.early_transfer_minimum_percent),
             "transfer_strategy_locked": False}
 
 
@@ -4689,6 +4724,36 @@ def assign_dynamic_wave_objects(session: Session, wave: Wave, source_id: int, pr
     return assigned
 
 
+def adaptive_restore_slot_limit(session: Session, run: DynamicPipelineRun,
+                                settings: RuntimeSettings) -> int:
+    """Return the durable restore-lane capacity for one dynamic pipeline.
+
+    Two concurrent restores are the safe cold-start baseline.  Only after at
+    least three completed waves provide usable timing evidence can Raikou add
+    slots, and then only when the observed/planned restore lead would otherwise
+    leave the single Raiju transfer lane idle.  A deliberately small ceiling
+    prevents a temporary noisy estimate from creating an expensive restore
+    fan-out.
+    """
+    baseline = 2
+    completed = list(session.scalars(select(Wave).where(
+        Wave.pipeline_run_id == run.id,
+        Wave.status.in_(["COMPLETED", "VERIFIED", "TRANSFERRED"]),
+        Wave.predicted_transfer_seconds > 0,
+    ).order_by(Wave.id.desc()).limit(12)))
+    if len(completed) < 3:
+        return baseline
+    predicted = sorted(float(w.predicted_transfer_seconds) for w in completed)
+    transfer_seconds = predicted[len(predicted) // 2]
+    if transfer_seconds <= 0:
+        return baseline
+    restore_seconds = restore_service_window_seconds(run.restore_tier)
+    needed_for_continuity = math.ceil(restore_seconds / transfer_seconds)
+    retention_seconds = max(1, int(run.restore_days)) * 24 * 3600
+    safe_by_retention = max(baseline, int(retention_seconds // transfer_seconds))
+    return max(baseline, min(6, safe_by_retention, needed_for_continuity))
+
+
 def materialize_dynamic_pipeline_horizon(session: Session, settings: RuntimeSettings,
                                          run: DynamicPipelineRun,
                                          now: datetime | None = None) -> list[Wave]:
@@ -4698,7 +4763,14 @@ def materialize_dynamic_pipeline_horizon(session: Session, settings: RuntimeSett
         return []
     source = session.get(Source, run.source_id) or source_or_404(session, run.source_id)
     scheduler_now = now or source_scheduler_clock(source).effective_now
-    horizon = max(1, int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1))
+    slots = adaptive_restore_slot_limit(session, run, settings)
+    # One future wave remains unsubmitted and can be repacked after fresh
+    # observations.  The initial 3-wave horizon therefore means two restore
+    # slots plus one mutable planning slice.
+    configured_horizon = int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1)
+    # Respect an explicit smaller horizon used by controlled tests/operators.
+    # The default remains three (two restore slots plus one mutable slice).
+    horizon = configured_horizon if slots == 2 else max(configured_horizon, slots + 1)
     terminal = {"COMPLETED", "VERIFIED", "TRANSFERRED", "FAILED", "TRANSFERRED_WITH_ERRORS", "RESTORE_REQUEST_FAILED", "VERIFICATION_FAILED"}
     existing = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
         Wave.planned_transfer_start_at, Wave.id
@@ -4880,7 +4952,10 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
     """
     queue_now = utcnow()
     released = 0
-    active_statuses = {"RESTORE_REQUESTED", "RESTORE_REQUEST_ACCEPTED", "RESTORING", "RESTORED", "TRANSFERRING"}
+    # Restore and transfer are separate lanes. A wave frees an expensive
+    # restore slot when all of its objects are available, even while the
+    # single global transfer lane is still copying it.
+    active_statuses = {"RESTORE_REQUESTED", "RESTORE_REQUEST_ACCEPTED", "RESTORING"}
     runs = list(session.scalars(select(DynamicPipelineRun).where(
         DynamicPipelineRun.scheduled_restores.is_(True),
         DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL"]),
@@ -4921,12 +4996,11 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
                         source_id=run.source_id,
                         wave_id=next_wave.id,
                     )
-        horizon = max(1, int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1))
-        # Keep the last materialized wave locally mutable.  With the default
-        # horizon of three this yields two restore requests in flight and one
-        # future slice that can absorb observed delay, throughput changes or
-        # new history before any charged AWS request is sent.
-        release_capacity = max(1, horizon - 1)
+        release_capacity = adaptive_restore_slot_limit(session, run, settings)
+        configured_horizon = int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1)
+        horizon = configured_horizon if release_capacity == 2 else max(configured_horizon, release_capacity + 1)
+        # Keep a future slice mutable.  The baseline is always two concurrent
+        # restores; Raikou may safely add slots only after sufficient evidence.
         waves = list(session.scalars(select(Wave).where(Wave.pipeline_run_id == run.id).order_by(
             Wave.planned_restore_at, Wave.id
         )))

@@ -195,6 +195,12 @@ class LogicalTransferRequest(BaseModel):
     source: ObjectIdentity
     destination_bucket: str = Field(min_length=1, max_length=255)
     size_bytes: int = Field(ge=0)
+    # Raiju's allocation is part of the simulated transport contract. CONTROL
+    # must model the same aggregate link envelope as DATA/REAL, rather than
+    # granting each parallel object the entire scenario throughput.
+    allocated_rate_mbps: float = Field(gt=0)
+    active_workers: int = Field(ge=1)
+    network_operation_key: str = Field(min_length=1, max_length=255)
     idempotency_key: UUID
 
 

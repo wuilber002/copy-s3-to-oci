@@ -920,6 +920,9 @@ class SimulationEngine:
         destination_bucket_name: str,
         key: str,
         size_bytes: int,
+        allocated_rate_mbps: float,
+        active_workers: int,
+        network_operation_key: str,
         idempotency_key: str,
     ) -> LogicalTransferResult:
         """Promote catalog evidence without generating payload in CONTROL."""
@@ -965,12 +968,18 @@ class SimulationEngine:
                 execution,
                 clock,
                 config,
-                f"{scenario.seed}:network:{stable_source_identity}:{attempt}",
+                f"{scenario.seed}:network:{network_operation_key}:{attempt}",
             )
             if unavailable:
                 session.commit()
                 raise SimulatedNetworkUnavailable(retry_after_virtual_seconds)
-            elapsed = size_bytes * 8 / (throughput_mbps * 1_000_000) + latency_seconds
+            # The local Raiju batch allocates a fraction of the configured
+            # link to every object.  The shared operation key ensures jitter
+            # is common to the batch instead of accidentally multiplying the
+            # simulated WAN capacity per object.
+            link_share_mbps = throughput_mbps / max(1, active_workers)
+            effective_rate_mbps = max(0.001, min(float(allocated_rate_mbps), link_share_mbps))
+            elapsed = size_bytes * 8 / (effective_rate_mbps * 1_000_000) + latency_seconds
             if fault and fault["action"] == "DELAY":
                 elapsed += max(0, float(fault.get("delay_seconds", 0)))
             checksum = "logical:" + hashlib.sha256(

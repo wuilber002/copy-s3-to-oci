@@ -618,6 +618,9 @@ def destination_logical_transfer(payload: LogicalTransferRequest) -> dict:
             payload.destination_bucket,
             payload.source.key,
             payload.size_bytes,
+            payload.allocated_rate_mbps,
+            payload.active_workers,
+            payload.network_operation_key,
             str(payload.idempotency_key),
         ).model_dump(mode="json")
     except SimulatedNetworkUnavailable as error:
