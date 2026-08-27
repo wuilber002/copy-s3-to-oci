@@ -1,11 +1,24 @@
-# Capacidades e operação do RAIJIN
+# Capacidades do RAIJIN e do FUJIN
 
-Este é o inventário vivo de produto do RAIJIN. Toda entrega que acrescente,
-remova ou altere um fluxo operacional deve atualizar este documento no mesmo
-commit. O objetivo é dar visibilidade rápida sobre **o que a plataforma é capaz
-de fazer** e **como ela organiza a operação**.
+Este é o inventário vivo dos dois programas que compõem a plataforma. Toda
+entrega que acrescente, remova ou altere um fluxo operacional deve atualizar
+este documento no mesmo commit.
 
-## O que o RAIJIN faz
+| Programa | Papel |
+| --- | --- |
+| ![Logo do RAIJIN](../images/raijin-banner.png) **RAIJIN** | Plano de controle e operação de migrações entre AWS S3 e OCI Object Storage. |
+| ![Logo do FUJIN](../images/fujin-oracle-about.png) **FUJIN** | Backend isolado de simulação para validar o comportamento do RAIJIN sem chamadas à AWS ou OCI. |
+
+## RAIJIN — plano de controle de migração
+
+![Logo do RAIJIN](../images/raijin-oracle-about.png)
+
+O RAIJIN é o programa que inventaria fontes, planeja waves, governa restores,
+coordena workers, transfere objetos, registra evidências e apresenta a console
+operacional. Ele opera com integrações reais ou, quando explicitamente iniciado
+no modo isolado, delega as integrações simuladas ao FUJIN.
+
+### O que o RAIJIN faz
 
 ### Fontes, conexões e inventário
 
@@ -91,7 +104,7 @@ de fazer** e **como ela organiza a operação**.
 - Usa Instance Principal OCI e Secrets OCI; credenciais AWS não são exibidas ao
   navegador nem persistidas no banco.
 
-## Como a operação funciona
+### Como a operação funciona
 
 ### Telas da console
 
@@ -165,14 +178,23 @@ O re-discovery é incremental e auditável:
   histórica estiver íntegra, usa **Ver alterações → Preparar nova transferência**
   para criar a revisão nova, que fica em `DISCOVERED`.
 
-## Backend simulado — implementado e em evolução
+## FUJIN — backend de simulação
 
-O backend simulado é um gêmeo digital controlado da AWS, do OCI, da rede e
-do tempo. Seu objetivo não é criar um fluxo alternativo que aprove waves
-artificialmente: os mesmos governance e transfer workers usados em produção
-continuarão processando fila, leases, polling, restores, streaming, multipart,
-retries, checkpoints, reconciliação e replanejamento. Somente as integrações
-externas são substituídas por implementações simuladas no modo isolado.
+![Logo do FUJIN](../images/fujin-oracle-about.png)
+
+O FUJIN é um programa independente, com contrato de backend versionado e ciclo
+de evolução próprio. Ele emula AWS S3, OCI Object Storage, rede e tempo para
+que o RAIJIN execute o mesmo fluxo operacional sem acessar provedores reais.
+O FUJIN não substitui os workers nem a lógica de governança do RAIJIN: substitui
+somente os endpoints externos consumidos por eles.
+
+### O que o FUJIN faz
+
+O FUJIN é um gêmeo digital controlado da AWS, do OCI, da rede e do tempo. Seu
+objetivo não é criar um fluxo alternativo que aprove waves artificialmente: os
+mesmos *governance* e *transfer workers* usados em produção continuam
+processando fila, *leases*, *polling*, restores, streaming, multipart, retries,
+checkpoints, reconciliação e replanejamento.
 
 Na criação de cenários, tamanhos lógicos e o orçamento físico do modo `DATA`
 são informados em GB e convertidos para bytes somente ao montar o contrato
@@ -225,7 +247,7 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
 
 ### Relógio virtual
 
-- O simulador manterá horário real e horário virtual separados, sem alterar o
+- O FUJIN manterá horário real e horário virtual separados, sem alterar o
   relógio do Linux.
 - Um fator configurável permitirá representar horas ou dias simulados em
   segundos reais.
@@ -248,7 +270,7 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
   fora do prazo ou nunca acontecer.
 - Cada objeto manterá os horários simulados de solicitação, primeiro momento
   observado como disponível e expiração da cópia restaurada.
-- O governance worker real executará o polling adaptativo. O simulador apenas
+- O *governance worker* real executará o polling adaptativo. O FUJIN apenas
   responderá ao `Describe`, `List` ou `Head`; não alterará diretamente a wave,
   o objeto ou a task no banco do RAIJIN.
 - Isso permitirá medir quantidade de consultas, atraso entre disponibilidade e
@@ -320,7 +342,7 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
   multipart rejeitada, restore expirado e corrupção de dados.
 - Toda falha aleatória usará seed e será persistida com o ponto exato de
   injeção, tornando o teste reproduzível.
-- O simulador nunca consumirá a fila durável nem mudará diretamente os estados
+- O FUJIN nunca consumirá a fila durável nem mudará diretamente os estados
   operacionais. A recuperação continuará sendo responsabilidade dos workers
   reais por leases, retries e checkpoints.
 - Relatórios compararão previsão e execução, mostrarão falhas injetadas,
@@ -351,7 +373,7 @@ com 100 TB lógicos e 640 mil objetos sem persistir payload.
 - A purga automática será configurável e poderá exigir aprovação manual. Um
   tombstone mínimo de auditoria será preservado, e os backups deverão cobrir o
   período completo de quarentena.
-- RAIJIN e simulador serão atualizados juntos e aceitarão somente uma versão
+- RAIJIN e FUJIN serão atualizados juntos e aceitarão somente uma versão
   compatível do contrato interno, validada no startup.
 - O gerador de dados terá versão persistida. Algoritmos antigos permanecerão
   disponíveis enquanto existirem cenários dependentes; depois disso, seguirão
