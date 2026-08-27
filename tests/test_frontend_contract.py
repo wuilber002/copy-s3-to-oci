@@ -194,6 +194,10 @@ def test_laboratory_mode_and_discovery_origin_are_visible_and_explicit():
     assert 'id="laboratory-mode-banner"' in page
     assert "syncLaboratoryModeBanner" in page
     assert "Discovery: ${escape(discoveryModeLabel(discovery.mode))}" in page
+    # Runtime selection is an administrative localhost API operation.  It
+    # must never be available to a console operator as a settings control.
+    assert 'id="operation-mode-action"' not in page
+    assert "requestOperationMode(" not in page
 
 
 def test_source_prefixes_use_a_controlled_add_remove_list():

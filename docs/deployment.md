@@ -69,6 +69,50 @@ antes de iniciar o perfil, ou prefira o bootstrap da VM, que faz isso de forma
 idempotente. O ambiente de produção troca o modo por `raijin-mode`, depois de
 um drain comprovado da fila, e nunca executa os dois runtimes ao mesmo tempo.
 
+### Alterar o modo de operação por API local
+
+A troca de modo não é exposta na interface web. Ela é uma operação
+administrativa executada somente na própria VM, pela API local publicada em
+`127.0.0.1:8080`. O endpoint solicita ao host um reinício controlado e recusa
+a operação enquanto houver tarefas ou *discoveries* em estado `READY` ou
+`RUNNING`.
+
+Primeiro, consulte o modo atual:
+
+```bash
+curl --fail --silent http://127.0.0.1:8080/api/runtime
+```
+
+Para solicitar a mudança para o runtime que acessa AWS e OCI reais:
+
+```bash
+curl --fail --silent --show-error \
+  --request POST http://127.0.0.1:8080/api/runtime/mode \
+  --header 'Content-Type: application/json' \
+  --data '{"target_mode":"REAL","confirmed":true}'
+```
+
+Para solicitar a mudança para o runtime isolado, que não chama AWS nem OCI:
+
+```bash
+curl --fail --silent --show-error \
+  --request POST http://127.0.0.1:8080/api/runtime/mode \
+  --header 'Content-Type: application/json' \
+  --data '{"target_mode":"SIMULATION","confirmed":true}'
+```
+
+Uma resposta `202` confirma somente que o host aceitou a solicitação. Aguarde
+o reinício e consulte `/healthz` até receber `"status":"ok"` e o
+`operation_mode` solicitado:
+
+```bash
+until curl --fail --silent http://127.0.0.1:8080/healthz; do sleep 5; done
+```
+
+Não execute a troca por navegador, por máquina remota ou durante uma
+migração. Quando a API retornar `409`, conclua, pause ou recupere as tarefas
+informadas antes de repetir a chamada.
+
 O painel de saúde também mostra o estado do serviço systemd da plataforma, dos containers PostgreSQL e aplicação, do timer de backup lógico e do timer que atualiza esse estado. O host gera um pequeno JSON em `/run/s3-oci-migration` a cada minuto; o container web apenas o lê, sem acesso ao socket Podman, systemd ou privilégios de host.
 
 O bloco **Observabilidade operacional** acompanha, sem chamar AWS ou OCI: tarefas falhas e em retry, leases vencidos, checkpoints multipart pendentes de retomada, transferências sem progresso há mais de dez minutos, falhas persistidas nas últimas 24 horas, risco previsto de expiração de cópias restauradas e espaço livre do volume persistente. Para um coletor local compatível, `http://127.0.0.1:8080/metrics` expõe essas métricas no formato Prometheus (`raijin_failed_tasks`, `raijin_retrying_tasks`, `raijin_stale_task_leases`, `raijin_active_multipart_checkpoints`, `raijin_stalled_transfers`, `raijin_failures_last_24h`, `raijin_restore_expiry_risk_waves` e `raijin_disk_free_bytes`); mantenha-o atrás do mesmo túnel SSH ou de um agente local, nunca em uma porta pública.
