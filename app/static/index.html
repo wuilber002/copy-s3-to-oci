@@ -610,8 +610,8 @@ refreshAll();
   };
 </script>
 <style>
-  .virtual-clock-state{position:relative;cursor:help}
-  .virtual-clock-state:hover::after,.virtual-clock-state:focus::after{content:attr(data-help);position:absolute;z-index:60;bottom:calc(100% + .45rem);left:50%;width:280px;padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;transform:translateX(-50%);white-space:normal}
+  .virtual-clock-state{cursor:help}
+  .virtual-clock-tooltip{position:fixed;z-index:120;width:min(360px,calc(100vw - 2rem));padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;pointer-events:none}
 </style>
 <script>
   (()=>{
@@ -628,13 +628,43 @@ refreshAll();
       if(!state)return;
       const mode=state.textContent.trim().toUpperCase();
       state.tabIndex=0;
-      state.dataset.help=help[mode]||`Estado do relógio virtual: ${mode}.`;
+      state.dataset.clockHelp=help[mode]||`Estado do relógio virtual: ${mode}.`;
       // Do not set the native title: it creates a second browser tooltip and
       // competes visually with the purpose-built status explanation.
       state.removeAttribute('title');
     };
     new MutationObserver(apply).observe(rate,{childList:true,characterData:true,subtree:true});
     apply();
+    const tooltip=document.createElement('div');
+    tooltip.className='virtual-clock-tooltip hidden';
+    tooltip.setAttribute('role','tooltip');
+    document.body.appendChild(tooltip);
+    const show=state=>{
+      const message=state?.dataset.clockHelp;
+      if(!message)return;
+      tooltip.textContent=message;
+      tooltip.classList.remove('hidden');
+      const rect=state.getBoundingClientRect();
+      const banner=document.querySelector('#simulation-runtime-banner');
+      const bannerBottom=banner?.getBoundingClientRect().bottom||0;
+      const left=Math.min(window.innerWidth-tooltip.offsetWidth-12,Math.max(12,rect.left));
+      tooltip.style.left=`${left}px`;
+      tooltip.style.top=`${Math.max(bannerBottom+8,rect.bottom+8)}px`;
+    };
+    const hide=()=>tooltip.classList.add('hidden');
+    document.addEventListener('mouseover',event=>{
+      const state=event.target.closest?.('.virtual-clock-state');
+      if(state)show(state);
+    });
+    document.addEventListener('mouseout',event=>{
+      const state=event.target.closest?.('.virtual-clock-state');
+      if(state&&!state.contains(event.relatedTarget))hide();
+    });
+    document.addEventListener('focusin',event=>{
+      const state=event.target.closest?.('.virtual-clock-state');
+      if(state)show(state);
+    });
+    document.addEventListener('focusout',hide);
   })();
 </script>
 </body></html>
