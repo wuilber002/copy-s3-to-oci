@@ -2983,13 +2983,25 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             if ready:
                 phases.append(ready)
         transfer_start = transfer_started_at or planned_transfer_at
+        transfer_start_inferred = False
+        # Older simulated executions persisted the completion milestone but
+        # not the start milestone. Keep their timeline readable: the observed
+        # finish plus the durable prediction yields a bounded inferred start.
+        if not transfer_started_at and transfer_completed_at:
+            transfer_start = transfer_completed_at - timedelta(
+                seconds=max(1, int(wave.predicted_transfer_seconds or 1))
+            )
+            transfer_start_inferred = True
         if transfer_started_at:
             transfer_end = transfer_completed_at or effective_now
+        elif transfer_completed_at:
+            transfer_end = transfer_completed_at
         elif transfer_start:
             transfer_end = transfer_start + timedelta(seconds=max(1, int(wave.predicted_transfer_seconds or 0)))
         else:
             transfer_end = None
-        transfer = phase("TRANSFER", transfer_start, transfer_end, planned=not bool(transfer_started_at),
+        transfer = phase("TRANSFER", transfer_start, transfer_end,
+                         planned=not bool(transfer_started_at or transfer_completed_at),
                          expected_seconds=max(1, int(wave.predicted_transfer_seconds or 0)))
         if transfer:
             phases.append(transfer)
@@ -3009,6 +3021,10 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             "planned_restore_at": wave.planned_restore_at,
             "expected_restore_available_at": expected_available_at,
             "planned_transfer_start_at": planned_transfer_at,
+            "transfer_started_at": transfer_started_at,
+            "transfer_completed_at": transfer_completed_at,
+            "transfer_effective_start_at": transfer_start,
+            "transfer_start_inferred": transfer_start_inferred,
             "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
             "phases": phases,
         })

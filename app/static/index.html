@@ -65,6 +65,16 @@
   <style>
     .banner-clock-row{grid-template-columns:5.8rem minmax(320px,auto)}.banner-clock-row.virtual{grid-template-columns:5.4rem auto;justify-content:center;gap:.7rem}.banner-clock-row.virtual .banner-clock-rate{display:none}.virtual-clock-meta{display:grid;gap:.05rem;align-content:center;justify-items:center;text-align:center;line-height:1.05}.virtual-clock-meta span{color:#4ade80}.virtual-clock-meta .virtual-clock-state.paused{color:#ff4d4f;animation:virtual-clock-paused .85s step-end infinite}.virtual-clock-meta .virtual-clock-state.held{color:#fbbf24}@keyframes virtual-clock-paused{50%{opacity:.25}}
   </style>
+  <style>
+    /* Keep every flight-board lane within its own row. A later legacy rule
+       used a 20px track and clipped the transfer lane at 26px. */
+    .flight-board-track{height:36px}
+    .flight-board-phase{height:6px}
+    .flight-board-phase.queue{top:2px}
+    .flight-board-phase.restore{top:10px}
+    .flight-board-phase.buffer{top:18px}
+    .flight-board-phase.transfer{top:26px}
+  </style>
 </head>
 <body>
   <header class="topbar app-banner"><button class="brand" title="Sobre o RAIJIN" aria-label="Sobre o RAIJIN" onclick="showView('about')"><img src="/static/assets/images/raijin-banner.png" alt="Emblema Raijin com fluxo de dados"><span><strong>RAIJIN</strong><small>Data Migration</small></span></button><div class="banner-clocks" aria-live="off"><div id="virtual-clock-row" class="banner-clock-row virtual hidden"><span class="banner-clock-label">Virtual</span><time id="virtual-banner-clock" class="banner-clock">--:--:--</time><span id="virtual-clock-rate" class="banner-clock-rate">×1</span></div><div class="banner-clock-row"><span class="banner-clock-label">System</span><time id="banner-clock" class="banner-clock">--:--:--</time><span class="banner-clock-rate" aria-hidden="true"></span></div></div><div class="banner-actions"><nav class="nav"><button class="active" data-view="dashboard" onclick="showView('dashboard')">Status</button><button data-view="queue" onclick="showView('queue')">Queue</button><button data-view="migrations" onclick="showView('migrations')">Migrações</button></nav><button id="simulation-nav" class="simulation-nav hidden" type="button" onclick="location.href='/simulation'">Simulation</button><button class="gear secondary" title="Configurações" aria-label="Configurações" onclick="showView('settings')">⚙</button></div></header>
@@ -563,4 +573,40 @@ refreshAll();
 <script>(()=>{const row=document.querySelector('#virtual-clock-row'),rate=document.querySelector('#virtual-clock-rate');if(!row||!rate)return;const label=row.querySelector('.banner-clock-label');if(!label)return;const update=()=>{const [rawMode='NORMAL',rawRate='×1']=(rate.textContent||'NORMAL · ×1').split(' · ');const mode=rawMode.trim().toUpperCase();label.className='banner-clock-label virtual-clock-meta';label.innerHTML=`<span class="virtual-clock-acceleration">${rawRate.trim()}</span><span>VIRTUAL</span><span class="virtual-clock-state ${mode.toLowerCase()}">${mode}</span>`};new MutationObserver(update).observe(rate,{childList:true,characterData:true,subtree:true});update()})();</script>
 <style>#pipeline-history th:last-child,#pipeline-history td:last-child{display:none}</style>
 <script>(()=>{const validate=document.querySelector('#source-validate-destination');if(!validate)return;const timeline=document.createElement('button');timeline.id='source-waves-timeline';timeline.type='button';timeline.className='secondary';timeline.textContent='Waves timeline';timeline.disabled=true;timeline.onclick=async()=>{if(!selectedSource)return;flightBoardSourceId=Number(selectedSource);await showFlightBoard()};validate.insertAdjacentElement('afterend',timeline);const queueButton=document.querySelector('#flight-board-button');if(queueButton)queueButton.textContent='Waves timeline';const refresh=async()=>{const sourceId=Number(selectedSource||0);timeline.disabled=!sourceId;timeline.classList.toggle('hidden',!sourceId);if(!sourceId)return;try{const availability=await api(`/api/flight-board/availability?source_id=${sourceId}`);timeline.disabled=!availability.available;timeline.title=availability.available?'Exibir a linha do tempo das waves dinâmicas desta origem.':'Nenhuma wave dinâmica disponível para esta origem.'}catch(_){timeline.disabled=true}};document.addEventListener('raijin:source-changed',refresh);refresh()})();</script>
+<script>
+  /* Transfer timing is a first-class part of the board: expose planned,
+     observed and, for historical records, safely inferred milestones. */
+  function flightBoardTransferSchedule(w){
+    const start=w.transfer_started_at||w.transfer_effective_start_at;
+    const startLabel=w.transfer_start_inferred?'Início estimado':'Início executado';
+    return `<b>Agendada:</b> ${flightBoardDate(w.planned_transfer_start_at)}<br>`+
+      `<b>${startLabel}:</b> ${flightBoardDate(start)}${w.transfer_start_inferred?' (derivado da conclusão)':''}<br>`+
+      `<b>Concluída:</b> ${flightBoardDate(w.transfer_completed_at)}`;
+  }
+  function renderFlightBoardModal(d,title,introduction){
+    const waves=d.waves||[];
+    const start=new Date(d.timeline_start_at).getTime();
+    const end=Math.max(start+1,new Date(d.timeline_end_at).getTime());
+    const chart=waves.map(w=>`<div class="flight-board-row"><div class="flight-board-label" title="${escape(w.wave_name)}">${escape(w.wave_name)} <small>#${w.wave_id}</small></div><div class="flight-board-track">${(w.phases||[]).map(phase=>flightBoardBar(phase,start,end)).join('')}</div></div>`).join('');
+    const rows=waves.map(w=>`<tr><td>${escape(w.wave_name)} <small>#${w.wave_id}</small></td><td><span class="queue-state">${escape(w.status)}</span></td><td><b>Previsto:</b> ${flightBoardDate(w.expected_restore_available_at)}<br><b>Solicitado:</b> ${flightBoardDate(w.started_at)}</td><td>${flightBoardTransferSchedule(w)}</td></tr>`).join('');
+    $('#flight-board-title').textContent=title;
+    $('#flight-board-content').innerHTML=`<p class="hint">${introduction}</p><div class="flight-board-legend"><span><i style="background:#64748b"></i>Na fila</span><span><i style="background:#d97706"></i>Restore</span><span><i style="background:#0f766e"></i>Aguardando transferência</span><span><i style="background:#2563eb"></i>Transferência</span><span><i style="background:repeating-linear-gradient(135deg,#ffffff99 0 3px,#64748b 3px 6px)"></i>Previsto</span></div><div class="flight-board-chart">${flightBoardAxis(start,end)}${chart}</div><table class="flight-board-table"><thead><tr><th>Wave</th><th>Status</th><th>Restore</th><th>Transferência</th></tr></thead><tbody>${rows}</tbody></table>${d.truncated?'<p class="warning">Exibindo as primeiras 500 waves dinâmicas desta source.</p>':''}`;
+    openModal('#flight-board-modal');
+  }
+  showFlightBoard=async function(){
+    try{
+      if(!flightBoardSourceId)return say('Não há source dinâmica na fila para exibir.',true);
+      const d=await api(`/api/flight-board?source_id=${flightBoardSourceId}`);
+      if(!(d.waves||[]).length)return say('Não há waves dinâmicas para exibir nesta source.',true);
+      renderFlightBoardModal(d,`Inventário de bordo — ${d.source_name||d.waves[0].source_name}`,'Linha do tempo prevista e observada das waves dinâmicas desta source. Barras listradas são previsões; barras sólidas representam trabalho iniciado ou observado.');
+    }catch(e){say(`Inventário de bordo: ${e.message}`,true)}
+  };
+  showPipelineHistoryFlightBoard=async function(runId){
+    try{
+      const d=await api(`/api/flight-board?run_id=${runId}`);
+      if(!(d.waves||[]).length)return say('Não há waves registradas nesta execução.',true);
+      renderFlightBoardModal(d,`Histórico de bordo — execução #${runId}`,'Linha do tempo persistida desta execução do pipeline dinâmico. Barras listradas representam o plano; barras sólidas, as fases observadas.');
+    }catch(e){say(`Histórico de bordo: ${e.message}`,true)}
+  };
+</script>
 </body></html>
