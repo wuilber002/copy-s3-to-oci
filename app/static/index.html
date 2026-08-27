@@ -661,6 +661,50 @@ refreshAll();
   .virtual-clock-state{cursor:help}
   .virtual-clock-tooltip{position:fixed;z-index:120;width:min(360px,calc(100vw - 2rem));padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;pointer-events:none}
 </style>
+<style>
+  /* Keep the durable wave ID visually attached to the wave name, never as a
+     trailing orphan. */
+  .wave-identity-prefix{font-size:inherit;font-weight:700;color:#dbeafe;white-space:nowrap}
+</style>
+<script>
+  (()=>{
+    const marker=/^#(\d+)$/;
+    function prefixWaveIdentity(scope){
+      if(!scope)return;
+      for(const node of scope.querySelectorAll('small')){
+        const match=(node.textContent||'').trim().match(marker);
+        if(!match||node.dataset.waveIdentityPrefixed==='true')continue;
+        const predecessor=node.previousSibling;
+        if(!predecessor)continue;
+        node.dataset.waveIdentityPrefixed='true';
+        node.classList.add('wave-identity-prefix');
+        node.textContent=`#${match[1]}: `;
+        node.parentNode.insertBefore(node,predecessor);
+      }
+    }
+    const transferQueueRenderer=renderTransferQueue;
+    renderTransferQueue=function(queue){transferQueueRenderer(queue);prefixWaveIdentity($('#transfer-queue'))};
+    const activityRenderer=renderActivity;
+    renderActivity=function(...args){activityRenderer(...args);prefixWaveIdentity($('#activity-transfers'))};
+    const eventLoader=loadEvents;
+    loadEvents=async function(){await eventLoader();for(const cell of document.querySelectorAll('#events tbody tr td:nth-child(4)'))prefixWaveIdentity(cell)};
+    const deepAuditRenderer=renderDeepAudits;
+    renderDeepAudits=function(data){deepAuditRenderer(data);for(const heading of document.querySelectorAll('#deep-audits h3')){
+      const markerNode=[...heading.querySelectorAll('small')].find(node=>marker.test((node.textContent||'').trim()));
+      if(!markerNode||markerNode.dataset.waveIdentityPrefixed==='true')continue;
+      const match=markerNode.textContent.trim().match(marker);
+      const text=heading.firstChild;
+      if(!match||!text||text.nodeType!==Node.TEXT_NODE)continue;
+      const suffix=` #${match[1]}`;
+      const value=text.textContent;
+      text.textContent=value.endsWith(suffix)?value.slice(0,-suffix.length):value;
+      markerNode.dataset.waveIdentityPrefixed='true';
+      markerNode.classList.add('wave-identity-prefix');
+      markerNode.textContent=`#${match[1]}: `;
+      heading.insertBefore(markerNode,text.nextSibling);
+    }};
+  })();
+</script>
 <script>
   (()=>{
     const rate=document.querySelector('#virtual-clock-rate');
