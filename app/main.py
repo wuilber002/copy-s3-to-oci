@@ -2640,9 +2640,9 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     recently_completed_bytes = int(session.scalar(select(func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(
         ObjectRecord.transferred_at >= live_since,
     )) or 0)
-    if not control_logical_active:
+    if not (control_logical_active or control_logical_recent):
         live_transfer_mbps += (recently_completed_bytes * 8) / live_window_seconds / 1_000_000
-    if control_logical_active:
+    if control_logical_active or control_logical_recent:
         # CONTROL promotes catalog evidence immediately. Display the bounded
         # simulated link allocation, never an impossible wall-clock rate.
         live_transfer_mbps = min(float(settings.max_throughput_mbps), live_transfer_mbps)
@@ -4951,9 +4951,10 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
     """Release only due restores inside each dynamic run's durable horizon.
 
     Only the adaptive horizon is materialized. Charged S3 Batch jobs are then
-    emitted gradually within that horizon. A slot is occupied from submission
-    until the wave reaches a terminal success state; this avoids restoring an
-    unbounded set of temporary copies while preserving the transfer pipeline.
+    emitted gradually within that horizon. A restore slot is occupied from
+    submission until all of that wave's objects are available. The transfer
+    lane remains independent and serial, which avoids restoring an unbounded
+    set of temporary copies while preserving a warm transfer pipeline.
     """
     queue_now = utcnow()
     released = 0
