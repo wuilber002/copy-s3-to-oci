@@ -68,6 +68,28 @@ ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCES
 
 class RestoreReapprovalRequired(RuntimeError):
     """A restored copy disappeared before transfer and a paid retry is required."""
+
+
+class SimulatedNetworkRecoveryPending(RuntimeError):
+    """Transfer is waiting for a deterministic simulated network recovery."""
+
+    def __init__(self, retry_after_virtual_seconds: int):
+        self.retry_after_virtual_seconds = max(1, int(retry_after_virtual_seconds))
+        super().__init__(
+            "Simulated network outage; advanced the isolated virtual clock "
+            f"by {self.retry_after_virtual_seconds}s to its recovery point"
+        )
+
+
+def simulated_network_retry_after(error: Exception) -> int | None:
+    """Extract the versioned simulator outage hint from a typed 503 response."""
+    if not isinstance(error, SimulatorTransportError):
+        return None
+    text = str(error)
+    if "SIMULATED_NETWORK_UNAVAILABLE" not in text:
+        return None
+    match = re.search(r'"retry_after_virtual_seconds"\s*:\s*(\d+)', text)
+    return max(1, int(match.group(1))) if match else 1
 # Restore status is not queryable by an arbitrary set of object keys through
 # ListObjectsV2. Poll only objects assigned to the wave with HeadObject rather
 # than repeatedly scanning a full source prefix that may contain many other
@@ -123,6 +145,8 @@ def classify_task_error(error: Exception) -> tuple[str, str]:
     status, code = metadata.get("HTTPStatusCode"), details.get("Code")
     name = type(error).__name__
     summary = f"{name} ({status} {code})" if status or code else f"{name}: {str(error)[:500]}"
+    if isinstance(error, SimulatedNetworkRecoveryPending):
+        return "retry", str(error)
     if isinstance(error, SimulatorTransportError):
         # Contract/validation responses are deterministic and require a code
         # or scenario correction.  Connection failures are retryable through
@@ -366,8 +390,11 @@ def retry(session, task: Task, error: Exception | str, seconds: int | None = Non
     task.error = str(error)[:8000]
     if task.kind == "TRANSFER_WAVE":
         wave = session.get(Wave, task.wave_id)
+        # A retry remains a transfer in progress.  Reverting to RESTORED made
+        # a single wave visually oscillate between RESTORING/TRANSFERRING and
+        # obscured an otherwise healthy retry.
         if wave and wave.status == "TRANSFERRING":
-            wave.status = "RESTORED"
+            wave.status = "TRANSFERRING"
     event(session, "TASK_RETRY_QUEUED", f"{task.kind} retry in {delay}s: {task.error}", wave_id=task.wave_id)
     session.commit()
 
@@ -2058,36 +2085,39 @@ def transfer_object_simulated(
 def transfer_wave(session, task: Task, settings) -> None:
     wave = session.get(Wave, task.wave_id)
     if runtime_context.is_simulation:
-        # A full/partial availability poll may already have retained a hold.
-        # Acquire a local one only for older waves or recovered tasks.
-        held_by_handoff = bool(wave.simulation_transfer_clock_held)
-        if held_by_handoff:
-            try:
-                _transfer_wave(session, task, settings)
-            except Exception:
-                # A failed transfer task becomes terminal only after the outer
-                # task handler records the failure.  Release the hand-off hold
-                # here as well; otherwise a failed wave can leave its source
-                # clock held forever and make a later recovery appear frozen.
-                refreshed = session.get(Wave, task.wave_id)
-                if refreshed:
-                    release_simulation_clock_after_transfer(session, refreshed)
-                session.commit()
-                raise
-            finally:
-                refreshed = session.get(Wave, task.wave_id)
-                # Retain the durable hold across *all* partial batches. It is
-                # released only when the wave reaches a terminal state or an
-                # explicit paid re-restore approval is required.
-                if refreshed and refreshed.status in {
-                    "COMPLETED", "VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS",
-                    "FAILED", "VERIFICATION_FAILED", "RESTORE_REAPPROVAL_REQUIRED",
-                }:
-                    release_simulation_clock_after_transfer(session, refreshed)
-                session.commit()
-        else:
-            with simulation_phase_clock_hold(wave.source, "wave transfer"):
-                _transfer_wave(session, task, settings)
+        # Freeze this source-owned clock during transfer and across retry
+        # hand-offs.  A wall-clock worker retry must not consume a virtual
+        # restore-retention window.  Availability polling may already have
+        # acquired this durable hold; calling it again is idempotent.
+        retain_simulation_clock_for_transfer(session, wave)
+        session.commit()
+        try:
+            _transfer_wave(session, task, settings)
+        except SimulatedNetworkRecoveryPending:
+            # The helper below has advanced precisely to the deterministic
+            # recovery boundary.  Keep the transfer hold until the next task
+            # claim so the source cannot jump through another virtual window.
+            session.commit()
+            raise
+        except SimulatorTransportError:
+            # Transport retries also keep the virtual clock frozen; their
+            # outcome is unknown and must not create artificial expiry.
+            session.commit()
+            raise
+        except Exception:
+            refreshed = session.get(Wave, task.wave_id)
+            if refreshed:
+                release_simulation_clock_after_transfer(session, refreshed)
+            session.commit()
+            raise
+        finally:
+            refreshed = session.get(Wave, task.wave_id)
+            if refreshed and refreshed.status in {
+                "COMPLETED", "VERIFIED", "TRANSFERRED", "TRANSFERRED_WITH_ERRORS",
+                "FAILED", "VERIFICATION_FAILED", "RESTORE_REAPPROVAL_REQUIRED",
+            }:
+                release_simulation_clock_after_transfer(session, refreshed)
+            session.commit()
         return
     _transfer_wave(session, task, settings)
 
@@ -2146,6 +2176,22 @@ def _transfer_wave(session, task: Task, settings) -> None:
                 except Exception as error:
                     errors.append(error)
         if errors:
+            network_delays = [simulated_network_retry_after(error) for error in errors]
+            if network_delays and all(delay is not None for delay in network_delays):
+                delay = max(int(delay or 1) for delay in network_delays)
+                SimulatorAdminClient(runtime_context.simulator_base_url).control_clock(
+                    source.simulation_execution_id, "ADVANCE", delay
+                )
+                event(
+                    session,
+                    "SIMULATED_NETWORK_RECOVERY_WAIT",
+                    "Simulated network outage during transfer; virtual clock advanced "
+                    f"{delay}s to the deterministic recovery boundary.",
+                    source_id=source.id,
+                    wave_id=wave.id,
+                )
+                session.commit()
+                raise SimulatedNetworkRecoveryPending(delay)
             unavailable = next((error for error in errors if restored_object_is_unavailable(error)), None)
             if unavailable is not None:
                 require_new_restore_approval(session, wave, str(unavailable))
@@ -2505,7 +2551,12 @@ def run_once(role: str = WORKER_ROLE) -> None:
         except Exception as error:
             disposition, summary = classify_task_error(error)
             if disposition == "retry":
-                retry(session, task, summary)
+                retry(
+                    session,
+                    task,
+                    summary,
+                    seconds=1 if isinstance(error, SimulatedNetworkRecoveryPending) else None,
+                )
             else:
                 fail_permanently(session, task, summary)
         finally:

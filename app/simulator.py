@@ -25,7 +25,7 @@ from app.simulator_store import (
     SimulatorStore,
     TemplateWrite,
 )
-from app.simulation_engine import SimulationEngine
+from app.simulation_engine import SimulationEngine, SimulatedNetworkUnavailable
 from app.backend_contracts import (
     HeadObjectRequest,
     ListObjectsRequest,
@@ -620,6 +620,17 @@ def destination_logical_transfer(payload: LogicalTransferRequest) -> dict:
             payload.size_bytes,
             str(payload.idempotency_key),
         ).model_dump(mode="json")
+    except SimulatedNetworkUnavailable as error:
+        # An outage selected by a scenario is a first-class, retryable
+        # simulator outcome.  It must never be collapsed into HTTP 500.
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "SIMULATED_NETWORK_UNAVAILABLE",
+                "message": str(error),
+                "retry_after_virtual_seconds": error.retry_after_virtual_seconds,
+            },
+        ) from error
     except PermissionError as error:
         # This is an expected operational state, not an internal simulator
         # fault: the temporary restored copy is no longer available.

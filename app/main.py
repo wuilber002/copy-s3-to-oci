@@ -2928,7 +2928,13 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         task = latest_tasks.get(wave.id)
         phases = []
         queue_end = request_at or wave.planned_restore_at
-        queued = phase("QUEUE", wave.created_at, queue_end, planned=not bool(request_at))
+        # Simulation timestamps live in a source-owned virtual clock.  Do not
+        # mix them with the database wall-clock creation timestamp, otherwise
+        # a planned lane can appear to start days before its own scenario.
+        queue_start = wave.planned_restore_at if simulated else wave.created_at
+        if queue_start and queue_end and queue_start > queue_end:
+            queue_start = queue_end
+        queued = phase("QUEUE", queue_start, queue_end, planned=not bool(request_at))
         if queued:
             phases.append(queued)
         restore_start = request_at or wave.planned_restore_at
@@ -2955,15 +2961,28 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
                                      elapsed_seconds=restore_progress_seconds)
             if forecast_restore:
                 phases.append(forecast_restore)
-        ready_start = available_at or expected_available_at
-        if not transfer_started_at and ready_start and wave.planned_transfer_start_at:
+        # A forecast from an earlier planning pass is never allowed to put a
+        # transfer before the restore data is usable.  For progressive
+        # transfer the first available object opens the lane; otherwise only
+        # the final available object does.  This normalization is also what
+        # keeps old persisted plans readable after a scheduler recalculation.
+        readiness_at = (
+            first_available_at if row_source.transfer_strategy == "AS_OBJECTS_AVAILABLE"
+            else available_at
+        ) or expected_available_at
+        planned_transfer_at = wave.planned_transfer_start_at
+        if readiness_at and planned_transfer_at:
+            planned_transfer_at = max(readiness_at, planned_transfer_at)
+        elif readiness_at:
+            planned_transfer_at = readiness_at
+        if not transfer_started_at and readiness_at and planned_transfer_at:
             run = runs_by_id.get(wave.pipeline_run_id)
-            ready = phase("BUFFER", ready_start, wave.planned_transfer_start_at,
-                          planned=not bool(available_at),
+            ready = phase("BUFFER", readiness_at, planned_transfer_at,
+                          planned=not bool(first_available_at or available_at),
                           expected_seconds=int(run.restore_safety_seconds or 0) if run else None)
             if ready:
                 phases.append(ready)
-        transfer_start = transfer_started_at or wave.planned_transfer_start_at
+        transfer_start = transfer_started_at or planned_transfer_at
         if transfer_started_at:
             transfer_end = transfer_completed_at or effective_now
         elif transfer_start:
@@ -2989,7 +3008,7 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             "completed_at": transfer_completed_at if status in {"COMPLETED", "VERIFIED", "TRANSFERRED"} else None,
             "planned_restore_at": wave.planned_restore_at,
             "expected_restore_available_at": expected_available_at,
-            "planned_transfer_start_at": wave.planned_transfer_start_at,
+            "planned_transfer_start_at": planned_transfer_at,
             "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
             "phases": phases,
         })

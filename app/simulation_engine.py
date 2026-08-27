@@ -6,6 +6,7 @@ import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 from typing import Iterator
 
 from sqlalchemy import and_, func, select, update
@@ -108,12 +109,29 @@ def _expire_restore_if_needed(item: VirtualObject, now: datetime) -> bool:
     return False
 
 
+class SimulatedNetworkUnavailable(ConnectionError):
+    """A deterministic, temporary network outage in a simulator profile.
+
+    This is an expected scenario condition, never an internal simulator error.
+    The retry hint lets the real Raijin worker advance only the isolated
+    scenario clock to the end of the outage while keeping the transfer lane
+    frozen and its restore window intact.
+    """
+
+    def __init__(self, retry_after_virtual_seconds: int):
+        self.retry_after_virtual_seconds = max(1, int(retry_after_virtual_seconds))
+        super().__init__(
+            "Simulated network profile is temporarily unavailable "
+            f"(retry after {self.retry_after_virtual_seconds} virtual seconds)"
+        )
+
+
 def network_conditions(
     execution: SimulationExecution,
     clock: SimulationClock,
     configuration: dict,
     operation_seed: str,
-) -> tuple[float, float, bool]:
+) -> tuple[float, float, bool, int]:
     """Resolve deterministic network conditions at the current virtual time.
 
     ``network_profile`` is an ordered list of virtual-hour windows. A profile
@@ -123,6 +141,7 @@ def network_conditions(
     throughput = float(configuration.get("network_throughput_mbps", 1100))
     latency_ms = float(configuration.get("per_object_latency_ms", 5))
     unavailable = False
+    retry_after_virtual_seconds = 0
     current = virtual_now(clock)
     anchor = execution.virtual_started_at or clock.virtual_anchor_at
     elapsed_hours = max(0.0, (current - aware(anchor)).total_seconds() / 3600)
@@ -135,12 +154,23 @@ def network_conditions(
             throughput = float(window.get("throughput_mbps", throughput))
             latency_ms = float(window.get("latency_ms", latency_ms))
             unavailable = bool(window.get("unavailable", False))
+            if unavailable:
+                # A finite profile window has a deterministic recovery point.
+                # A deliberately unbounded outage remains observable but is
+                # retried in bounded virtual-hour increments.
+                remaining_hours = (end - profile_hour) if end != float("inf") else 1.0
+                retry_after_virtual_seconds = max(1, math.ceil(remaining_hours * 3600))
             break
     jitter = max(0.0, float(configuration.get("network_jitter_percent", 0)))
     if jitter:
         factor = 1 + ((_fraction(operation_seed) * 2) - 1) * jitter / 100
         throughput *= max(0.001, factor)
-    return max(0.001, throughput), max(0.0, latency_ms) / 1000, unavailable
+    return (
+        max(0.001, throughput),
+        max(0.0, latency_ms) / 1000,
+        unavailable,
+        retry_after_virtual_seconds,
+    )
 
 
 def _descriptor(item: VirtualObject, bucket_name: str) -> ObjectDescriptor:
@@ -931,7 +961,7 @@ class SimulationEngine:
                 raise ConnectionError("Injected deterministic logical transfer failure")
             config = snapshot.get("configuration", {})
             stable_source_identity = source.content_object_id or source.object_key
-            throughput_mbps, latency_seconds, unavailable = network_conditions(
+            throughput_mbps, latency_seconds, unavailable, retry_after_virtual_seconds = network_conditions(
                 execution,
                 clock,
                 config,
@@ -939,7 +969,7 @@ class SimulationEngine:
             )
             if unavailable:
                 session.commit()
-                raise ConnectionError("Simulated network profile is unavailable")
+                raise SimulatedNetworkUnavailable(retry_after_virtual_seconds)
             elapsed = size_bytes * 8 / (throughput_mbps * 1_000_000) + latency_seconds
             if fault and fault["action"] == "DELAY":
                 elapsed += max(0, float(fault.get("delay_seconds", 0)))
