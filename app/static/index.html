@@ -81,13 +81,20 @@
     .about-hero.simulation-about{grid-template-columns:minmax(190px,300px) minmax(0,1fr) minmax(0,1fr) minmax(190px,300px);gap:1.35rem}
     .about-hero .about-copy{min-width:0}
     .about-hero.simulation-about .about-copy{align-self:start}
+    .about-hero.simulation-about>img:first-child{grid-column:1;grid-row:1}
+    .about-hero.simulation-about>.about-copy:not(.about-fujin-copy){grid-column:2;grid-row:1}
+    .about-hero.simulation-about>.about-fujin-copy{grid-column:3;grid-row:1}
+    .about-hero.simulation-about>.about-simulator-art{grid-column:4;grid-row:1}
+    .about-hero.simulation-about .about-project-link-raijin{display:none}
+    .about-hero .about-project-link-shared{display:none}
+    .about-hero.simulation-about .about-project-link-shared{display:block;grid-column:2 / span 2;grid-row:2;margin:.1rem 0 0;text-align:center}
     .about-hero .about-copy p{overflow-wrap:anywhere}
     .about-hero .about-fujin-copy{border-left:1px solid #334155;padding-left:1.35rem}
     .about-hero .about-fujin-copy .about-eyebrow{color:#38bdf8}
     .about-hero .about-fujin-copy .about-version{border-color:#38bdf8;background:#0c4a6e;color:#e0f2fe}
     .about-hero .about-simulator-art{width:min(100%,300px)}
-    @media(max-width:1100px){.about-hero.simulation-about{grid-template-columns:minmax(180px,260px) minmax(0,1fr)}.about-hero.simulation-about .about-fujin-copy{grid-column:2;border-left:0;padding-left:0;border-top:1px solid #334155;padding-top:1rem}.about-hero.simulation-about .about-simulator-art{grid-column:1;grid-row:1 / span 2}}
-    @media(max-width:850px){.about-hero.simulation-about{grid-template-columns:1fr}.about-hero.simulation-about .about-fujin-copy,.about-hero.simulation-about .about-simulator-art{grid-column:auto;grid-row:auto;border-left:0;padding-left:0;border-top:1px solid #334155;padding-top:1rem}.about-hero.simulation-about .about-simulator-art{justify-self:center}}
+    @media(max-width:1100px){.about-hero.simulation-about{grid-template-columns:minmax(180px,260px) minmax(0,1fr)}.about-hero.simulation-about .about-fujin-copy{grid-column:2;border-left:0;padding-left:0;border-top:1px solid #334155;padding-top:1rem}.about-hero.simulation-about .about-simulator-art{grid-column:1;grid-row:1 / span 2}.about-hero.simulation-about .about-project-link-shared{grid-column:2;grid-row:3;text-align:left}}
+    @media(max-width:850px){.about-hero.simulation-about{grid-template-columns:1fr}.about-hero.simulation-about .about-fujin-copy,.about-hero.simulation-about .about-simulator-art,.about-hero.simulation-about .about-project-link-shared{grid-column:auto;grid-row:auto;border-left:0;padding-left:0;border-top:1px solid #334155;padding-top:1rem}.about-hero.simulation-about .about-simulator-art{justify-self:center}.about-hero.simulation-about .about-project-link-shared{text-align:center}}
   </style>
 </head>
 <body>
@@ -114,7 +121,22 @@
   </main>
 
   <main id="view-about" class="view">
-  <section id="about-hero" class="card about-hero"><img src="/static/assets/images/raijin-oracle-about.png?v=3" alt="Emblema detalhado do RAIJIN"><div class="about-copy"><p class="about-eyebrow">Plataforma de migração de dados</p><h2 class="about-title">RAIJIN</h2><span class="about-version">Versão 0.4.0</span><p>RAIJIN conduz migrações controladas de AWS S3 para OCI Object Storage, com inventário persistente, ondas operacionais, retomada segura, rastreabilidade e verificação criptográfica de integridade.</p><p class="about-details">Inspirado em Raijin, a divindade japonesa do trovão, o emblema representa força, movimento e condução precisa: cada objeto sai da origem com evidências de transferência e chega ao destino preservando sua integridade operacional.</p><p><a href="https://github.com/wuilber002/raijin-data-migration" target="_blank" rel="noopener noreferrer">Ver projeto no GitHub ↗</a></p></div><div id="about-fujin-copy" class="about-copy about-fujin-copy simulation-only hidden"><p class="about-eyebrow">Backend de simulação cloud</p><h2 class="about-title">FUJIN</h2><span class="about-version">Versão 0.4.0</span><p>FUJIN simula AWS S3, OCI Object Storage, rede e tempo por contrato versionado, permitindo que os workers reais do RAIJIN sejam validados sem chamadas aos provedores.</p><p class="about-details">Inspirado em Fūjin, a divindade japonesa do vento, ele cria cenários determinísticos, preserva evidências operacionais e reproduz falhas para validar o comportamento da migração com segurança.</p></div><img id="about-fujin-art" class="about-simulator-art simulation-only hidden" src="/static/assets/images/fujin-oracle-about.png?v=1" alt="Emblema detalhado do FUJIN"></section>
+  <section id="about-hero" class="card about-hero">
+    <img src="/static/assets/images/raijin-oracle-about.png?v=3" alt="Emblema detalhado do RAIJIN">
+    <div class="about-copy">
+      <p class="about-eyebrow">Plataforma de migração de dados</p><h2 class="about-title">RAIJIN</h2><span class="about-version">Versão 0.4.0</span>
+      <p>RAIJIN conduz migrações controladas de AWS S3 para OCI Object Storage, com inventário persistente, ondas operacionais, retomada segura, rastreabilidade e verificação criptográfica de integridade.</p>
+      <p class="about-details">Inspirado em Raijin, a divindade japonesa do trovão, o emblema representa força, movimento e condução precisa: cada objeto sai da origem com evidências de transferência e chega ao destino preservando sua integridade operacional.</p>
+      <p class="about-project-link-raijin"><a href="https://github.com/wuilber002/raijin-data-migration" target="_blank" rel="noopener noreferrer">Ver projeto no GitHub ↗</a></p>
+    </div>
+    <div id="about-fujin-copy" class="about-copy about-fujin-copy simulation-only hidden">
+      <p class="about-eyebrow">Backend de simulação cloud</p><h2 class="about-title">FUJIN</h2><span class="about-version">Versão 0.4.0</span>
+      <p>FUJIN simula AWS S3, OCI Object Storage, rede e tempo por contrato versionado, permitindo que os workers reais do RAIJIN sejam validados sem chamadas aos provedores.</p>
+      <p class="about-details">Inspirado em Fūjin, a divindade japonesa do vento, ele cria cenários determinísticos, preserva evidências operacionais e reproduz falhas para validar o comportamento da migração com segurança.</p>
+    </div>
+    <img id="about-fujin-art" class="about-simulator-art simulation-only hidden" src="/static/assets/images/fujin-oracle-about.png?v=1" alt="Emblema detalhado do FUJIN">
+    <p class="about-project-link-shared simulation-only hidden"><a href="https://github.com/wuilber002/raijin-data-migration" target="_blank" rel="noopener noreferrer">Ver projeto no GitHub ↗</a></p>
+  </section>
   <section class="card"><h2>Princípios da plataforma</h2><div class="grid"><div class="metric"><span>Controle</span><b>Ondas persistentes</b><p class="hint">Planejamento, fila, retomada e histórico sobrevivem a reinicializações da VM.</p></div><div class="metric"><span>Eficiência</span><b>Chamadas minimizadas</b><p class="hint">Discovery e restores são orquestrados para reduzir operações cobradas na AWS.</p></div><div class="metric"><span>Confiança</span><b>Integridade comprovada</b><p class="hint">A cópia registra evidências SHA-256; auditoria profunda fica disponível sob demanda.</p></div></div></section>
   </main>
 
