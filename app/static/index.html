@@ -611,7 +611,7 @@ refreshAll();
 </script>
 <style>
   .virtual-clock-state{position:relative;cursor:help}
-  .virtual-clock-state:hover::after,.virtual-clock-state:focus::after{content:attr(data-help);position:absolute;z-index:60;top:calc(100% + .45rem);left:50%;width:280px;padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;transform:translateX(-50%);white-space:normal}
+  .virtual-clock-state:hover::after,.virtual-clock-state:focus::after{content:attr(data-help);position:absolute;z-index:60;bottom:calc(100% + .45rem);left:50%;width:280px;padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;transform:translateX(-50%);white-space:normal}
 </style>
 <script>
   (()=>{
@@ -629,7 +629,9 @@ refreshAll();
       const mode=state.textContent.trim().toUpperCase();
       state.tabIndex=0;
       state.dataset.help=help[mode]||`Estado do relógio virtual: ${mode}.`;
-      state.title=state.dataset.help;
+      // Do not set the native title: it creates a second browser tooltip and
+      // competes visually with the purpose-built status explanation.
+      state.removeAttribute('title');
     };
     new MutationObserver(apply).observe(rate,{childList:true,characterData:true,subtree:true});
     apply();

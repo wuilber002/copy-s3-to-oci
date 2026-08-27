@@ -152,7 +152,7 @@
 <script>(()=>{const row=document.querySelector('#virtual-clock-row'),rate=document.querySelector('#virtual-clock-rate');if(!row||!rate)return;const label=row.querySelector('.banner-clock-label');if(!label)return;const update=()=>{const [rawMode='NORMAL',rawRate='×1']=(rate.textContent||'NORMAL · ×1').split(' · ');const mode=rawMode.trim().toUpperCase();label.className='banner-clock-label virtual-clock-meta';label.innerHTML=`<span class="virtual-clock-acceleration">${rawRate.trim()}</span><span>VIRTUAL</span><span class="virtual-clock-state ${mode.toLowerCase()}">${mode}</span>`};new MutationObserver(update).observe(rate,{childList:true,characterData:true,subtree:true});update()})();</script>
 <style>
   .virtual-clock-state{position:relative;cursor:help}
-  .virtual-clock-state:hover::after,.virtual-clock-state:focus::after{content:attr(data-help);position:absolute;z-index:60;top:calc(100% + .45rem);left:50%;width:280px;padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;transform:translateX(-50%);white-space:normal}
+  .virtual-clock-state:hover::after,.virtual-clock-state:focus::after{content:attr(data-help);position:absolute;z-index:60;bottom:calc(100% + .45rem);left:50%;width:280px;padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;transform:translateX(-50%);white-space:normal}
 </style>
 <script>
   (()=>{
@@ -170,7 +170,9 @@
       const mode=state.textContent.trim().toUpperCase();
       state.tabIndex=0;
       state.dataset.help=help[mode]||`Estado do relógio virtual: ${mode}.`;
-      state.title=state.dataset.help;
+      // The dedicated CSS tooltip is the only visible explanation. A native
+      // title would create a second, browser-controlled tooltip.
+      state.removeAttribute('title');
     };
     new MutationObserver(apply).observe(rate,{childList:true,characterData:true,subtree:true});
     apply();
