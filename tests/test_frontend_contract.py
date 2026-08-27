@@ -200,6 +200,13 @@ def test_discovery_origin_is_visible_and_retired_lab_mode_is_not_exposed():
     assert "requestOperationMode(" not in page
 
 
+def test_real_mode_hides_every_virtual_clock_residue_and_centers_system_clock():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert 'id="system-clock-row"' in page
+    assert "body:not(.simulation-mode) #virtual-clock-row{display:none!important}" in page
+    assert "body:not(.simulation-mode) #system-clock-row .banner-clock-label" in page
+
+
 def test_source_prefixes_use_a_controlled_add_remove_list():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="prefix-input"' in page
