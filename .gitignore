@@ -10,5 +10,6 @@ crash.log
 releases/
 operational/
 .s3-data-bucket/
+.tools/
 __pycache__/
 *:Zone.Identifier
