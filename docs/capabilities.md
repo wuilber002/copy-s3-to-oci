@@ -4,14 +4,9 @@ Este é o inventário vivo dos dois programas que compõem a plataforma. Toda
 entrega que acrescente, remova ou altere um fluxo operacional deve atualizar
 este documento no mesmo commit.
 
-| Programa | Papel |
-| --- | --- |
-| ![Logo do RAIJIN](../images/raijin-banner.png) **RAIJIN** | Plano de controle e operação de migrações entre AWS S3 e OCI Object Storage. |
-| ![Logo do FUJIN](../images/fujin-oracle-about.png) **FUJIN** | Backend isolado de simulação para validar o comportamento do RAIJIN sem chamadas à AWS ou OCI. |
-
 ## RAIJIN — plano de controle de migração
 
-![Logo do RAIJIN](../images/raijin-oracle-about.png)
+<img src="../images/raijin-oracle-about.png" alt="Logo do RAIJIN" width="280">
 
 O RAIJIN é o programa que inventaria fontes, planeja waves, governa restores,
 coordena workers, transfere objetos, registra evidências e apresenta a console
@@ -180,7 +175,7 @@ O re-discovery é incremental e auditável:
 
 ## FUJIN — backend de simulação
 
-![Logo do FUJIN](../images/fujin-oracle-about.png)
+<img src="../images/fujin-oracle-about.png" alt="Logo do FUJIN" width="280">
 
 O FUJIN é um programa independente, com contrato de backend versionado e ciclo
 de evolução próprio. Ele emula AWS S3, OCI Object Storage, rede e tempo para
