@@ -2987,12 +2987,14 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         # Older simulated executions persisted the completion milestone but
         # not the start milestone. Keep their timeline readable: the observed
         # finish plus the durable prediction yields a bounded inferred start.
-        if not transfer_started_at and transfer_completed_at:
+        if transfer_completed_at and (
+            not transfer_started_at or transfer_completed_at <= transfer_started_at
+        ):
             transfer_start = transfer_completed_at - timedelta(
                 seconds=max(1, int(wave.predicted_transfer_seconds or 1))
             )
             transfer_start_inferred = True
-        if transfer_started_at:
+        if transfer_started_at and not transfer_start_inferred:
             transfer_end = transfer_completed_at or effective_now
         elif transfer_completed_at:
             transfer_end = transfer_completed_at
