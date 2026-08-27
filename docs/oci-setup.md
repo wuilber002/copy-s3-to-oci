@@ -30,24 +30,30 @@ administrativo ocorre por túnel SSH autenticado por chave pública/privada.
 
 ## 2. Informações a registrar antes do início
 
-Registre os valores a seguir. Os mesmos códigos serão reutilizados nos comandos
-e nas policies. A tabela é uma referência, não um comando.
+Na Console OCI, recursos são localizados e selecionados pelo **nome exibido**:
+compartment, subnet, imagem, Vault, chave e VM. Os OCIDs não precisam ser
+informados nos seletores visuais. OCIDs são necessários somente nos comandos
+da OCI CLI, nas regras da Dynamic Group, nas policies e no arquivo de runtime
+da instalação.
 
-| Código | O que informar | Exemplo | Uso |
-|---|---|---|---|
-| `<TENANCY_OCID>` | OCID do *tenancy* OCI. | `ocid1.tenancy.oc1..example` | CLI |
-| `<VM_COMPARTMENT_OCID>` | Compartment onde a VM será criada. | `ocid1.compartment.oc1..example` | Console e CLI |
-| `<SUBNET_OCID>` | Subnet existente habilitada pelo cliente para a conectividade dedicada OCI–AWS e para os serviços OCI. | `ocid1.subnet.oc1.sa-saopaulo-1.example` | Console e CLI |
-| `<AVAILABILITY_DOMAIN>` | Availability Domain (AD) escolhido para a VM. | `xYzA:SA-SAOPAULO-1-AD-1` | Console e CLI |
-| `<IMAGE_OCID>` | Imagem Oracle Linux compatível. | `ocid1.image.oc1.sa-saopaulo-1.example` | Console e CLI |
-| `<DESTINATION_COMPARTMENT_OCID>` | Compartment que contém o *bucket* OCI de destino. | `ocid1.compartment.oc1..example` | Console e CLI |
-| `<DESTINATION_BUCKET>` | Nome do *bucket* OCI que receberá dados. | `migration-destination` | Console e CLI |
-| `<SECRETS_COMPARTMENT_OCID>` | Compartment em que os *Secrets* poderão ser lidos pela VM. | `ocid1.compartment.oc1..example` | Console e CLI |
-| `<VAULT_OCID>` | Vault que armazenará os *Secrets*. | `ocid1.vault.oc1.sa-saopaulo-1.example` | Console e CLI |
-| `<KEY_OCID>` | Chave AES-256 usada para cifrar os *Secrets*. | `ocid1.key.oc1.sa-saopaulo-1.example` | Console e CLI |
-| `<POLICY_COMPARTMENT_OCID>` | Compartment que governa os compartments informados na policy. | `ocid1.compartment.oc1..example` | Console e CLI |
-| `<VM_OCID>` | OCID da VM criada neste procedimento. | `ocid1.instance.oc1.sa-saopaulo-1.example` | Console e CLI |
-| `<DYNAMIC_GROUP_NAME>` | Nome da Dynamic Group exclusiva da VM. | `oracle-data-migration-vm` | Console e CLI |
+Registre o nome exibido e, quando o procedimento usar CLI ou configuração,
+registre também o OCID correspondente.
+
+| Recurso | Na Console OCI | Na CLI, policy ou runtime | Exemplo de OCID | Uso |
+|---|---|---|---|---|
+| Tenancy | Identifique o tenancy pelo nome exibido. | `<TENANCY_OCID>` | `ocid1.tenancy.oc1..example` | CLI |
+| Compartment da VM | Selecione pelo nome do compartment. | `<VM_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
+| Subnet | Selecione pelo nome da subnet. | `<SUBNET_OCID>` | `ocid1.subnet.oc1.sa-saopaulo-1.example` | Console e CLI |
+| Availability Domain (AD) | Selecione pelo nome exibido. | `<AVAILABILITY_DOMAIN>` | `xYzA:SA-SAOPAULO-1-AD-1` | Console e CLI |
+| Imagem Oracle Linux | Selecione pelo nome da imagem. | `<IMAGE_OCID>` | `ocid1.image.oc1.sa-saopaulo-1.example` | Console e CLI |
+| Compartment do destino | Selecione pelo nome do compartment. | `<DESTINATION_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
+| Bucket de destino | Selecione ou informe o nome do bucket. | `<DESTINATION_BUCKET>` | `migration-destination` | Console e CLI |
+| Compartment de Secrets | Selecione pelo nome do compartment. | `<SECRETS_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
+| Vault | Selecione pelo nome do Vault. | `<VAULT_OCID>` | `ocid1.vault.oc1.sa-saopaulo-1.example` | Console e CLI |
+| Chave mestra | Selecione pelo nome da chave. | `<KEY_OCID>` | `ocid1.key.oc1.sa-saopaulo-1.example` | Console e CLI |
+| Compartment da policy | Selecione pelo nome do compartment. | `<POLICY_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
+| VM | Selecione pelo nome da instância. | `<VM_OCID>` | `ocid1.instance.oc1.sa-saopaulo-1.example` | Console e CLI |
+| Dynamic Group | Informe o nome da Dynamic Group. | `<DYNAMIC_GROUP_NAME>` | `oracle-data-migration-vm` | Console e CLI |
 
 Para listar recursos pela OCI CLI, configure previamente o perfil da sua conta
 administrativa e execute, por exemplo:
@@ -58,6 +64,17 @@ oci iam availability-domain list \
   --query 'data[].name' --output table
 
 oci os ns get --query data --raw-output
+```
+
+Para consultar o OCID de um recurso selecionado por nome, use a OCI CLI ou a
+API administrativa. Por exemplo, para uma subnet:
+
+```bash
+oci network subnet list \
+  --compartment-id "<VM_COMPARTMENT_OCID>" \
+  --all \
+  --query 'data[?"display-name"==`<SUBNET_NAME>`].id | [0]' \
+  --raw-output
 ```
 
 ## 3. Pré-requisitos de rede e acesso administrativo
@@ -96,7 +113,7 @@ a chave do objeto e grava metadados de migração; não requer acesso a outros
 Na Console OCI:
 
 1. Abra **Object Storage & Archive Storage → Buckets**.
-2. Selecione o compartment `<DESTINATION_COMPARTMENT_OCID>`.
+2. Selecione o compartment de destino pelo nome exibido.
 3. Clique em **Create Bucket**.
 4. Informe `<DESTINATION_BUCKET>`, mantenha a visibilidade privada e confirme.
 5. Anote o nome exato e o compartment.
@@ -119,7 +136,8 @@ policy quando pertencem ao mesmo compartment, reduzindo o número de statements.
 
 É possível usar um Vault e uma chave AES existentes, desde que sejam acessíveis
 ao administrador que cria os *Secrets*. Caso sejam criados agora, prefira o
-mesmo compartment de segurança e registre os OCIDs retornados.
+mesmo compartment de segurança e registre os nomes exibidos e os OCIDs usados
+posteriormente pela CLI e pelo runtime.
 
 Na Console OCI:
 
@@ -168,7 +186,7 @@ Crie os dois *Secrets* no Vault selecionado:
 Na Console OCI, para cada entrada:
 
 1. Abra **Vault → <vault> → Secrets → Create Secret**.
-2. Selecione `<KEY_OCID>`.
+2. Selecione a chave pelo nome exibido.
 3. Informe o nome recomendado, uma descrição sem a senha e cole o valor no
    conteúdo da versão **Current**.
 4. Salve e registre o OCID do Secret.
@@ -215,10 +233,10 @@ validação pequena, use no mínimo 2 OCPUs, 8 GB e 200 GB de volume.
 Na Console OCI:
 
 1. Abra **Compute → Instances → Create instance**.
-2. Selecione `<VM_COMPARTMENT_OCID>`, a imagem Oracle Linux aprovada e
-   `<AVAILABILITY_DOMAIN>`.
+2. Selecione pelo nome exibido o compartment da VM, a imagem Oracle Linux
+   aprovada e o Availability Domain (AD).
 3. Escolha `VM.Standard.E5.Flex` e configure a capacidade desejada.
-4. Em **Networking**, selecione `<SUBNET_OCID>`. Atribua IP público somente se
+4. Em **Networking**, selecione a subnet pelo nome exibido. Atribua IP público somente se
    ele for necessário para o túnel SSH e a regra corporativa o permitir.
 5. Em **Add SSH keys**, cole a chave pública administrativa.
 6. Defina o boot volume com pelo menos 200 GB; use 500 GB como referência

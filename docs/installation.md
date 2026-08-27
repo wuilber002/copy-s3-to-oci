@@ -12,7 +12,9 @@ no [OCI Setup](oci-setup.md).
 
 ## 1. Informações necessárias
 
-Registre os valores abaixo antes de acessar a VM.
+Registre os valores abaixo antes de acessar a VM. Na Console OCI, os recursos
+são selecionados pelos respectivos nomes exibidos; os OCIDs desta tabela são
+usados somente neste guia para a configuração de runtime e para comandos CLI.
 
 | Código | Finalidade | Exemplo |
 |---|---|---|
