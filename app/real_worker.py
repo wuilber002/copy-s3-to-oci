@@ -1109,7 +1109,11 @@ def submit_restore(session, task: Task, settings) -> None:
             Manifest={"Spec": {"Format": "S3BatchOperations_CSV_20180820", "Fields": fields}, "Location": {"ObjectArn": f"arn:aws:s3:::{operation['control_bucket']}/{manifest_key}", "ETag": response["ETag"].strip('"')}},
             Report={"Bucket": f"arn:aws:s3:::{operation['control_bucket']}", "Prefix": f"{operation['control_prefix'].rstrip('/')}/reports/wave-{wave.id}/attempt-{attempt.id}/", "Format": "Report_CSV_20180820", "Enabled": True, "ReportScope": "AllTasks"},
             Description=f"S3 to OCI restore wave {wave.id}",
-            ClientRequestToken=f"s3-oci-wave-{wave.id}",
+            # A retry of this durable task keeps the same token, while an
+            # operator-approved reprocess creates a new task and therefore a
+            # new Batch submission. Reusing only the wave id would make AWS
+            # reject a legitimately new manifest as an idempotency conflict.
+            ClientRequestToken=f"odmt-wave-{wave.id}-task-{task.id}",
         )
     except Exception as error:
         _, summary = classify_task_error(error)
@@ -1149,7 +1153,12 @@ def submit_restore_simulated(
     manifest_sha = hashlib.sha256()
     for obj in archives:
         manifest_sha.update(simulated_manifest_line(obj))
-    idempotency_key = uuid5(NAMESPACE_URL, f"raijin:simulation:restore:wave:{wave.id}")
+    # Idempotency belongs to a durable submission task, not to the wave
+    # forever.  Retrying this task remains safe, while a later explicit
+    # reprocess has a distinct task id and may submit its new manifest.
+    idempotency_key = uuid5(
+        NAMESPACE_URL, f"odmt:simulation:restore:wave:{wave.id}:task:{task.id}"
+    )
     response = port.submit_restore_batch(
         SubmitRestoreBatchRequest(
             context=context,
