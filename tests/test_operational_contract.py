@@ -121,6 +121,34 @@ def test_global_actionable_failure_banner_ignores_archived_sources():
         assert operations_overview(session)["tasks"]["ACTIONABLE_FAILED"] == 0
 
 
+def test_operations_overview_reports_raiju_and_raikou_occupancy():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(name="worker-status", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        session.add(source)
+        session.flush()
+        wave = Wave(
+            source_id=source.id, name="wave-001", max_bytes=1024,
+            restore_days=1, restore_tier="BULK", status="TRANSFERRING",
+            active_transfer_workers=5,
+        )
+        session.add(wave)
+        session.flush()
+        session.add_all([
+            ObjectRecord(source_id=source.id, wave_id=wave.id, object_key="in-flight.bin", size_bytes=1024, state=ObjectState.TRANSFERRING),
+            Task(wave_id=wave.id, kind="TRANSFER_WAVE", state=TaskState.RUNNING),
+            Task(wave_id=wave.id, kind="POLL_RESTORE", state=TaskState.RUNNING),
+        ])
+        session.commit()
+
+        workers = operations_overview(session)["workers"]
+
+        assert workers["raiju"] == {"active": 5, "busy": 1, "idle": 4}
+        assert workers["raikou"] == {"busy": 1}
+
+
 def test_active_sources_cannot_silently_share_an_s3_prefix_scope():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)

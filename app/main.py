@@ -396,6 +396,10 @@ class Wave(Base):
     planner_mode: Mapped[str] = mapped_column(String(32), default="MANUAL")
     predicted_transfer_seconds: Mapped[float] = mapped_column(Float, default=0)
     prediction_samples: Mapped[int] = mapped_column(Integer, default=0)
+    # Raiju decides this value batch by batch.  Persisting the current
+    # allocation makes the Status view report the actual dynamic concurrency
+    # instead of presenting a fixed, misleading worker count.
+    active_transfer_workers: Mapped[int] = mapped_column(Integer, default=0)
     planned_restore_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     planned_transfer_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     # Observed milestones use the simulator virtual clock only for simulated
@@ -1135,7 +1139,7 @@ def create_schema() -> None:
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
     source_columns.update({"destination_validation_at": "TIMESTAMP WITH TIME ZONE", "destination_validation_status": "VARCHAR(32)", "destination_missing_count": "INTEGER NOT NULL DEFAULT 0", "destination_size_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_metadata_mismatch_count": "INTEGER NOT NULL DEFAULT 0", "destination_extra_count": "INTEGER NOT NULL DEFAULT 0"})
-    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE", "restore_requested_virtual_at": "TIMESTAMP WITH TIME ZONE", "first_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "last_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_started_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_completed_virtual_at": "TIMESTAMP WITH TIME ZONE", "simulation_transfer_clock_held": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_required": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_reason": "TEXT", "restore_reapproval_detected_at": "TIMESTAMP WITH TIME ZONE"}
+    wave_columns = {"batch_job_id": "VARCHAR(128)", "batch_job_status": "VARCHAR(64)", "manifest_key": "VARCHAR(2048)", "manifest_etag": "VARCHAR(128)", "last_poll_at": "TIMESTAMP WITH TIME ZONE", "poll_count": "INTEGER NOT NULL DEFAULT 0", "pipeline_run_id": "BIGINT", "availability_head_requests": "BIGINT NOT NULL DEFAULT 0", "availability_poll_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "availability_throttle_retries": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_objects": "INTEGER NOT NULL DEFAULT 0", "last_availability_poll_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "planner_mode": "VARCHAR(32) NOT NULL DEFAULT 'MANUAL'", "predicted_transfer_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "prediction_samples": "INTEGER NOT NULL DEFAULT 0", "active_transfer_workers": "INTEGER NOT NULL DEFAULT 0", "planned_restore_at": "TIMESTAMP WITH TIME ZONE", "planned_transfer_start_at": "TIMESTAMP WITH TIME ZONE", "restore_requested_virtual_at": "TIMESTAMP WITH TIME ZONE", "first_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "last_restore_available_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_started_virtual_at": "TIMESTAMP WITH TIME ZONE", "transfer_completed_virtual_at": "TIMESTAMP WITH TIME ZONE", "simulation_transfer_clock_held": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_required": "BOOLEAN NOT NULL DEFAULT FALSE", "restore_reapproval_reason": "TEXT", "restore_reapproval_detected_at": "TIMESTAMP WITH TIME ZONE"}
     existing_runtime_columns = {column["name"] for column in inspect(engine).get_columns("runtime_settings")}
     existing_source_columns = {column["name"] for column in inspect(engine).get_columns("sources")}
     existing_wave_columns = {column["name"] for column in inspect(engine).get_columns("waves")}
@@ -2629,6 +2633,28 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
          "in_flight_files": int(in_flight_files), "in_flight_bytes": int(in_flight_bytes), "live_mbps": round(float(live_mbps), 2)}
         for wave_id, wave_name, source_name, total_files, total_bytes, done_files, done_bytes, in_flight_files, in_flight_bytes, live_mbps in active_transfer_rows
     ]
+    # Raiju concurrency is selected dynamically by the transfer worker and
+    # persisted on the running wave.  A Raikou process owns governance work
+    # serially, so its busy state is represented by a live governance task or
+    # discovery job.  Service liveness is combined with this local snapshot by
+    # the browser, because only the host status collector can see containers.
+    running_transfer_wave_ids = select(Task.wave_id).where(
+        Task.kind == "TRANSFER_WAVE", Task.state == TaskState.RUNNING
+    )
+    raiju_active = int(session.scalar(select(func.coalesce(func.sum(Wave.active_transfer_workers), 0)).where(
+        Wave.id.in_(running_transfer_wave_ids)
+    )) or 0)
+    raiju_busy = int(session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.state == ObjectState.TRANSFERRING,
+        ObjectRecord.wave_id.in_(running_transfer_wave_ids),
+    )) or 0)
+    raikou_task_kinds = ("SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE")
+    raikou_busy = int(session.scalar(select(func.count(Task.id)).where(
+        Task.kind.in_(raikou_task_kinds), Task.state == TaskState.RUNNING
+    )) or 0)
+    raikou_busy += int(session.scalar(select(func.count(DiscoveryJob.id)).where(
+        DiscoveryJob.state == TaskState.RUNNING
+    )) or 0)
     volume = shutil.disk_usage("/")
     return {
         "status": "ok",
@@ -2652,6 +2678,10 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "restored_per_minute": round(restored_files / (restore_seconds / 60), 2),
             "restored_per_hour": round(restored_files / (restore_seconds / 3600), 2),
             "active_transfers": active_transfers,
+        },
+        "workers": {
+            "raiju": {"active": raiju_active, "busy": raiju_busy, "idle": max(0, raiju_active - raiju_busy)},
+            "raikou": {"busy": min(1, raikou_busy)},
         },
         "disk": {"total": volume.total, "used": volume.used, "free": volume.free},
     }

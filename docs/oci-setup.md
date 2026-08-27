@@ -31,29 +31,27 @@ administrativo ocorre por túnel SSH autenticado por chave pública/privada.
 ## 2. Informações a registrar antes do início
 
 Na Console OCI, recursos são localizados e selecionados pelo **nome exibido**:
-compartment, subnet, imagem, Vault, chave e VM. Os OCIDs não precisam ser
-informados nos seletores visuais. OCIDs são necessários somente nos comandos
-da OCI CLI, nas regras da Dynamic Group, nas policies e no arquivo de runtime
-da instalação.
+compartment, subnet, imagem, Vault, chave e VM. Nenhum OCID é informado nos
+seletores visuais. Todo valor que contém `OCID` nesta tabela é usado somente
+nos comandos da OCI CLI; a Console permanece orientada a nomes exibidos.
 
-Registre o nome exibido e, quando o procedimento usar CLI ou configuração,
-registre também o OCID correspondente.
+Registre os identificadores abaixo antes de executar os comandos de CLI.
 
-| Recurso | Na Console OCI | Na CLI, policy ou runtime | Exemplo de OCID | Uso |
-|---|---|---|---|---|
-| Tenancy | Identifique o tenancy pelo nome exibido. | `<TENANCY_OCID>` | `ocid1.tenancy.oc1..example` | CLI |
-| Compartment da VM | Selecione pelo nome do compartment. | `<VM_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
-| Subnet | Selecione pelo nome da subnet. | `<SUBNET_OCID>` | `ocid1.subnet.oc1.sa-saopaulo-1.example` | Console e CLI |
-| Availability Domain (AD) | Selecione pelo nome exibido. | `<AVAILABILITY_DOMAIN>` | `xYzA:SA-SAOPAULO-1-AD-1` | Console e CLI |
-| Imagem Oracle Linux | Selecione pelo nome da imagem. | `<IMAGE_OCID>` | `ocid1.image.oc1.sa-saopaulo-1.example` | Console e CLI |
-| Compartment do destino | Selecione pelo nome do compartment. | `<DESTINATION_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
-| Bucket de destino | Selecione ou informe o nome do bucket. | `<DESTINATION_BUCKET>` | `migration-destination` | Console e CLI |
-| Compartment de Secrets | Selecione pelo nome do compartment. | `<SECRETS_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
-| Vault | Selecione pelo nome do Vault. | `<VAULT_OCID>` | `ocid1.vault.oc1.sa-saopaulo-1.example` | Console e CLI |
-| Chave mestra | Selecione pelo nome da chave. | `<KEY_OCID>` | `ocid1.key.oc1.sa-saopaulo-1.example` | Console e CLI |
-| Compartment da policy | Selecione pelo nome do compartment. | `<POLICY_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | Console e CLI |
-| VM | Selecione pelo nome da instância. | `<VM_OCID>` | `ocid1.instance.oc1.sa-saopaulo-1.example` | Console e CLI |
-| Dynamic Group | Informe o nome da Dynamic Group. | `<DYNAMIC_GROUP_NAME>` | `oracle-data-migration-vm` | Console e CLI |
+| Recurso | Código usado na CLI | Exemplo | Uso |
+|---|---|---|---|
+| Tenancy | `<TENANCY_OCID>` | `ocid1.tenancy.oc1..example` | CLI |
+| Compartment da VM | `<VM_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | CLI |
+| Subnet | `<SUBNET_OCID>` | `ocid1.subnet.oc1.sa-saopaulo-1.example` | CLI |
+| Availability Domain (AD) | `<AVAILABILITY_DOMAIN>` | `xYzA:SA-SAOPAULO-1-AD-1` | CLI |
+| Imagem Oracle Linux | `<IMAGE_OCID>` | `ocid1.image.oc1.sa-saopaulo-1.example` | CLI |
+| Compartment do destino | `<DESTINATION_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | CLI |
+| Bucket de destino | `<DESTINATION_BUCKET>` | `migration-destination` | CLI |
+| Compartment de Secrets | `<SECRETS_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | CLI |
+| Vault | `<VAULT_OCID>` | `ocid1.vault.oc1.sa-saopaulo-1.example` | CLI |
+| Chave mestra | `<KEY_OCID>` | `ocid1.key.oc1.sa-saopaulo-1.example` | CLI |
+| Compartment da policy | `<POLICY_COMPARTMENT_OCID>` | `ocid1.compartment.oc1..example` | CLI |
+| VM | `<VM_OCID>` | `ocid1.instance.oc1.sa-saopaulo-1.example` | CLI |
+| Dynamic Group | `<DYNAMIC_GROUP_NAME>` | `oracle-data-migration-vm` | CLI |
 
 Para listar recursos pela OCI CLI, configure previamente o perfil da sua conta
 administrativa e execute, por exemplo:

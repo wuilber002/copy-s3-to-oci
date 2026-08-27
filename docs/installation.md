@@ -14,7 +14,8 @@ no [OCI Setup](oci-setup.md).
 
 Registre os valores abaixo antes de acessar a VM. Na Console OCI, os recursos
 são selecionados pelos respectivos nomes exibidos; os OCIDs desta tabela são
-usados somente neste guia para a configuração de runtime e para comandos CLI.
+usados somente nos procedimentos de OCI CLI deste guia, inclusive para criar a
+configuração de runtime.
 
 | Código | Finalidade | Exemplo |
 |---|---|---|

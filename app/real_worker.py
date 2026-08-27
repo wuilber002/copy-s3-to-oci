@@ -2290,7 +2290,13 @@ def _transfer_wave(session, task: Task, settings) -> None:
         worker_count = managed_raiju_worker_count(session, wave, len(candidates), live_settings.max_throughput_mbps)
         object_ids = candidates[:worker_count]
         if not object_ids:
+            wave.active_transfer_workers = 0
+            session.commit()
             break
+        # This is the live Raiju allocation for the current parallel batch.
+        # It is persisted so the Status page can distinguish busy and idle
+        # workers without guessing from the configured minimum.
+        wave.active_transfer_workers = len(object_ids)
         task.lease_expires_at = utcnow() + timedelta(seconds=live_settings.task_lease_seconds)
         session.commit()
         rate = live_settings.max_throughput_mbps * 125000 / worker_count
@@ -2313,6 +2319,10 @@ def _transfer_wave(session, task: Task, settings) -> None:
                     future.result()
                 except Exception as error:
                     errors.append(error)
+        # All executor threads for this batch have ended.  The next loop may
+        # allocate a different number based on observed throughput.
+        wave.active_transfer_workers = 0
+        session.commit()
         if errors:
             network_delays = [simulated_network_retry_after(error) for error in errors]
             if network_delays and all(delay is not None for delay in network_delays):
