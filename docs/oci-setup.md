@@ -18,7 +18,7 @@ somente nos *buckets* OCI explicitamente autorizados.
 | Componente | Finalidade |
 |---|---|
 | VM Linux | Executa a interface web, PostgreSQL, Raikou (governança) e Raiju (transferência). |
-| Conectividade dedicada OCI–AWS | Leva todo o tráfego de Amazon S3 e AWS STS pelo caminho privado aprovado, via FastConnect/DRG e a conectividade AWS correspondente. |
+| Conectividade dedicada OCI–AWS | Pré-requisito do cliente para levar o tráfego de Amazon S3 e AWS STS pelo caminho privado aprovado. |
 | Boot volume persistente | Mantém banco, checkpoints multipart, evidências, *logs* e backups lógicos após reinicialização da VM. |
 | Bucket OCI de destino | Recebe os objetos migrados. A autorização é limitada por nome de *bucket*. |
 | Vault e chave | Protegem as senhas do PostgreSQL e os JSONs das conexões AWS. |
@@ -37,10 +37,7 @@ e nas policies. A tabela é uma referência, não um comando.
 |---|---|---|
 | `<TENANCY_OCID>` | OCID do *tenancy* OCI. | `ocid1.tenancy.oc1..example` |
 | `<VM_COMPARTMENT_OCID>` | Compartment onde a VM será criada. | `ocid1.compartment.oc1..example` |
-| `<SUBNET_OCID>` | Subnet existente, conectada ao DRG, com rota privada para AWS e acesso aos serviços OCI. | `ocid1.subnet.oc1.sa-saopaulo-1.example` |
-| `<DRG_OCID>` | Dynamic Routing Gateway (DRG) conectado à VCN e ao circuito privado. | `ocid1.drg.oc1.sa-saopaulo-1.example` |
-| `<AWS_REGION>` | Região AWS das origens S3. | `us-east-1` |
-| `<AWS_S3_ENDPOINT>` | Nome DNS AWS que será resolvido e alcançado pelo enlace dedicado. | `s3.us-east-1.amazonaws.com` |
+| `<SUBNET_OCID>` | Subnet existente habilitada pelo cliente para a conectividade dedicada OCI–AWS e para os serviços OCI. | `ocid1.subnet.oc1.sa-saopaulo-1.example` |
 | `<AVAILABILITY_DOMAIN>` | Availability Domain (AD) escolhido para a VM. | `xYzA:SA-SAOPAULO-1-AD-1` |
 | `<IMAGE_OCID>` | Imagem Oracle Linux compatível. | `ocid1.image.oc1.sa-saopaulo-1.example` |
 | `<DESTINATION_COMPARTMENT_OCID>` | Compartment que contém o *bucket* OCI de destino. | `ocid1.compartment.oc1..example` |
@@ -63,46 +60,18 @@ oci iam availability-domain list \
 oci os ns get --query data --raw-output
 ```
 
-## 3. Preparar rede dedicada OCI–AWS e acesso administrativo
+## 3. Pré-requisitos de rede e acesso administrativo
 
-Neste cenário, a VM **não usa a internet para acessar AWS**. Todo tráfego de
-Amazon S3, AWS Security Token Service (STS) e *S3 Batch Operations* deve
-seguir pelo enlace dedicado contratado: FastConnect conectado ao DRG da VCN e
-ao componente AWS correspondente. A rota de retorno AWS para a VCN também é
-obrigatória.
+Neste cenário, a VM **não usa a internet para acessar AWS**. O cliente deve
+garantir previamente que todo tráfego entre a VM e Amazon S3, AWS Security
+Token Service (STS) e *S3 Batch Operations* percorra a conectividade dedicada
+OCI–AWS aprovada, incluindo resolução de nomes, rotas de ida/retorno e regras
+de firewall necessárias. O desenho, a implantação e a validação desse enlace
+não fazem parte deste procedimento.
 
-FastConnect é a entrada privada da VCN pelo DRG; ele não cria, por si só, um
-endpoint Amazon S3. O time de redes deve homologar uma das arquiteturas abaixo:
-
-1. **Endpoint privado S3 na AWS (recomendado):** a VCN chega, por caminho
-   dedicado, a uma VPC AWS com *Interface VPC Endpoint* para Amazon S3. O DNS
-   corporativo/Route 53 deve resolver os nomes S3 usados pela região para esse
-   endpoint privado. Esse modelo evita depender de endereços públicos do S3.
-2. **Direct Connect public virtual interface (VIF):** o enlace dedicado anuncia
-   e alcança os prefixos públicos AWS necessários para `s3.<região>.amazonaws.com`
-   e STS. O nome continua público, porém o caminho de rede até a AWS usa a VIF
-   pública, não um Internet Gateway da VCN.
-
-Quando OCI e AWS estiverem em regiões compatíveis, o Oracle Interconnect for
-AWS pode fornecer a interconexão gerenciada entre FastConnect/DRG e AWS Direct
-Connect Gateway. Em outras combinações de regiões, o cliente deve fornecer a
-interconexão por parceiro ou rede própria. A disponibilidade e a arquitetura
-dependem da região; valide o desenho com as equipes OCI e AWS antes da criação
-da VM. A documentação oficial descreve o papel do DRG, o circuito de
-interconexão e as regiões suportadas pelo [Oracle Interconnect for AWS](https://docs.oracle.com/en-us/iaas/Content/multicloud/interconnect-aws.htm).
-
-### 3.1 Requisitos de rota, DNS e firewall
-
-Antes de criar a VM, o time de rede deve comprovar todos os itens:
-
-| Item | Requisito |
-|---|---|
-| VCN e DRG | A VCN da `<SUBNET_OCID>` está anexada ao `<DRG_OCID>`. |
-| Rota de saída | A tabela de rota da subnet envia os CIDRs/endpoints AWS aprovados para o DRG. |
-| Rota de retorno | AWS anuncia ou possui rota estática de retorno para o CIDR da VCN. |
-| DNS | `<AWS_S3_ENDPOINT>` e o endpoint STS regional resolvem para endereços alcançáveis pelo enlace dedicado. |
-| Firewall | A VM pode abrir TCP 443 apenas para os endpoints AWS privados/aprovados e os serviços OCI necessários. |
-| Repositório | A instalação e atualização podem usar um proxy corporativo ou canal GitHub aprovado; isso é separado do caminho AWS. |
+O acesso ao repositório de instalação e às atualizações pode usar o canal
+corporativo aprovado pelo cliente, como proxy ou espelho Git; ele é separado do
+caminho dedicado AWS.
 
 Na *security list* ou no Network Security Group (NSG), permita entrada SSH
 (TCP 22) somente conforme a política corporativa. Não é necessário abrir TCP
@@ -112,29 +81,10 @@ desabilitados no bootstrap.
 
 Na Console OCI:
 
-1. Abra **Networking → Dynamic Routing Gateways** e confirme o attachment da
-   VCN ao `<DRG_OCID>`.
-2. Na tabela de rotas da `<SUBNET_OCID>`, confirme os destinos AWS apontando
-   para o DRG, sem rota padrão para Internet Gateway para o tráfego AWS.
-3. Confirme com a equipe AWS a rota de retorno e o anúncio BGP correspondente.
-4. Valide a resolução DNS de S3 e STS pelo resolvedor usado pela VM.
-5. Inclua a regra SSH aprovada pelo cliente e não crie regra de entrada para
-   TCP 8080.
-
-O cliente pode validar DNS e conectividade TCP a partir de uma VM de teste na
-mesma subnet antes de instalar a plataforma:
-
-```bash
-getent hosts "s3.<AWS_REGION>.amazonaws.com"
-getent hosts "sts.<AWS_REGION>.amazonaws.com"
-
-timeout 10 bash -c '</dev/tcp/s3.<AWS_REGION>.amazonaws.com/443>'
-timeout 10 bash -c '</dev/tcp/sts.<AWS_REGION>.amazonaws.com/443>'
-```
-
-Os comandos acima validam resolução e abertura TCP; eles não autenticam, não
-listam objetos e não iniciam uma migração. A equipe de redes deve confirmar por
-telemetria do DRG/VIF que o tráfego percorreu o circuito dedicado.
+1. Selecione uma subnet que já atenda ao pré-requisito de conectividade
+   dedicada OCI–AWS.
+2. Inclua a regra SSH aprovada pelo cliente.
+3. Não crie regra de entrada para TCP 8080.
 
 ## 4. Criar o bucket OCI de destino
 
