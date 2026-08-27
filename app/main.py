@@ -4861,6 +4861,34 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
         if run.status == "NEEDS_ATTENTION":
             continue
         scheduler_now = now or source_scheduler_clock(run.source).effective_now
+        if runtime_context.is_simulation and run.source.backend_kind == "SIMULATED" and now is None:
+            # Simulator time is intentionally paused between durable
+            # decisions. When this source has no claimed/ready work, jump only
+            # to the next already-planned restore submission; never let a
+            # free-running accelerated clock burn a temporary restore window.
+            active_work = session.scalar(select(Task.id).join(Wave).where(
+                Wave.source_id == run.source_id,
+                Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+            ).limit(1))
+            if active_work is None:
+                next_wave = session.scalar(select(Wave).where(
+                    Wave.pipeline_run_id == run.id,
+                    Wave.status == "RESTORE_SCHEDULED",
+                    Wave.planned_restore_at.is_not(None),
+                ).order_by(Wave.planned_restore_at, Wave.id).limit(1))
+                if next_wave and next_wave.planned_restore_at and next_wave.planned_restore_at > scheduler_now:
+                    advance_seconds = (next_wave.planned_restore_at - scheduler_now).total_seconds()
+                    SimulatorAdminClient(runtime_context.simulator_base_url).control_clock(
+                        run.source.simulation_execution_id, "ADVANCE", advance_seconds
+                    )
+                    scheduler_now = source_scheduler_clock(run.source).effective_now
+                    record_event(
+                        session,
+                        "SIMULATION_CLOCK_ADVANCED",
+                        f"Virtual clock advanced {int(advance_seconds)}s to the next scheduled restore",
+                        source_id=run.source_id,
+                        wave_id=next_wave.id,
+                    )
         horizon = max(1, int(run.restore_horizon_waves or settings.dynamic_restore_horizon_waves or 1))
         # Keep the last materialized wave locally mutable.  With the default
         # horizon of three this yields two restore requests in flight and one
@@ -5023,7 +5051,10 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
                 func.sum(ObjectRecord.transfer_elapsed_seconds), func.max(ObjectRecord.transfer_elapsed_seconds),
             ).where(ObjectRecord.wave_id == wave.id)).one()
             planned_start = wave.planned_transfer_start_at or scheduler_now
-            simulated = runtime_context.is_simulation and wave.source.backend_kind == "SIMULATED"
+            # The planner is also exercised against an isolated simulation
+            # database in tests and recovery tools. The source itself is the
+            # durable authority for whether its timing is virtual.
+            simulated = wave.source.backend_kind == "SIMULATED"
             observed_virtual_start = wave.transfer_started_virtual_at if simulated else None
             observed_virtual_end = wave.transfer_completed_virtual_at if simulated else None
             duration_seconds = max(1, int(wave.predicted_transfer_seconds or 1))

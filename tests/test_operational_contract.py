@@ -600,6 +600,23 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert 'synchronize_simulation_source_clocks(session)' in Path("app/real_worker.py").read_text()
 
 
+def test_simulation_clock_advances_only_through_durable_decisions():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    store = Path("app/simulator_store.py").read_text(encoding="utf-8")
+    assert "def advance_simulation_clock" in worker
+    assert '"restore availability polling interval"' in worker
+    assert 'control_clock(source.simulation_execution_id, "RESUME")' not in worker
+    assert "paused=True" in store and "paused_virtual_at=datetime.now(timezone.utc)" in store
+    assert "Releasing an already-cleared hold is therefore a safe" in store
+
+
+def test_simulated_restore_reapproval_requires_confirmed_expiry_evidence():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "def simulation_restore_expiry_confirmed" in worker
+    assert "SIMULATOR_RESTORE_STATE_MISMATCH" in worker
+    assert "not simulation_restore_expiry_confirmed(session, wave, source)" in worker
+
+
 def test_dynamic_prediction_prefers_p75_history_then_conservative_link_model():
     settings = type("Settings", (), {"multipart_part_size_mib": 64, "max_throughput_mbps": 1000, "transfer_workers": 4})()
     obj = type("Object", (), {"size_bytes": 512 * 1024})()
@@ -674,7 +691,7 @@ def test_dynamic_replan_preserves_submitted_waves_and_exposes_forecast():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert "def replan_dynamic_pipeline" in source
     assert 'Task.kind == "SUBMIT_BATCH_RESTORE"' in source
-    assert 'if wave.status != "RESTORE_SCHEDULED" or has_batch_task:' in source
+    assert 'if not has_batch_task and wave.status == "RESTORE_SCHEDULED":' in source
     assert '"pipeline_completion_at"' in source
     assert "replan_dynamic_pipeline(session, settings)" in worker
 

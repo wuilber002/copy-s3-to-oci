@@ -415,6 +415,13 @@ class SimulatorStore:
                 SimulationClock(
                     execution_id=execution.id,
                     acceleration=scenario.clock_acceleration,
+                    # Virtual time advances only through durable simulator
+                    # decisions (restore polling, scheduled work or injected
+                    # recovery).  A free-running accelerated clock can cross
+                    # a retention deadline while the real worker is simply
+                    # busy with requests or streaming.
+                    paused=True,
+                    paused_virtual_at=datetime.now(timezone.utc),
                 )
             )
             session.commit()
@@ -585,7 +592,12 @@ class SimulatorStore:
             elif normalized == "RELEASE":
                 count = int(clock.hold_count or 0)
                 if count <= 0:
-                    raise ValueError("Clock hold is not active")
+                    # A worker can restart after its durable wave flag was
+                    # committed but before the simulator observed the hold.
+                    # Releasing an already-cleared hold is therefore a safe
+                    # recovery no-op, never a reason to fail a migration.
+                    session.commit()
+                    return self.clock_status(execution_id)
                 clock.hold_count = count - 1
                 if clock.hold_count == 0:
                     released = clock.held_virtual_at or current

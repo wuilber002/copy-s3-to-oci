@@ -550,6 +550,30 @@ def release_simulation_clock_after_transfer(session, wave: Wave) -> None:
         session.flush()
 
 
+def advance_simulation_clock(session, source: Source, seconds: float, reason: str,
+                             wave: Wave | None = None) -> float:
+    """Advance isolated cloud time only through a durable simulator decision.
+
+    Simulation must never consume a restore-retention window merely because a
+    real worker is processing a large manifest or waiting for its next lease.
+    This helper is the sole path used by worker phases to move virtual time.
+    """
+    if not runtime_context.is_simulation or seconds <= 0:
+        return 0
+    bounded = max(0.0, float(seconds))
+    SimulatorAdminClient(runtime_context.simulator_base_url).control_clock(
+        source.simulation_execution_id, "ADVANCE", bounded
+    )
+    event(
+        session,
+        "SIMULATION_CLOCK_ADVANCED",
+        f"Virtual clock advanced {bounded:.0f}s for {reason}",
+        source_id=source.id,
+        wave_id=wave.id if wave else None,
+    )
+    return bounded
+
+
 def simulation_transfer_task_active(session, wave: Wave) -> bool:
     """Whether a real transfer worker currently owns this wave's lane."""
     return session.scalar(select(Task.id).where(
@@ -560,12 +584,12 @@ def simulation_transfer_task_active(session, wave: Wave) -> bool:
 
 
 def synchronize_simulation_source_clocks(session) -> int:
-    """Run each source-owned virtual clock only while it has durable work.
+    """Keep every source-owned virtual clock stopped between explicit ticks.
 
-    A scenario execution is deliberately a separate simulated world.  Its
-    clock must not keep consuming virtual retention merely because another
-    source has a queued task.  READY work includes an availability-poll retry:
-    virtual AWS time has to progress while the source waits for that retry.
+    Clock acceleration is a *planning/display* property, not permission for
+    wall-clock worker time to burn through S3 restore retention.  Restore
+    polling and the dynamic scheduler advance their own clock in durable,
+    bounded increments via :func:`advance_simulation_clock`.
     """
     if not runtime_context.is_simulation:
         return 0
@@ -575,21 +599,9 @@ def synchronize_simulation_source_clocks(session) -> int:
     for source in sources:
         if not source.simulation_execution_id:
             continue
-        has_task = session.scalar(select(Task.id).join(Wave).where(
-            Wave.source_id == source.id,
-            Task.state.in_([TaskState.READY, TaskState.RUNNING]),
-        ).limit(1)) is not None
-        has_discovery = session.scalar(select(DiscoveryJob.id).where(
-            DiscoveryJob.source_id == source.id,
-            DiscoveryJob.state.in_([TaskState.READY, TaskState.RUNNING]),
-        ).limit(1)) is not None
-        should_run = source.archived_at is None and (has_task or has_discovery)
         try:
             clock = admin.clock_status(source.simulation_execution_id)
-            if should_run and clock.get("paused"):
-                admin.control_clock(source.simulation_execution_id, "RESUME")
-                changed += 1
-            elif not should_run and not clock.get("paused"):
+            if not clock.get("paused"):
                 admin.control_clock(source.simulation_execution_id, "PAUSE")
                 changed += 1
         except Exception:
@@ -597,6 +609,26 @@ def synchronize_simulation_source_clocks(session) -> int:
             # durable task must retain its normal retry/error behavior.
             continue
     return changed
+
+
+def simulation_restore_expiry_confirmed(session, wave: Wave, source: Source) -> bool:
+    """Confirm expiry from durable evidence before asking for a paid restore.
+
+    A simulated 409 by itself is not enough: a backend restart or clock-state
+    mismatch must be diagnosed as a simulator defect, never presented to an
+    operator as a new billable restore.  The retained expiry timestamps are
+    observed from the same per-object ``HeadObject`` evidence used by the
+    regular migration path.
+    """
+    if not runtime_context.is_simulation:
+        return True
+    now = simulation_virtual_now(source)
+    expiries = list(session.scalars(select(ObjectRecord.restore_expires_at).where(
+        ObjectRecord.wave_id == wave.id,
+        ObjectRecord.state.in_([ObjectState.RESTORED, ObjectState.TRANSFERRING]),
+        ObjectRecord.restore_expires_at.is_not(None),
+    )))
+    return bool(expiries) and now >= min(expiries)
 
 
 def require_new_restore_approval(session, wave: Wave, reason: str) -> None:
@@ -1400,26 +1432,37 @@ def poll_restore_simulated(
             transfer_strategy=source.transfer_strategy,
             pending_objects=pending,
         )
-        # The polling policy is expressed in operational (virtual) time. In
-        # simulation a 3,600x clock must not wait two real hours for a
-        # two-virtual-hour check: that would advance the virtual clock by 300
-        # days and make an otherwise valid restore expire. Convert it to wall
-        # time, retaining a one-second floor for the durable queue.
+        # The polling policy is expressed in operational (virtual) time. The
+        # simulator clock is paused between durable decisions, so move it by
+        # one bounded polling interval rather than letting a 3,600x wall-clock
+        # race consume days of retention while the worker performs HeadObject
+        # calls.
+        virtual_delay = delay
         try:
             clock = SimulatorAdminClient(runtime_context.simulator_base_url).clock_status(
                 source.simulation_execution_id
             )
             acceleration = max(1.0, float(clock.get("acceleration") or 1.0))
-            delay = max(1, math.ceil(delay / acceleration))
+            if recommended_real_delays:
+                virtual_delay = min(
+                    virtual_delay,
+                    max(1, math.ceil(min(recommended_real_delays) * acceleration)),
+                )
         except Exception:
-            # A transient status-read failure must never turn a simulation
-            # retry into an hours-long wall-clock wait.
-            delay = max(1, min(delay, 5))
-        if recommended_real_delays:
-            # The simulated source can also tell us when the next object is
-            # expected. Use the earlier safe deadline, never a longer one.
-            delay = max(1, min(delay, math.ceil(min(recommended_real_delays))))
-        delay_label = f"{delay}s" if delay < 60 else f"{math.ceil(delay / 60)} minute(s)"
+            # Retain the conservative policy interval if the status endpoint
+            # has a transient issue; no free-running fallback is allowed.
+            virtual_delay = delay
+        advance_simulation_clock(
+            session,
+            source,
+            virtual_delay,
+            "restore availability polling interval",
+            wave,
+        )
+        # The next durable poll is intentionally soon in real time; virtual
+        # time has already advanced by the controlled interval above.
+        delay = 1
+        delay_label = f"{virtual_delay}s virtual" if virtual_delay < 60 else f"{math.ceil(virtual_delay / 60)} virtual minute(s)"
         retry(
             session,
             task,
@@ -2242,6 +2285,16 @@ def _transfer_wave(session, task: Task, settings) -> None:
                 raise SimulatedNetworkRecoveryPending(delay)
             unavailable = next((error for error in errors if restored_object_is_unavailable(error)), None)
             if unavailable is not None:
+                if runtime_context.is_simulation and not simulation_restore_expiry_confirmed(session, wave, source):
+                    # A simulator 409 before the locally observed expiry is a
+                    # state-contract violation.  Do not reset objects or ask
+                    # the operator to approve a paid restore for a defect in
+                    # the isolated backend.
+                    raise RuntimeError(
+                        "SIMULATOR_RESTORE_STATE_MISMATCH: simulator reported an archived object "
+                        "unavailable before the durable per-object restore expiry. "
+                        "The wave was preserved; inspect simulator state before retrying."
+                    ) from unavailable
                 require_new_restore_approval(session, wave, str(unavailable))
                 raise RestoreReapprovalRequired(
                     "One or more restored objects became unavailable before transfer. "
@@ -2501,6 +2554,13 @@ def run_once(role: str = WORKER_ROLE) -> None:
             return
         allowed_task_kinds = task_kinds_for_role(role)
         if role in {"governance", "all"}:
+            if runtime_context.is_simulation:
+                # Stop any clock created by an earlier release before planner
+                # work can observe it. New releases create paused clocks, but
+                # this safely migrates active scenarios without resetting
+                # their virtual timeline.
+                synchronize_simulation_source_clocks(session)
+                session.commit()
             # Sources archived by an earlier release can still have READY
             # polling tasks. Reconcile them before any planner/claim action.
             if reconcile_archived_source_work(session):
