@@ -14,6 +14,10 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
+# Version identifiers are deliberately centralized: the About page and the
+# API report the release that is actually running, rather than a duplicated
+# presentation-only value.
+RAIJIN_SERVICE_VERSION = "0.4.0"
 SIMULATOR_CONTRACT_VERSION = "1"
 SIMULATOR_SERVICE_VERSION = "0.1.0"
 

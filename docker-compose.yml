@@ -113,8 +113,8 @@ services:
     environment:
       RAIJIN_OPERATION_MODE: SIMULATION
       RAIJIN_SIMULATOR_BASE_URL: http://simulator:8090
-      RAIJIN_WORKER_ROLE: governance
-      RAIJIN_WORKER_ID: simulation-governance-worker
+      RAIJIN_WORKER_ROLE: raikou
+      RAIJIN_WORKER_ID: raikou-governance
       DATABASE_URL: postgresql+psycopg://migration_simulation@postgres:5432/migration_simulation
       POSTGRES_PASSWORD_FILE: /run/secrets/simulation_postgres_password
     command: ["python3", "-m", "app.real_worker"]
@@ -135,8 +135,8 @@ services:
     environment:
       RAIJIN_OPERATION_MODE: SIMULATION
       RAIJIN_SIMULATOR_BASE_URL: http://simulator:8090
-      RAIJIN_WORKER_ROLE: transfer
-      RAIJIN_WORKER_ID: simulation-transfer-worker
+      RAIJIN_WORKER_ROLE: raiju
+      RAIJIN_WORKER_ID: raiju-transfer
       DATABASE_URL: postgresql+psycopg://migration_simulation@postgres:5432/migration_simulation
       POSTGRES_PASSWORD_FILE: /run/secrets/simulation_postgres_password
     command: ["python3", "-m", "app.real_worker"]

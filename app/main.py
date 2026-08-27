@@ -31,15 +31,17 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, Request as FastAPIRequest
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, and_, case, create_engine, func, inspect, or_, select, text, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, aliased, mapped_column, relationship, sessionmaker
 
 from app.cloud_backends import backend_for
-from app.runtime_context import load_runtime_context
+from app.runtime_context import RAIJIN_SERVICE_VERSION, SIMULATOR_SERVICE_VERSION, load_runtime_context
 from app.simulator_admin import SimulatorAdminClient, SimulatorAdminError
+
+RAIJU_MIN_WORKERS = 5
 
 
 def utcnow() -> datetime:
@@ -701,7 +703,6 @@ class RuntimeSettings(Base):
     __tablename__ = "runtime_settings"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
-    transfer_workers: Mapped[int] = mapped_column(Integer, default=4)
     max_throughput_mbps: Mapped[int] = mapped_column(Integer, default=1100)
     multipart_part_size_mib: Mapped[int] = mapped_column(Integer, default=64)
     default_wave_size_bytes: Mapped[int] = mapped_column(BigInteger, default=10 * 1024**4)
@@ -713,7 +714,6 @@ class RuntimeSettings(Base):
     aws_control_bucket: Mapped[str] = mapped_column(String(255), default="")
     aws_control_prefix: Mapped[str] = mapped_column(String(1024), default="s3-oci-control/")
     preserve_s3_tags: Mapped[bool] = mapped_column(default=True)
-    real_worker_enabled: Mapped[bool] = mapped_column(default=False)
     cost_estimation_enabled: Mapped[bool] = mapped_column(default=False)
     cost_include_aws_transfer_out: Mapped[bool] = mapped_column(default=True)
     cost_pricing_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
@@ -724,10 +724,6 @@ class RuntimeSettings(Base):
     dynamic_wave_max_objects: Mapped[int] = mapped_column(Integer, default=50000)
     dynamic_restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=6 * 3600)
     dynamic_restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=3)
-    dynamic_pipeline_enabled: Mapped[bool] = mapped_column(default=False)
-    # A deliberate, highly visible exception for demonstrations and controlled
-    # validation.  Production keeps source S3 scopes mutually exclusive.
-    laboratory_mode_enabled: Mapped[bool] = mapped_column(default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -806,12 +802,11 @@ def require_non_overlapping_source_scope(session: Session, source: Source) -> No
     if runtime_context.is_simulation:
         return
     conflicts = active_source_scope_conflicts(session, source.s3_bucket, source_prefix_values(source), source.id)
-    if conflicts and not runtime_settings(session).laboratory_mode_enabled:
+    if conflicts:
         names = ", ".join(sorted({item["source_name"] for item in conflicts}))
         raise HTTPException(
             status_code=409,
-            detail=(f"S3 scope overlaps active source(s): {names}. Archive the conflicting source or enable "
-                    "Laboratory mode only for a controlled test."),
+            detail=(f"S3 scope overlaps active source(s): {names}. Archive the conflicting source or remove the overlapping prefix."),
         )
 
 
@@ -985,7 +980,10 @@ class TaskUpdate(BaseModel):
 
 
 class RuntimeSettingsUpdate(BaseModel):
-    transfer_workers: int = Field(ge=1, le=64)
+    # Reject retired controls explicitly.  Operational concurrency, the
+    # dynamic pipeline and the real worker are no longer operator switches.
+    model_config = ConfigDict(extra="forbid")
+
     max_throughput_mbps: int = Field(ge=1, le=1200)
     multipart_part_size_mib: int = Field(ge=16, le=512)
     default_wave_size_bytes: int = Field(gt=0, le=10 * 1024**4)
@@ -993,15 +991,12 @@ class RuntimeSettingsUpdate(BaseModel):
     default_restore_tier: str = Field(pattern="^(BULK|STANDARD)$")
     task_lease_seconds: int = Field(ge=30, le=3600)
     preserve_s3_tags: bool = True
-    real_worker_enabled: bool = False
     cost_estimation_enabled: bool = False
     cost_include_aws_transfer_out: bool | None = None
     cost_pricing_auto_refresh_enabled: bool = True
     cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
     dynamic_restore_horizon_waves: int = Field(default=3, ge=1, le=20)
-    dynamic_pipeline_enabled: bool = False
-    laboratory_mode_enabled: bool = False
 
 
 class GlobalOutboundCostUpdate(BaseModel):
@@ -1025,7 +1020,7 @@ class IntegrityEvidence(BaseModel):
     error: str | None = Field(default=None, max_length=4000)
 
 
-app = FastAPI(title="S3 to OCI Migration", version="0.4.0")
+app = FastAPI(title="S3 to OCI Migration", version=RAIJIN_SERVICE_VERSION)
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 
@@ -1125,7 +1120,6 @@ def create_schema() -> None:
         "aws_control_bucket": "VARCHAR(255) NOT NULL DEFAULT ''",
         "aws_control_prefix": "VARCHAR(1024) NOT NULL DEFAULT 's3-oci-control/'",
         "preserve_s3_tags": "BOOLEAN NOT NULL DEFAULT TRUE",
-        "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "cost_estimation_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "cost_include_aws_transfer_out": "BOOLEAN NOT NULL DEFAULT TRUE",
         "cost_pricing_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
@@ -1137,8 +1131,6 @@ def create_schema() -> None:
         "dynamic_wave_max_objects": "INTEGER NOT NULL DEFAULT 50000",
         "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
         "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 3",
-        "dynamic_pipeline_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
-        "laboratory_mode_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
@@ -1409,11 +1401,10 @@ def runtime_settings(session: Session) -> RuntimeSettings:
 
 
 def settings_dict(settings: RuntimeSettings) -> dict:
-    return {"transfer_workers": settings.transfer_workers, "max_throughput_mbps": settings.max_throughput_mbps,
+    return {"max_throughput_mbps": settings.max_throughput_mbps,
             "multipart_part_size_mib": settings.multipart_part_size_mib,
             "default_wave_size_bytes": settings.default_wave_size_bytes, "default_restore_days": settings.default_restore_days,
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
-            "real_worker_enabled": settings.real_worker_enabled,
             "preserve_s3_tags": settings.preserve_s3_tags, "cost_estimation_enabled": settings.cost_estimation_enabled,
             "cost_include_aws_transfer_out": settings.cost_include_aws_transfer_out,
             "cost_pricing_auto_refresh_enabled": settings.cost_pricing_auto_refresh_enabled,
@@ -1422,8 +1413,6 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "activity_refresh_seconds": settings.activity_refresh_seconds,
             "dynamic_restore_safety_seconds": settings.dynamic_restore_safety_seconds,
             "dynamic_restore_horizon_waves": settings.dynamic_restore_horizon_waves,
-            "dynamic_pipeline_enabled": settings.dynamic_pipeline_enabled,
-            "laboratory_mode_enabled": settings.laboratory_mode_enabled,
             "updated_at": settings.updated_at}
 
 
@@ -1872,7 +1861,9 @@ def aws_connection_configuration(connection: AwsConnection, secret: dict) -> dic
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     with open("app/static/index.html", encoding="utf-8") as page:
-        return page.read()
+        return (page.read()
+                .replace("{{RAIJIN_VERSION}}", RAIJIN_SERVICE_VERSION)
+                .replace("{{FUJIN_VERSION}}", SIMULATOR_SERVICE_VERSION))
 
 
 @app.get("/simulation", response_class=HTMLResponse)
@@ -1896,6 +1887,8 @@ def healthcheck(session: Session = Depends(get_session)) -> dict:
 def runtime_identity() -> dict:
     readiness = cloud_backend.readiness(require_operations=False)
     return {"operation_mode": runtime_context.mode.value,
+            "raijin_version": RAIJIN_SERVICE_VERSION,
+            "fujin_version": SIMULATOR_SERVICE_VERSION,
             "backend_operations_enabled": readiness.operations_enabled,
             "backend_contract_version": readiness.contract_version,
             "backend_capabilities": list(readiness.capabilities)}
@@ -2775,7 +2768,7 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
         in_flight = [obj for obj in objects if obj.state == ObjectState.TRANSFERRING]
         active = task.kind == "TRANSFER_WAVE" and task.state == TaskState.RUNNING
         workers = []
-        capacity = runtime_settings(session).transfer_workers
+        capacity = RAIJU_MIN_WORKERS
         for slot in range(capacity):
             obj = in_flight[slot] if slot < len(in_flight) else None
             workers.append({
@@ -3544,7 +3537,7 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
             raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
     prefixes = normalize_source_prefixes(payload.s3_prefixes, payload.s3_prefix)
     conflicts = active_source_scope_conflicts(session, payload.s3_bucket, prefixes)
-    if conflicts and not runtime_settings(session).laboratory_mode_enabled:
+    if conflicts:
         names = ", ".join(sorted({item["source_name"] for item in conflicts}))
         raise HTTPException(status_code=409, detail=(
             f"S3 prefix scope overlaps active source(s): {names}. Archive the conflicting source or remove the overlapping prefix."
@@ -3556,8 +3549,6 @@ def create_source(payload: SourceCreate, session: Session = Depends(get_session)
     session.flush()
     session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
     record_event(session, "SOURCE_CREATED", f"Source '{source.name}' configured", source_id=source.id)
-    if conflicts:
-        record_event(session, "SOURCE_SCOPE_OVERLAP_ALLOWED", f"Laboratory mode allowed S3 scope overlap with {', '.join(sorted({item['source_name'] for item in conflicts}))}", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
 
@@ -3582,7 +3573,7 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
             raise HTTPException(status_code=422, detail="Source AWS region is defined by the selected AWS connection; create another connection for a different region")
     prefixes = normalize_source_prefixes(payload.s3_prefixes, payload.s3_prefix)
     conflicts = active_source_scope_conflicts(session, payload.s3_bucket, prefixes, source_id)
-    if conflicts and not runtime_settings(session).laboratory_mode_enabled:
+    if conflicts:
         names = ", ".join(sorted({item["source_name"] for item in conflicts}))
         raise HTTPException(status_code=409, detail=(
             f"S3 prefix scope overlaps active source(s): {names}. Archive the conflicting source or remove the overlapping prefix."
@@ -3593,8 +3584,6 @@ def update_source(source_id: int, payload: SourceUpdate, session: Session = Depe
     session.query(SourcePrefix).filter(SourcePrefix.source_id == source.id).delete(synchronize_session=False)
     session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
     record_event(session, "SOURCE_UPDATED", f"Source '{source.name}' configuration updated", source_id=source.id)
-    if conflicts:
-        record_event(session, "SOURCE_SCOPE_OVERLAP_ALLOWED", f"Laboratory mode allowed S3 scope overlap with {', '.join(sorted({item['source_name'] for item in conflicts}))}", source_id=source.id)
     session.commit()
     return {"id": source.id, "name": source.name, "status": source.status}
 
@@ -4490,7 +4479,7 @@ def predict_size_transfer_seconds(size_bytes: int, settings: RuntimeSettings, pr
         return float(profile["p75_seconds"]), int(profile["samples"])
     # Link-model fallback: service/object overhead + the object's fair share
     # of configured aggregate bandwidth.  Multipart has a modest setup term.
-    throughput_per_worker = max(1.0, settings.max_throughput_mbps / max(1, settings.transfer_workers))
+    throughput_per_worker = max(1.0, settings.max_throughput_mbps / RAIJU_MIN_WORKERS)
     # Small-object operations are dominated by request, TLS and OCI write
     # overhead.  The prior 0.25-second cold estimate underpredicted the
     # Deep Archive validation workload by about 4x.  Use a conservative
@@ -4531,7 +4520,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
         # Individual estimates represent worker time. Wall time is bounded by
         # aggregate throughput and by worker parallelism, plus a small setup.
         link_seconds = bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000)
-        wall_seconds = max(link_seconds, predicted_sum / max(1, settings.transfer_workers)) + 30
+        wall_seconds = max(link_seconds, predicted_sum / RAIJU_MIN_WORKERS) + 30
         waves.append({"bytes": bytes_total, "object_count": current_count,
                       "predicted_transfer_seconds": math.ceil(wall_seconds), "prediction_samples": sample_count,
                       "exclusive": exclusive})
@@ -4546,7 +4535,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
         projected_count = current_count + 1
         projected_sum = predicted_sum + predicted
         projected_wall = max(projected_bytes * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-                             projected_sum / max(1, settings.transfer_workers)) + 30
+                             projected_sum / RAIJU_MIN_WORKERS) + 30
         exceeds = projected_bytes > max_bytes or projected_count > max_objects or projected_wall > target_transfer_seconds
         if current_count and exceeds:
             flush()
@@ -4556,7 +4545,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
             current_count = 1
             bytes_total, predicted_sum, sample_count = size_bytes, predicted, samples
             one_wall = max(bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-                           predicted_sum / max(1, settings.transfer_workers)) + 30
+                           predicted_sum / RAIJU_MIN_WORKERS) + 30
             if bytes_total > max_bytes or one_wall > target_transfer_seconds:
                 flush(exclusive=True)
             continue
@@ -4591,7 +4580,7 @@ def next_dynamic_wave_plan(session: Session, source_id: int, max_bytes: int,
         projected_sum = predicted_sum + predicted
         projected_wall = max(
             projected_bytes * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-            projected_sum / max(1, settings.transfer_workers),
+            projected_sum / RAIJU_MIN_WORKERS,
         ) + 30
         if object_count and (
             projected_bytes > max_bytes or projected_count > max_objects or projected_wall > target_transfer_seconds
@@ -4609,7 +4598,7 @@ def next_dynamic_wave_plan(session: Session, source_id: int, max_bytes: int,
         return None, profiles, settings
     wall_seconds = max(
         bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-        predicted_sum / max(1, settings.transfer_workers),
+        predicted_sum / RAIJU_MIN_WORKERS,
     ) + 30
     return ({"bytes": bytes_total, "object_count": object_count,
              "predicted_transfer_seconds": math.ceil(wall_seconds),
@@ -5072,7 +5061,7 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
                     1,
                     math.ceil(max(
                         float(elapsed_max or 0),
-                        float(elapsed_sum) / max(1, settings.transfer_workers),
+                        float(elapsed_sum) / RAIJU_MIN_WORKERS,
                     )),
                 )
                 observed_basis = "simulated logical transfer duration"
@@ -5177,8 +5166,6 @@ def create_dynamic_waves(source_id: int, payload: DynamicWaveCreate, session: Se
     source = active_source_or_409(session, source_id)
     require_non_overlapping_source_scope(session, source)
     settings = runtime_settings(session)
-    if not settings.dynamic_pipeline_enabled:
-        raise HTTPException(status_code=422, detail="Enable and save the dynamic restore pipeline in Settings before creating dynamic waves.")
     target_transfer_seconds, reserve_seconds = automatic_dynamic_duration_limit(payload.restore_days)
     matching_objects, matching_bytes = session.execute(select(
         func.count(ObjectRecord.id), func.coalesce(func.sum(ObjectRecord.size_bytes), 0)

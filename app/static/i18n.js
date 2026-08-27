@@ -107,8 +107,7 @@
   const phraseToEn = {
     'objetos': 'objects', 'objeto(s)': 'object(s)', 'sem objetos': 'no objects',
     'em cópia': 'copying', 'concluídos': 'completed', 'disponíveis': 'available', 'solicitados': 'requested',
-    'Origem salva.': 'Source saved.', 'Configuração salva; worker real habilitado.': 'Configuration saved; real worker enabled.',
-    'Configuração salva; worker real desabilitado.': 'Configuration saved; real worker disabled.',
+    'Origem salva.': 'Source saved.', 'Configuração operacional salva.': 'Operational configuration saved.',
     'Selecione uma origem antes de validar o destino OCI.': 'Select a source before validating the OCI destination.',
     'Validando destino OCI…': 'Validating OCI destination…',
     'Destino OCI validado: todos os objetos existem, têm o tamanho esperado e preservam a proveniência.': 'OCI destination validated: all objects exist, have the expected size, and preserve provenance.',

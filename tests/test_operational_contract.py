@@ -161,7 +161,9 @@ def test_governance_and_transfer_workers_claim_disjoint_durable_responsibilities
     assert TRANSFER_TASK_KINDS == {"TRANSFER_WAVE"}
     assert GOVERNANCE_TASK_KINDS.isdisjoint(TRANSFER_TASK_KINDS)
     assert task_kinds_for_role("governance") == GOVERNANCE_TASK_KINDS
+    assert task_kinds_for_role("raikou") == GOVERNANCE_TASK_KINDS
     assert task_kinds_for_role("transfer") == TRANSFER_TASK_KINDS
+    assert task_kinds_for_role("raiju") == TRANSFER_TASK_KINDS
     assert task_kinds_for_role("all") is None
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert "def ensure_transfer_task" in worker
@@ -436,7 +438,7 @@ def test_restore_submission_reports_the_failed_aws_stage_without_exposing_detail
 
 def test_real_worker_imports_the_runtime_namespace_reader_used_by_transfer_and_audit():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
-    assert "read_oci_runtime_config" in worker[worker.index("from app.main import ("):worker.index(")\n\n# The bootstrap")]
+    assert "read_oci_runtime_config" in worker[worker.index("from app.main import ("):worker.index(")\n\n# Raiju")]
 
 
 def test_wave_report_returns_tasks_in_durable_execution_order():
@@ -487,14 +489,14 @@ def test_destination_provenance_requires_s3_etag_and_last_modified_when_known():
 
 def test_multipart_size_runtime_setting_has_safe_bounds():
     payload = {
-        "transfer_workers": 4, "max_throughput_mbps": 1000, "multipart_part_size_mib": 64,
+        "max_throughput_mbps": 1000, "multipart_part_size_mib": 64,
         "default_wave_size_bytes": 1024, "default_restore_days": 7, "default_restore_tier": "BULK",
         "task_lease_seconds": 300,
     }
     assert RuntimeSettingsUpdate(**payload).multipart_part_size_mib == 64
     assert RuntimeSettingsUpdate(**payload).cost_estimation_enabled is False
-    assert RuntimeSettingsUpdate(**payload).laboratory_mode_enabled is False
-    assert "laboratory_mode_enabled" in RuntimeSettings.__table__.columns
+    with pytest.raises(ValidationError):
+        RuntimeSettingsUpdate(**(payload | {"laboratory_mode_enabled": False}))
     with pytest.raises(ValidationError):
         RuntimeSettingsUpdate(**(payload | {"multipart_part_size_mib": 15}))
     with pytest.raises(ValidationError):
@@ -506,7 +508,7 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     from app.main import DynamicPipelineRun, Wave, RuntimeSettings
     assert {"planner_mode", "pipeline_run_id", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
     assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "restore_horizon_waves", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
-    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves", "dynamic_pipeline_enabled"} <= set(RuntimeSettings.__table__.columns.keys())
+    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves"} <= set(RuntimeSettings.__table__.columns.keys())
     payload = DynamicWaveCreate(restore_days=3, restore_tier="BULK")
     assert payload.restore_days == 3
     assert automatic_dynamic_duration_limit(1) == (16 * 3600, 8 * 3600)
@@ -550,8 +552,6 @@ def test_dynamic_planner_uses_scalar_boundaries_and_assigns_every_object_once():
         assert sum(item["object_count"] for item in plan["waves"]) == 37
         assert all("objects" not in item for item in plan["waves"])
 
-        session.get(RuntimeSettings, 1).dynamic_pipeline_enabled = True
-        session.flush()
         response = create_dynamic_waves(
             source.id,
             DynamicWaveCreate(
@@ -670,7 +670,7 @@ def test_dynamic_pipeline_materializes_only_the_horizon_then_adapts_next_wave():
     now = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
     with Session() as session:
         source = Source(id=965, name="adaptive-horizon", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
-        settings = RuntimeSettings(id=1, dynamic_pipeline_enabled=True, dynamic_restore_horizon_waves=2)
+        settings = RuntimeSettings(id=1, dynamic_restore_horizon_waves=2)
         run = DynamicPipelineRun(id=966, source_id=source.id, status="SCHEDULED", scheduled_restores=True,
                                  target_max_bytes=100, target_transfer_seconds=3600, max_objects=100,
                                  restore_days=1, restore_tier="BULK", restore_horizon_waves=2)
@@ -721,9 +721,7 @@ def test_dynamic_replan_uses_control_mode_logical_elapsed_time():
         )
         settings = RuntimeSettings(
             id=1,
-            transfer_workers=2,
             max_throughput_mbps=1100,
-            dynamic_pipeline_enabled=True,
         )
         run = DynamicPipelineRun(
             id=972,
@@ -834,7 +832,7 @@ def test_failed_dynamic_wave_stops_future_restore_releases():
     initial = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
     with Session() as session:
         source = Source(id=984, name="stop-on-failure", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
-        settings = RuntimeSettings(id=1, dynamic_pipeline_enabled=True, dynamic_restore_horizon_waves=2)
+        settings = RuntimeSettings(id=1, dynamic_restore_horizon_waves=2)
         run = DynamicPipelineRun(id=985, source_id=source.id, scheduled_restores=True, restore_horizon_waves=2)
         failed = Wave(id=986, source_id=source.id, pipeline_run_id=run.id, name="wave-001", max_bytes=1,
                       restore_days=1, restore_tier="BULK", status="FAILED", planner_mode="DYNAMIC",
@@ -1024,7 +1022,7 @@ def test_public_aws_transfer_catalog_uses_only_external_egress_rate():
 
 def test_cost_pricing_refresh_settings_have_safe_defaults_and_bounds():
     payload = {
-        "transfer_workers": 4, "max_throughput_mbps": 1000, "multipart_part_size_mib": 64,
+        "max_throughput_mbps": 1000, "multipart_part_size_mib": 64,
         "default_wave_size_bytes": 1024, "default_restore_days": 7, "default_restore_tier": "BULK",
         "task_lease_seconds": 300,
     }

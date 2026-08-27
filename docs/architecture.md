@@ -30,7 +30,7 @@ funcional está detalhado em [Capacidades e operação](capabilities.md).
 - Ondas podem ser criadas uma a uma, automaticamente para toda a origem ou automaticamente para um prefixo S3. A seleção é determinística por chave S3; a prévia informa objetos, bytes, estimativa de ondas e objetos acima do tamanho alvo.
 - Um objeto maior que o alvo não bloqueia o planejamento: ele recebe uma onda exclusiva sinalizada no histórico. A criação automática é limitada a 10.000 ondas por ação como proteção operacional.
 - Uma onda só pode ser excluída antes de uma tarefa ser assumida; a exclusão devolve seus objetos a `DISCOVERED`. Depois de restore, polling, transferência ou verificação iniciados, os dados são preservados para auditoria.
-- Apenas uma onda pode ter uma tarefa de transferência em execução por vez. Dentro dessa onda, `Workers de transferência` controla quantos objetos são copiados simultaneamente. O worker recarrega essa configuração e o limite agregado de throughput antes de cada lote; mudanças na interface entram em vigor no próximo lote, sem reiniciar a VM. Arquivos já em cópia não são interrompidos.
+- Apenas uma onda pode ter uma tarefa de transferência em execução por vez. Dentro dessa onda, o scheduler inicia com cinco Raijus e ajusta automaticamente quantos objetos são copiados simultaneamente conforme a taxa medida e o limite agregado de throughput. A concorrência não é um controle da interface e não cai abaixo de cinco quando houver objetos suficientes. Arquivos já em cópia não são interrompidos.
 - A origem é lida uma única vez por objeto e enviada em streaming para OCI Object Storage. `GetObject` fornece simultaneamente conteúdo e metadados, evitando uma chamada `HeadObject` adicional por arquivo. A consulta de tags pode ser desabilitada em Configurações quando não for requisito de migração, eliminando também `GetObjectTagging`.
 - SHA-256 é calculado durante a leitura do S3. Para objetos pequenos, o valor é enviado ao `PutObject` e validado pelo OCI antes da aceitação. Para objetos grandes, cada parte multipart recebe SHA-256 próprio e o OCI valida todas as partes antes do commit. O tamanho-base da parte é configurável na console (64 MiB por padrão) e é gravado no checkpoint do objeto; para respeitar o máximo OCI de 10.000 partes, a plataforma o aumenta automaticamente em objetos muito grandes. A evidência nativa de entrega fica no PostgreSQL sem reler o destino.
 - A reconciliação OCI sob demanda lista o destino paginado e compara chaves e tamanhos com o discovery persistido. Nos itens equivalentes, faz `HeadObject` somente no OCI para comparar a proveniência imutável gravada na cópia: ETag e data de última modificação da versão S3. Uma divergência reabre apenas os objetos e ondas afetados; não relê payload nem chama AWS.
@@ -73,7 +73,7 @@ Para o caso inicial de 600 TB, ondas de 10 TB e rota de 1,2 Gbps:
 | CPU | 8 OCPUs em produção; 2 OCPUs na validação inicial de 220 MB |
 | Memória | 32 GB em produção; 8 GB na validação inicial de 220 MB |
 | Boot volume | 500 GB |
-| Workers de transferência iniciais | 4 |
+| Raijus iniciais | 5 |
 
 Em 1,2 Gbps, 10 TB levam cerca de 18,5 h no limite teórico; planeje 22–30 h. A retenção padrão de restore deve ser 4 dias.
 

@@ -18,7 +18,7 @@ Validar o ciclo completo sem gerar custo de recuperação durante discovery e an
 | Tamanho máximo da onda | 10 TB; a PoC usa todo o dataset de 220 MB |
 | Tier de restore | Bulk |
 | Retenção | 3 dias |
-| Workers de transferência | 4 |
+| Raijus iniciais | 5 |
 | Integridade | SHA-256 obrigatório e MD5 complementar |
 
 ## Roteiro

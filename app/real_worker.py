@@ -52,17 +52,24 @@ from app.simulator_admin import SimulatorAdminClient
 from app.simulator_ports import SimulatedDestinationPort, SimulatedSourcePort, SimulatorTransportError
 from app.main import (
     AwsConnection, DiscoveryJob, Event, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, SessionLocal, Source, Task, TaskState, merge_discovery_rows, source_key_in_scope, source_prefix_values,
-    DynamicPipelineRun, Wave, cloud_backend, materialize_dynamic_pipeline_horizon, parse_aws_connection_payload, read_oci_runtime_config, reconcile_archived_source_work, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_context, runtime_settings, utcnow,
+    DynamicPipelineRun, RAIJU_MIN_WORKERS, Wave, cloud_backend, materialize_dynamic_pipeline_horizon, parse_aws_connection_payload, read_oci_runtime_config, reconcile_archived_source_work, refresh_dynamic_pipeline_run, refresh_due_global_aws_pricing, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_result_diagnostics, runtime_context, runtime_settings, utcnow,
 )
 
-# The bootstrap supplies a stable identity for the one real worker on the VM.
+# Raiju is the operational worker identity.  Raikou is the separate governance
+# identity that plans and protects the migration; both use the same durable
+# queue and roles remain intentionally small and explicit.
 # Keep the hostname fallback for local development/tests that do not use it.
-WORKER_ID = os.getenv("RAIJIN_WORKER_ID", f"aws-oci-worker-{socket.gethostname()}")
-# The two production workers share PostgreSQL's durable queue but never claim
+WORKER_ID = os.getenv("RAIJIN_WORKER_ID", f"raiju-{socket.gethostname()}")
+# The two worker identities share PostgreSQL's durable queue but never claim
 # each other's responsibility. ``all`` preserves a simple local invocation.
 WORKER_ROLE = os.getenv("RAIJIN_WORKER_ROLE", "all").strip().lower()
-GOVERNANCE_TASK_KINDS = frozenset({"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE"})
-TRANSFER_TASK_KINDS = frozenset({"TRANSFER_WAVE"})
+RAIKOU_TASK_KINDS = frozenset({"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE"})
+RAIJU_TASK_KINDS = frozenset({"TRANSFER_WAVE"})
+# Compatibility aliases are private Python names only; the console and
+# runtime identities use Raikou/Raiju.
+GOVERNANCE_TASK_KINDS = RAIKOU_TASK_KINDS
+TRANSFER_TASK_KINDS = RAIJU_TASK_KINDS
+RAIJU_MAX_WORKERS = 64
 ARCHIVE_CLASSES = {"GLACIER", "DEEP_ARCHIVE", "INTELLIGENT_TIERING_ARCHIVE_ACCESS", "INTELLIGENT_TIERING_DEEP_ARCHIVE_ACCESS"}
 
 
@@ -2224,6 +2231,34 @@ def transfer_wave(session, task: Task, settings) -> None:
     _transfer_wave(session, task, settings)
 
 
+def managed_raiju_worker_count(session, wave: Wave, available_objects: int, max_throughput_mbps: int) -> int:
+    """Choose transfer parallelism from observed work, never below five.
+
+    Raiju owns the concurrency decision.  Completed objects from this wave
+    provide a conservative per-worker throughput sample; if five workers did
+    not approach the configured link limit, the next batch grows only enough
+    to fill the observed gap, bounded to 64 workers.  A small remaining batch
+    naturally uses fewer threads because no additional object exists to run.
+    """
+    if available_objects <= 0:
+        return 0
+    floor = min(RAIJU_MIN_WORKERS, available_objects)
+    samples = list(session.scalars(select(ObjectRecord).where(
+        ObjectRecord.wave_id == wave.id,
+        ObjectRecord.transfer_elapsed_seconds > 0,
+        ObjectRecord.state.in_([ObjectState.TRANSFERRED, ObjectState.VERIFIED]),
+    ).order_by(ObjectRecord.transferred_at.desc()).limit(50)))
+    rates = [
+        (obj.size_bytes * 8 / max(.001, float(obj.transfer_elapsed_seconds)) / 1_000_000)
+        for obj in samples if obj.size_bytes > 0
+    ]
+    if not rates:
+        return floor
+    observed_per_raiju = max(.1, sum(rates) / len(rates))
+    target = math.ceil(max_throughput_mbps / observed_per_raiju)
+    return min(RAIJU_MAX_WORKERS, available_objects, max(floor, target))
+
+
 def _transfer_wave(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
     # Reflect the claimed transfer immediately.  Establishing AWS clients can
@@ -2243,16 +2278,17 @@ def _transfer_wave(session, task: Task, settings) -> None:
         s3, namespace = None, "simulated"
 
     # The wave task remains exclusive: file workers only parallelize objects
-    # inside it. Settings are reloaded before each batch, so changing workers
-    # or the aggregate throughput in the UI takes effect without a restart.
+    # inside it. Raiju re-evaluates its worker count before every batch to use
+    # measured throughput while honoring the fixed floor of five workers.
     while True:
         session.expire_all()
         live_settings = runtime_settings(session)
-        worker_count = max(1, live_settings.transfer_workers)
-        object_ids = list(session.scalars(select(ObjectRecord.id).where(
+        candidates = list(session.scalars(select(ObjectRecord.id).where(
             ObjectRecord.wave_id == wave.id,
             ObjectRecord.state.in_([ObjectState.RESTORED, ObjectState.TRANSFERRING]),
-        ).order_by(ObjectRecord.id).limit(worker_count)))
+        ).order_by(ObjectRecord.id).limit(RAIJU_MAX_WORKERS)))
+        worker_count = managed_raiju_worker_count(session, wave, len(candidates), live_settings.max_throughput_mbps)
+        object_ids = candidates[:worker_count]
         if not object_ids:
             break
         task.lease_expires_at = utcnow() + timedelta(seconds=live_settings.task_lease_seconds)
@@ -2260,7 +2296,7 @@ def _transfer_wave(session, task: Task, settings) -> None:
         rate = live_settings.max_throughput_mbps * 125000 / worker_count
         multipart_part_size = live_settings.multipart_part_size_mib * 1024 * 1024
         errors: list[Exception] = []
-        with ThreadPoolExecutor(max_workers=len(object_ids), thread_name_prefix="s3-oci-transfer") as executor:
+        with ThreadPoolExecutor(max_workers=len(object_ids), thread_name_prefix="raiju-transfer") as executor:
             if runtime_context.is_simulation:
                 futures = [
                     executor.submit(
@@ -2538,13 +2574,13 @@ def verify_wave_simulated(session, task: Task, wave: Wave, source: Source) -> No
 
 
 def task_kinds_for_role(role: str) -> frozenset[str] | None:
-    if role == "governance":
+    if role in {"governance", "raikou"}:
         return GOVERNANCE_TASK_KINDS
-    if role == "transfer":
+    if role in {"transfer", "raiju"}:
         return TRANSFER_TASK_KINDS
     if role == "all":
         return None
-    raise RuntimeError("RAIJIN_WORKER_ROLE must be governance, transfer, or all")
+    raise RuntimeError("RAIJIN_WORKER_ROLE must be raikou/governance, raiju/transfer, or all")
 
 
 def run_once(role: str = WORKER_ROLE) -> None:
@@ -2557,14 +2593,8 @@ def run_once(role: str = WORKER_ROLE) -> None:
         cloud_backend.readiness(require_operations=True)
     with SessionLocal() as session:
         settings = runtime_settings(session)
-        # SIMULATION processes are already isolated from cloud credentials and
-        # use only typed simulator ports. The legacy-named production switch
-        # therefore controls REAL claims only; a simulation console does not
-        # need to mutate or reinterpret a real-cloud safety setting.
-        if runtime_context.is_real and not settings.real_worker_enabled:
-            return
         allowed_task_kinds = task_kinds_for_role(role)
-        if role in {"governance", "all"}:
+        if role in {"governance", "raikou", "all"}:
             if runtime_context.is_simulation:
                 # Stop any clock created by an earlier release before planner
                 # work can observe it. New releases create paused clocks, but
@@ -2578,26 +2608,25 @@ def run_once(role: str = WORKER_ROLE) -> None:
                 session.commit()
             if runtime_context.is_real:
                 refresh_due_global_aws_pricing(session)
-            if settings.dynamic_pipeline_enabled:
-                replan_dynamic_pipeline(session, settings)
-                for run in session.scalars(select(DynamicPipelineRun).where(
-                    DynamicPipelineRun.scheduled_restores.is_(True),
-                    DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL", "NEEDS_ATTENTION"]),
-                )):
-                    materialize_dynamic_pipeline_horizon(session, settings, run)
-                release_dynamic_restore_horizon(session, settings)
-                # A completed restore may have been held behind an earlier
-                # transfer at the exact moment its polling task finished.
-                # Revisit durable RESTORED waves on every governance cycle so
-                # the next one advances as soon as the lane is free.
-                reconcile_restored_transfer_lane(session)
-                session.commit()
+            replan_dynamic_pipeline(session, settings)
+            for run in session.scalars(select(DynamicPipelineRun).where(
+                DynamicPipelineRun.scheduled_restores.is_(True),
+                DynamicPipelineRun.status.not_in(["COMPLETED", "HISTORICAL", "NEEDS_ATTENTION"]),
+            )):
+                materialize_dynamic_pipeline_horizon(session, settings, run)
+            release_dynamic_restore_horizon(session, settings)
+            # A completed restore may have been held behind an earlier
+            # transfer at the exact moment its polling task finished.
+            # Revisit durable RESTORED waves on every governance cycle so
+            # the next one advances as soon as the lane is free.
+            reconcile_restored_transfer_lane(session)
+            session.commit()
         # There is exactly one real worker per VM.  If it was interrupted while
         # discovery was running, its page checkpoint is already committed. Make
         # the source eligible again instead of leaving it permanently stuck in
         # DISCOVERING.  The unfinished active slice is intentionally not added
         # to elapsed time because a power loss makes its exact end unknowable.
-        interrupted = list(session.scalars(select(Source).where(Source.status == "DISCOVERING"))) if role in {"governance", "all"} else []
+        interrupted = list(session.scalars(select(Source).where(Source.status == "DISCOVERING"))) if role in {"governance", "raikou", "all"} else []
         for pending_source in interrupted:
             pending_source.status = "DISCOVERY_QUEUED"
             pending_source.discovery_started_at = None
@@ -2615,7 +2644,7 @@ def run_once(role: str = WORKER_ROLE) -> None:
             session.commit()
         # Upgrade compatibility: sources queued by releases before the
         # discovery queue existed become visible jobs on the next worker loop.
-        legacy_queued = list(session.scalars(select(Source).where(Source.status == "DISCOVERY_QUEUED"))) if role in {"governance", "all"} else []
+        legacy_queued = list(session.scalars(select(Source).where(Source.status == "DISCOVERY_QUEUED"))) if role in {"governance", "raikou", "all"} else []
         for queued_source in legacy_queued:
             exists = session.scalar(select(DiscoveryJob.id).where(
                 DiscoveryJob.source_id == queued_source.id,
@@ -2625,7 +2654,7 @@ def run_once(role: str = WORKER_ROLE) -> None:
                 session.add(DiscoveryJob(source_id=queued_source.id))
         if legacy_queued:
             session.commit()
-        discovery_job = claim_discovery_job(session, settings.task_lease_seconds) if role in {"governance", "all"} else None
+        discovery_job = claim_discovery_job(session, settings.task_lease_seconds) if role in {"governance", "raikou", "all"} else None
         if discovery_job:
             source = session.get(Source, discovery_job.source_id)
             if not source or source.status != "DISCOVERY_QUEUED":

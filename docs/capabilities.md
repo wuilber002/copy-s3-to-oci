@@ -26,9 +26,6 @@ no modo isolado, delega as integrações simuladas ao FUJIN.
   usa a semântica literal do S3 (`app/` também cobre `app/images/`) e evita
   discovery, restore e transferência duplicados. Sources arquivadas não
   bloqueiam um novo cadastro.
-- Oferece **Modo de laboratório** como exceção explícita para testes
-  controlados de escopos sobrepostos; enquanto ativo, a console mantém um
-  banner vermelho persistente e registra a exceção no histórico operacional.
 - Descobre objetos por API S3 paginada, com checkpoint, retomada, limitação de
   requisições por conexão e acompanhamento em fila durável.
 - Importa CSV/GZIP ou `manifest.json` do S3 Inventory para evitar chamadas de
@@ -56,8 +53,12 @@ no modo isolado, delega as integrações simuladas ao FUJIN.
   equivalente, sem criar um restore duplicado.
 - Permite duas estratégias: iniciar transferência somente após toda a wave estar
   restaurada ou liberar objetos à medida que se tornam disponíveis.
-- Opera uma wave de transferência por vez, com múltiplos workers para copiar os
-  objetos dessa wave em paralelo e limite de throughput configurável.
+- Opera uma wave de transferência por vez. O scheduler inicia com cinco
+  **Raijus**, aumenta ou reduz a concorrência de cópia conforme a banda medida
+  e nunca fica abaixo desse piso quando houver objetos suficientes.
+- O **Raikou** é o worker de governança: executa discovery, planejamento, S3
+  Batch Operations, polling de restore, reconciliação e auditorias. O **Raiju**
+  é o worker operacional de transferência e retomada multipart.
 - Copia S3 para OCI preservando chave, tamanho, metadados compatíveis e tags
   registradas localmente.
 - Retoma uploads multipart interrompidos usando checkpoints persistidos de
@@ -135,8 +136,8 @@ recuperação de leases, Secrets, pré-check e tarifas públicas.
 3. Execute discovery por API ou importe o S3 Inventory.
 4. Revise inventário, estimativas e crie waves manualmente ou pelo pipeline
    dinâmico.
-5. Coloque as waves na fila. O worker de governança submete e acompanha restore;
-   o worker de transferência copia os objetos liberados.
+5. Coloque as waves na fila. O Raikou submete e acompanha restores; os Raijus
+   copiam os objetos liberados.
 6. Acompanhe a execução em **Queue** e consulte relatórios, manifestos e eventos
    por wave.
 7. Execute **Validate OCI destination** ao finalizar ou quando houver suspeita de

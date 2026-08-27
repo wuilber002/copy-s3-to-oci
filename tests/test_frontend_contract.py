@@ -188,11 +188,11 @@ def test_all_confirmation_questions_use_the_raijin_modal_instead_of_browser_conf
     assert page.count("await ask(") >= 14
 
 
-def test_laboratory_mode_and_discovery_origin_are_visible_and_explicit():
+def test_discovery_origin_is_visible_and_retired_lab_mode_is_not_exposed():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
-    assert 'id="set-laboratory-mode"' in page
-    assert 'id="laboratory-mode-banner"' in page
-    assert "syncLaboratoryModeBanner" in page
+    assert 'id="set-laboratory-mode"' not in page
+    assert 'id="laboratory-mode-banner"' not in page
+    assert "syncLaboratoryModeBanner" not in page
     assert "Discovery: ${escape(discoveryModeLabel(discovery.mode))}" in page
     # Runtime selection is an administrative localhost API operation.  It
     # must never be available to a console operator as a settings control.
@@ -427,8 +427,8 @@ def test_simulation_mode_keeps_the_regular_console_and_exposes_a_red_admin_page(
     assert simulation.index('class="simulation-active"') < simulation.index('class="gear"')
     assert ".simulation-nav{background:transparent!important" in page
     assert ".simulation-active{background:#b91c1c" in simulation
-    assert "body.simulation-mode #alerts,body.laboratory-mode #alerts{top:134px}" in page
-    assert "body.simulation-mode .notification-stack,body.laboratory-mode .notification-stack{top:138px}" in page
+    assert "body.simulation-mode #alerts{top:134px}" in page
+    assert "body.simulation-mode .notification-stack{top:138px}" in page
     assert "Open in Migrations" in simulation
     assert '>Discovery</button><button onclick="createWaves' not in simulation
     assert '>Create dynamic waves</button>' not in simulation

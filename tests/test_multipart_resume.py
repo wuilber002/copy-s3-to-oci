@@ -107,7 +107,7 @@ def test_multipart_part_size_is_increased_only_when_needed_for_oci_part_limit():
 
 
 def test_worker_identity_is_stable_for_restart_reclaim():
-    assert WORKER_ID.startswith("aws-oci-worker-")
+    assert WORKER_ID.startswith("raiju-")
     now = utcnow()
     assert worker_can_reclaim_lease(WORKER_ID, now + timedelta(minutes=5), now)
     assert not worker_can_reclaim_lease("another-worker", now + timedelta(minutes=5), now)

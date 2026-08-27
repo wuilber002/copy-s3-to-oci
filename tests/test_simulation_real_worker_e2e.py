@@ -107,7 +107,6 @@ def test_real_workers_complete_simulated_discovery_restore_and_transfer(tmp_path
         session.add(
             main.RuntimeSettings(
                 id=1,
-                transfer_workers=2,
                 max_throughput_mbps=10_000,
                 multipart_part_size_mib=5,
                 task_lease_seconds=300,
