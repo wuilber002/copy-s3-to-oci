@@ -715,6 +715,7 @@ class RuntimeSettings(Base):
     preserve_s3_tags: Mapped[bool] = mapped_column(default=True)
     real_worker_enabled: Mapped[bool] = mapped_column(default=False)
     cost_estimation_enabled: Mapped[bool] = mapped_column(default=False)
+    cost_include_aws_transfer_out: Mapped[bool] = mapped_column(default=True)
     cost_pricing_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
     cost_pricing_refresh_days: Mapped[int] = mapped_column(Integer, default=7)
     activity_auto_refresh_enabled: Mapped[bool] = mapped_column(default=True)
@@ -994,12 +995,17 @@ class RuntimeSettingsUpdate(BaseModel):
     preserve_s3_tags: bool = True
     real_worker_enabled: bool = False
     cost_estimation_enabled: bool = False
+    cost_include_aws_transfer_out: bool | None = None
     cost_pricing_auto_refresh_enabled: bool = True
     cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
     dynamic_restore_horizon_waves: int = Field(default=3, ge=1, le=20)
     dynamic_pipeline_enabled: bool = False
     laboratory_mode_enabled: bool = False
+
+
+class GlobalOutboundCostUpdate(BaseModel):
+    include_aws_transfer_out: bool
 
 
 class ActivityRefreshSettingsUpdate(BaseModel):
@@ -1121,6 +1127,7 @@ def create_schema() -> None:
         "preserve_s3_tags": "BOOLEAN NOT NULL DEFAULT TRUE",
         "real_worker_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
         "cost_estimation_enabled": "BOOLEAN NOT NULL DEFAULT FALSE",
+        "cost_include_aws_transfer_out": "BOOLEAN NOT NULL DEFAULT TRUE",
         "cost_pricing_auto_refresh_enabled": "BOOLEAN NOT NULL DEFAULT TRUE",
         "cost_pricing_refresh_days": "INTEGER NOT NULL DEFAULT 7",
         "multipart_part_size_mib": "INTEGER NOT NULL DEFAULT 64",
@@ -1408,6 +1415,7 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "default_restore_tier": settings.default_restore_tier, "task_lease_seconds": settings.task_lease_seconds,
             "real_worker_enabled": settings.real_worker_enabled,
             "preserve_s3_tags": settings.preserve_s3_tags, "cost_estimation_enabled": settings.cost_estimation_enabled,
+            "cost_include_aws_transfer_out": settings.cost_include_aws_transfer_out,
             "cost_pricing_auto_refresh_enabled": settings.cost_pricing_auto_refresh_enabled,
             "cost_pricing_refresh_days": settings.cost_pricing_refresh_days,
             "activity_auto_refresh_enabled": settings.activity_auto_refresh_enabled,
@@ -1811,7 +1819,8 @@ def wave_cost_estimate(session: Session, wave: Wave) -> dict:
     add("source_reads", "S3 object reads during transfer", len(objects), "requests", "aws_s3_get_usd_per_1000", 1000)
     if settings.preserve_s3_tags:
         add("tag_reads", "S3 object-tag reads", len(objects), "requests", "aws_s3_get_usd_per_1000", 1000)
-    include_aws_transfer_out = pricing.include_aws_transfer_out if pricing is not None else True
+    connection_allows_aws_transfer_out = pricing.include_aws_transfer_out if pricing is not None else True
+    include_aws_transfer_out = settings.cost_include_aws_transfer_out and connection_allows_aws_transfer_out
     include_oci_costs = pricing.include_oci_costs if pricing is not None else False
     if include_aws_transfer_out:
         add("aws_transfer_out", "AWS data transfer out to OCI", total_gib, "GiB", "aws_transfer_out_usd_per_gib")
@@ -3134,7 +3143,8 @@ def update_activity_refresh_settings(payload: ActivityRefreshSettingsUpdate, ses
 def update_settings(payload: RuntimeSettingsUpdate, session: Session = Depends(get_session)) -> dict:
     settings = runtime_settings(session)
     for field, value in payload.model_dump().items():
-        setattr(settings, field, value)
+        if value is not None:
+            setattr(settings, field, value)
     record_event(session, "SETTINGS_UPDATED", "Operational transfer settings updated")
     session.commit()
     return settings_dict(settings)
@@ -3379,6 +3389,20 @@ def update_aws_connection_operational_limits(connection_id: int, payload: AwsCon
 def get_global_aws_pricing(session: Session = Depends(get_session)) -> list[dict]:
     regions = active_pricing_regions(session)
     return [global_pricing_summary(session, region) for region in regions]
+
+
+@app.put("/api/global-aws-pricing/outbound")
+def update_global_aws_pricing_outbound(payload: GlobalOutboundCostUpdate,
+                                       session: Session = Depends(get_session)) -> dict:
+    settings = runtime_settings(session)
+    settings.cost_include_aws_transfer_out = payload.include_aws_transfer_out
+    record_event(
+        session,
+        "GLOBAL_AWS_OUTBOUND_COST_UPDATED",
+        f"Global AWS outbound cost estimation {'enabled' if payload.include_aws_transfer_out else 'disabled'}",
+    )
+    session.commit()
+    return {"include_aws_transfer_out": settings.cost_include_aws_transfer_out}
 
 
 @app.post("/api/global-aws-pricing/refresh")
