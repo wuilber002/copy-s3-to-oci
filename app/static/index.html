@@ -674,7 +674,8 @@ refreshAll();
       for(const node of scope.querySelectorAll('small')){
         const match=(node.textContent||'').trim().match(marker);
         if(!match||node.dataset.waveIdentityPrefixed==='true')continue;
-        const predecessor=node.previousSibling;
+        let predecessor=node.previousSibling;
+        while(predecessor&&predecessor.nodeType===Node.TEXT_NODE&&!predecessor.textContent.trim())predecessor=predecessor.previousSibling;
         if(!predecessor)continue;
         node.dataset.waveIdentityPrefixed='true';
         node.classList.add('wave-identity-prefix');
@@ -697,11 +698,16 @@ refreshAll();
       if(!match||!text||text.nodeType!==Node.TEXT_NODE)continue;
       const suffix=` #${match[1]}`;
       const value=text.textContent;
-      text.textContent=value.endsWith(suffix)?value.slice(0,-suffix.length):value;
+      const content=value.endsWith(suffix)?value.slice(0,-suffix.length):value;
+      const split=content.lastIndexOf(' / ');
+      const sourcePrefix=split>=0?content.slice(0,split+3):'';
+      const waveName=split>=0?content.slice(split+3):content;
+      text.textContent=sourcePrefix;
       markerNode.dataset.waveIdentityPrefixed='true';
       markerNode.classList.add('wave-identity-prefix');
       markerNode.textContent=`#${match[1]}: `;
       heading.insertBefore(markerNode,text.nextSibling);
+      heading.insertBefore(document.createTextNode(`${waveName} `),markerNode.nextSibling);
     }};
   })();
 </script>
