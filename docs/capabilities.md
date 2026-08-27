@@ -1,10 +1,10 @@
-# Capacidades do RAIJIN e do FUJIN
+# Capacidades do [RAIJIN](https://en.wikipedia.org/wiki/Raijin) e do [FUJIN](https://en.wikipedia.org/wiki/F%C5%ABjin)
 
 Este é o inventário vivo dos dois programas que compõem a plataforma. Toda
 entrega que acrescente, remova ou altere um fluxo operacional deve atualizar
 este documento no mesmo commit.
 
-## RAIJIN — plano de controle de migração
+## [RAIJIN](https://en.wikipedia.org/wiki/Raijin) — plano de controle de migração
 
 <img src="../images/raijin-oracle-about.png" alt="Logo do RAIJIN" width="280">
 
@@ -173,7 +173,7 @@ O re-discovery é incremental e auditável:
   histórica estiver íntegra, usa **Ver alterações → Preparar nova transferência**
   para criar a revisão nova, que fica em `DISCOVERED`.
 
-## FUJIN — backend de simulação
+## [FUJIN](https://en.wikipedia.org/wiki/F%C5%ABjin) — backend de simulação
 
 <img src="../images/fujin-oracle-about.png" alt="Logo do FUJIN" width="280">
 
