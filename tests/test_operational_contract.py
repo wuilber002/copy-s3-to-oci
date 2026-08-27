@@ -617,6 +617,12 @@ def test_simulated_restore_reapproval_requires_confirmed_expiry_evidence():
     assert "not simulation_restore_expiry_confirmed(session, wave, source)" in worker
 
 
+def test_transfer_reconciliation_requires_a_pending_restored_object():
+    worker = Path("app/real_worker.py").read_text(encoding="utf-8")
+    assert "pending_restored = session.scalar(select(ObjectRecord.id)" in worker
+    assert "ObjectRecord.state == ObjectState.RESTORED" in worker
+
+
 def test_dynamic_prediction_prefers_p75_history_then_conservative_link_model():
     settings = type("Settings", (), {"multipart_part_size_mib": 64, "max_throughput_mbps": 1000, "transfer_workers": 4})()
     obj = type("Object", (), {"size_bytes": 512 * 1024})()
@@ -811,7 +817,9 @@ def test_transfer_lane_releases_only_the_earliest_nonterminal_wave():
         later = Wave(id=983, source_id=source.id, pipeline_run_id=run.id, name="wave-002", max_bytes=1,
                      restore_days=1, restore_tier="BULK", status="RESTORED", planner_mode="DYNAMIC",
                      planned_transfer_start_at=initial + timedelta(hours=1))
-        session.add_all([source, run, first, later]); session.flush()
+        restored = ObjectRecord(id=984, source_id=source.id, wave_id=later.id, object_key="ready.bin",
+                                size_bytes=1, state=ObjectState.RESTORED)
+        session.add_all([source, run, first, later, restored]); session.flush()
         assert ensure_transfer_task(session, later) is False
         assert session.scalar(select(Task.id).where(Task.wave_id == later.id)) is None
         first.status = "COMPLETED"

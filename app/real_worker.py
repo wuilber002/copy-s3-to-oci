@@ -371,6 +371,17 @@ def ensure_transfer_task(session, wave: Wave) -> bool:
     predecessor = session.scalar(select(Wave.id).where(*predecessor_filters).limit(1))
     if predecessor is not None:
         return False
+    # A reconciliation cycle can outlive the transfer worker's commit. Do
+    # not create another transfer merely because the prior task is already
+    # terminal: there must still be a concrete restored object waiting for
+    # this wave. This also preserves legitimate early-release behaviour,
+    # where a later availability poll exposes a new RESTORED subset.
+    pending_restored = session.scalar(select(ObjectRecord.id).where(
+        ObjectRecord.wave_id == wave.id,
+        ObjectRecord.state == ObjectState.RESTORED,
+    ).limit(1))
+    if pending_restored is None:
+        return False
     existing = session.scalar(select(Task.id).where(
         Task.wave_id == wave.id,
         Task.kind == "TRANSFER_WAVE",
