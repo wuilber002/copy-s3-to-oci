@@ -150,4 +150,30 @@
     async function refreshAll(){try{await Promise.all([loadRuntime(),loadTemplates(),loadScenarioNameSuggestion(),refreshOperationalMessages(),syncClock()]);await loadSources()}catch(e){notify(e.message,true)}}prepareIntegerFields();updateClock();setInterval(updateClock,1000);setInterval(syncClock,5000);refreshAll();setInterval(loadSources,10000);setInterval(refreshOperationalMessages,30000);
   </script>
 <script>(()=>{const row=document.querySelector('#virtual-clock-row'),rate=document.querySelector('#virtual-clock-rate');if(!row||!rate)return;const label=row.querySelector('.banner-clock-label');if(!label)return;const update=()=>{const [rawMode='NORMAL',rawRate='×1']=(rate.textContent||'NORMAL · ×1').split(' · ');const mode=rawMode.trim().toUpperCase();label.className='banner-clock-label virtual-clock-meta';label.innerHTML=`<span class="virtual-clock-acceleration">${rawRate.trim()}</span><span>VIRTUAL</span><span class="virtual-clock-state ${mode.toLowerCase()}">${mode}</span>`};new MutationObserver(update).observe(rate,{childList:true,characterData:true,subtree:true});update()})();</script>
+<style>
+  .virtual-clock-state{position:relative;cursor:help}
+  .virtual-clock-state:hover::after,.virtual-clock-state:focus::after{content:attr(data-help);position:absolute;z-index:60;top:calc(100% + .45rem);left:50%;width:280px;padding:.6rem;border:1px solid #64748b;border-radius:6px;background:#020617;color:#e7eefb;font-size:.75rem;font-weight:500;line-height:1.35;text-align:left;text-transform:none;letter-spacing:normal;box-shadow:0 4px 15px #0008;transform:translateX(-50%);white-space:normal}
+</style>
+<script>
+  (()=>{
+    const rate=document.querySelector('#virtual-clock-rate');
+    if(!rate)return;
+    const help={
+      HELD:'HELD: o relógio virtual está temporariamente retido para preservar a janela de restore enquanto uma wave restaurada aguarda o worker de transferência. Ele volta a avançar quando a transferência assume a wave ou a retenção deixa de ser necessária.',
+      PAUSED:'PAUSED: o tempo virtual foi pausado por uma ação do operador ou porque não há processamento ativo para esta source. Nenhum prazo simulado avança enquanto estiver pausado.',
+      NORMAL:'NORMAL: o relógio virtual está avançando na mesma velocidade do relógio do sistema.',
+      ACCELERATED:'ACCELERATED: o relógio virtual está avançando mais rápido que o relógio do sistema para simular esperas de restore e planejamento. A transferência de dados não usa essa aceleração.'
+    };
+    const apply=()=>{
+      const state=document.querySelector('.virtual-clock-state');
+      if(!state)return;
+      const mode=state.textContent.trim().toUpperCase();
+      state.tabIndex=0;
+      state.dataset.help=help[mode]||`Estado do relógio virtual: ${mode}.`;
+      state.title=state.dataset.help;
+    };
+    new MutationObserver(apply).observe(rate,{childList:true,characterData:true,subtree:true});
+    apply();
+  })();
+</script>
 </body></html>
