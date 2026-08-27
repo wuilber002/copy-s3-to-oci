@@ -23,7 +23,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 from datetime import datetime, timedelta, timezone
 
 from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
-from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
+from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, require_new_restore_approval, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -147,6 +147,34 @@ def test_operations_overview_reports_raiju_and_raikou_occupancy():
 
         assert workers["raiju"] == {"active": 5, "busy": 1, "idle": 4}
         assert workers["raikou"] == {"busy": 1}
+
+
+def test_restore_reapproval_is_terminal_and_cancels_pending_polling():
+    """A stale availability poll must never revive a wave after expiry."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(name="expiry-guard", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        session.add(source); session.flush()
+        wave = Wave(source_id=source.id, name="wave-001", max_bytes=1024, restore_days=1, restore_tier="BULK", status="TRANSFERRING")
+        session.add(wave); session.flush()
+        pending = ObjectRecord(source_id=source.id, wave_id=wave.id, object_key="pending.bin", size_bytes=1024, state=ObjectState.RESTORED)
+        completed = ObjectRecord(source_id=source.id, wave_id=wave.id, object_key="done.bin", size_bytes=1024, state=ObjectState.TRANSFERRED)
+        queued_poll = Task(wave_id=wave.id, kind="POLL_RESTORE", state=TaskState.READY)
+        active_transfer = Task(wave_id=wave.id, kind="TRANSFER_WAVE", state=TaskState.RUNNING)
+        session.add_all([pending, completed, queued_poll, active_transfer]); session.commit()
+
+        require_new_restore_approval(session, wave, "temporary copy expired")
+        session.refresh(wave); session.refresh(pending); session.refresh(completed)
+        session.refresh(queued_poll); session.refresh(active_transfer)
+
+        assert wave.status == "RESTORE_REAPPROVAL_REQUIRED"
+        assert wave.restore_reapproval_required is True
+        assert pending.state == ObjectState.WAVE_ASSIGNED
+        assert completed.state == ObjectState.TRANSFERRED
+        assert queued_poll.state == TaskState.CANCELLED
+        assert active_transfer.state == TaskState.RUNNING
 
 
 def test_active_sources_cannot_silently_share_an_s3_prefix_scope():

@@ -649,6 +649,54 @@ def simulation_restore_expiry_confirmed(session, wave: Wave, source: Source) -> 
     return bool(expiries) and now >= min(expiries)
 
 
+def restore_reapproval_is_required(wave: Wave) -> bool:
+    """Return whether a wave has reached the terminal restore approval gate.
+
+    This is deliberately based on both the durable flag and the visible
+    status.  A poll and a transfer run in separate database sessions, so a
+    stale poll must never turn a stopped wave back into ``RESTORING`` after a
+    transfer has detected that a new, potentially billable restore is needed.
+    """
+    return bool(wave.restore_reapproval_required) or wave.status == "RESTORE_REAPPROVAL_REQUIRED"
+
+
+def cancel_superseded_wave_tasks(session, wave: Wave, active_task_id: int | None = None) -> int:
+    """Cancel queued work that can no longer run after a restore expiry.
+
+    Running work is not overwritten here because its worker owns the lease and
+    will observe :func:`restore_reapproval_is_required` before persisting a
+    later state transition.  Ready tasks, however, are safe to cancel now and
+    must not be claimed after the explicit operator-approval gate is set.
+    """
+    tasks = list(session.scalars(select(Task).where(
+        Task.wave_id == wave.id,
+        Task.state == TaskState.READY,
+    )))
+    cancelled = 0
+    for pending in tasks:
+        if active_task_id is not None and pending.id == active_task_id:
+            continue
+        pending.state = TaskState.CANCELLED
+        pending.lease_expires_at = None
+        pending.error = "Superseded: a new restore requires explicit operator approval"
+        cancelled += 1
+    return cancelled
+
+
+def finish_superseded_restore_poll(session, task: Task, wave: Wave) -> None:
+    """Finish a stale polling task without changing a terminal wave state."""
+    task.state, task.lease_expires_at = TaskState.CANCELLED, None
+    task.error = "Superseded: the wave requires explicit approval for a new restore"
+    event(
+        session,
+        "RESTORE_POLL_SUPERSEDED",
+        "Availability polling stopped because the wave requires explicit approval for a new restore",
+        source_id=wave.source_id,
+        wave_id=wave.id,
+    )
+    session.commit()
+
+
 def require_new_restore_approval(session, wave: Wave, reason: str) -> None:
     """Stop only this wave and retain clear evidence before another restore.
 
@@ -666,11 +714,13 @@ def require_new_restore_approval(session, wave: Wave, reason: str) -> None:
     wave.restore_reapproval_required = True
     wave.restore_reapproval_reason = reason
     wave.restore_reapproval_detected_at = utcnow()
+    cancelled = cancel_superseded_wave_tasks(session, wave)
     release_simulation_clock_after_transfer(session, wave)
     event(
         session,
         "RESTORE_REAPPROVAL_REQUIRED",
-        "Restored copy became unavailable before transfer. Operator approval is required before a new paid restore: " + reason,
+        "Restored copy became unavailable before transfer. Operator approval is required before a new paid restore"
+        f"; {cancelled} queued task(s) cancelled: " + reason,
         source_id=wave.source_id,
         wave_id=wave.id,
     )
@@ -1251,6 +1301,9 @@ def submit_restore_simulated(
 def poll_restore_simulated(
     session, task: Task, settings, wave: Wave, source: Source
 ) -> None:
+    if restore_reapproval_is_required(wave):
+        finish_superseded_restore_poll(session, task, wave)
+        return
     context = simulation_execution_context(source)
     port = SimulatedSourcePort(runtime_context.simulator_base_url)
     attempt = restore_attempt_for_job(session, wave, source)
@@ -1370,6 +1423,13 @@ def poll_restore_simulated(
             task.lease_expires_at = utcnow() + timedelta(seconds=settings.task_lease_seconds)
             session.commit()
     poll_elapsed = time.monotonic() - started
+    # A transfer worker can discover a genuine expiry while this polling
+    # worker is collecting per-object evidence. Refresh the wave before any
+    # status mutation so this stale session cannot resurrect it as RESTORING.
+    session.refresh(wave)
+    if restore_reapproval_is_required(wave):
+        finish_superseded_restore_poll(session, task, wave)
+        return
     persist_restore_poll_metrics(
         wave,
         {
@@ -1454,7 +1514,17 @@ def poll_restore_simulated(
         # simulator clock is paused between durable decisions, so move it by
         # one bounded polling interval rather than letting a 3,600x wall-clock
         # race consume days of retention while the worker performs HeadObject
-        # calls.
+        # calls.  Never advance it while a Raiju transfer hold is active: that
+        # would consume a temporary restore window while actual copy work is
+        # still running.
+        if wave.simulation_transfer_clock_held or simulation_transfer_task_active(session, wave):
+            retry(
+                session,
+                task,
+                "SIMULATED: availability polling deferred while transfer retains the virtual restore window",
+                1,
+            )
+            return
         virtual_delay = delay
         try:
             clock = SimulatorAdminClient(runtime_context.simulator_base_url).clock_status(
@@ -1508,6 +1578,9 @@ def poll_restore_simulated(
 
 def poll_restore(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
+    if restore_reapproval_is_required(wave):
+        finish_superseded_restore_poll(session, task, wave)
+        return
     if runtime_context.is_simulation:
         with simulation_phase_clock_hold(source, "restore availability polling"):
             poll_restore_simulated(session, task, settings, wave, source)
@@ -2261,6 +2334,11 @@ def managed_raiju_worker_count(session, wave: Wave, available_objects: int, max_
 
 def _transfer_wave(session, task: Task, settings) -> None:
     wave, source = session.get(Wave, task.wave_id), session.get(Wave, task.wave_id).source
+    if restore_reapproval_is_required(wave):
+        task.state, task.lease_expires_at = TaskState.CANCELLED, None
+        task.error = "Superseded: the wave requires explicit approval for a new restore"
+        session.commit()
+        return
     # Reflect the claimed transfer immediately.  Establishing AWS clients can
     # take a few seconds (or retry credentials), and leaving the wave as
     # READY_FOR_RESTORE during that interval is misleading for Standard data,
@@ -2377,6 +2455,12 @@ def _transfer_wave(session, task: Task, settings) -> None:
     )) or 0
     if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and waiting_restore:
         wave.status = "RESTORING"
+        # Every object currently available has been transferred.  Releasing
+        # this wave's durable hold allows the next targeted availability poll
+        # to advance virtual time deliberately for the remaining objects.  A
+        # hold must never span an idle period indefinitely.
+        if runtime_context.is_simulation:
+            release_simulation_clock_after_transfer(session, wave)
         event(session, "PARTIAL_TRANSFER_COMPLETED", f"Transferred currently available objects; {waiting_restore} object(s) still await restore.", source_id=source.id, wave_id=wave.id)
     else:
         wave.status = "COMPLETED" if not remaining and not delivery_pending else "TRANSFERRED_WITH_ERRORS"
