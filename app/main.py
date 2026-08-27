@@ -2697,6 +2697,11 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
     raikou_busy += int(session.scalar(select(func.count(DiscoveryJob.id)).where(
         DiscoveryJob.state == TaskState.RUNNING
     )) or 0)
+    transfer_mbps = (transferred_bytes * 8) / transfer_seconds / 1_000_000
+    if control_logical_recent:
+        # Older CONTROL evidence may predate the aggregate-cap contract. Do
+        # not let it make the console claim an impossible link speed.
+        transfer_mbps = min(float(settings.max_throughput_mbps), transfer_mbps)
     volume = shutil.disk_usage("/")
     return {
         "status": "ok",
@@ -2711,7 +2716,7 @@ def operations_overview(session: Session = Depends(get_session)) -> dict:
             "transfer_files": transferred_files,
             "transferred_per_minute": round(transferred_files / (transfer_seconds / 60), 2),
             "transferred_per_hour": round(transferred_files / (transfer_seconds / 3600), 2),
-            "transfer_mbps": round((transferred_bytes * 8) / transfer_seconds / 1_000_000, 2),
+            "transfer_mbps": round(transfer_mbps, 2),
             "transfer_live_mbps": round(live_transfer_mbps, 2),
             "simulation_logical_metrics": bool(control_logical_recent or control_logical_active),
             "transfer_live_window_seconds": live_window_seconds,
