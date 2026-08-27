@@ -33,21 +33,21 @@ administrativo ocorre por túnel SSH autenticado por chave pública/privada.
 Registre os valores a seguir. Os mesmos códigos serão reutilizados nos comandos
 e nas policies. A tabela é uma referência, não um comando.
 
-| Código | O que informar | Exemplo |
-|---|---|---|
-| `<TENANCY_OCID>` | OCID do *tenancy* OCI. | `ocid1.tenancy.oc1..example` |
-| `<VM_COMPARTMENT_OCID>` | Compartment onde a VM será criada. | `ocid1.compartment.oc1..example` |
-| `<SUBNET_OCID>` | Subnet existente habilitada pelo cliente para a conectividade dedicada OCI–AWS e para os serviços OCI. | `ocid1.subnet.oc1.sa-saopaulo-1.example` |
-| `<AVAILABILITY_DOMAIN>` | Availability Domain (AD) escolhido para a VM. | `xYzA:SA-SAOPAULO-1-AD-1` |
-| `<IMAGE_OCID>` | Imagem Oracle Linux compatível. | `ocid1.image.oc1.sa-saopaulo-1.example` |
-| `<DESTINATION_COMPARTMENT_OCID>` | Compartment que contém o *bucket* OCI de destino. | `ocid1.compartment.oc1..example` |
-| `<DESTINATION_BUCKET>` | Nome do *bucket* OCI que receberá dados. | `migration-destination` |
-| `<SECRETS_COMPARTMENT_OCID>` | Compartment em que os *Secrets* poderão ser lidos pela VM. | `ocid1.compartment.oc1..example` |
-| `<VAULT_OCID>` | Vault que armazenará os *Secrets*. | `ocid1.vault.oc1.sa-saopaulo-1.example` |
-| `<KEY_OCID>` | Chave AES-256 usada para cifrar os *Secrets*. | `ocid1.key.oc1.sa-saopaulo-1.example` |
-| `<POLICY_COMPARTMENT_OCID>` | Compartment que governa os compartments informados na policy. | `ocid1.compartment.oc1..example` |
-| `<VM_OCID>` | OCID da VM criada neste procedimento. | `ocid1.instance.oc1.sa-saopaulo-1.example` |
-| `<DYNAMIC_GROUP_NAME>` | Nome da Dynamic Group exclusiva da VM. | `oracle-data-migration-vm` |
+| Código | O que informar | Exemplo | Uso |
+|---|---|---|---|
+| `<TENANCY_OCID>` | OCID do *tenancy* OCI. | `ocid1.tenancy.oc1..example` | CLI |
+| `<VM_COMPARTMENT_OCID>` | Compartment onde a VM será criada. | `ocid1.compartment.oc1..example` | Console e CLI |
+| `<SUBNET_OCID>` | Subnet existente habilitada pelo cliente para a conectividade dedicada OCI–AWS e para os serviços OCI. | `ocid1.subnet.oc1.sa-saopaulo-1.example` | Console e CLI |
+| `<AVAILABILITY_DOMAIN>` | Availability Domain (AD) escolhido para a VM. | `xYzA:SA-SAOPAULO-1-AD-1` | Console e CLI |
+| `<IMAGE_OCID>` | Imagem Oracle Linux compatível. | `ocid1.image.oc1.sa-saopaulo-1.example` | Console e CLI |
+| `<DESTINATION_COMPARTMENT_OCID>` | Compartment que contém o *bucket* OCI de destino. | `ocid1.compartment.oc1..example` | Console e CLI |
+| `<DESTINATION_BUCKET>` | Nome do *bucket* OCI que receberá dados. | `migration-destination` | Console e CLI |
+| `<SECRETS_COMPARTMENT_OCID>` | Compartment em que os *Secrets* poderão ser lidos pela VM. | `ocid1.compartment.oc1..example` | Console e CLI |
+| `<VAULT_OCID>` | Vault que armazenará os *Secrets*. | `ocid1.vault.oc1.sa-saopaulo-1.example` | Console e CLI |
+| `<KEY_OCID>` | Chave AES-256 usada para cifrar os *Secrets*. | `ocid1.key.oc1.sa-saopaulo-1.example` | Console e CLI |
+| `<POLICY_COMPARTMENT_OCID>` | Compartment que governa os compartments informados na policy. | `ocid1.compartment.oc1..example` | Console e CLI |
+| `<VM_OCID>` | OCID da VM criada neste procedimento. | `ocid1.instance.oc1.sa-saopaulo-1.example` | Console e CLI |
+| `<DYNAMIC_GROUP_NAME>` | Nome da Dynamic Group exclusiva da VM. | `oracle-data-migration-vm` | Console e CLI |
 
 Para listar recursos pela OCI CLI, configure previamente o perfil da sua conta
 administrativa e execute, por exemplo:
