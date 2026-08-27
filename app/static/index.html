@@ -157,6 +157,7 @@
       <label class="field"><span class="field-label"><span class="with-help">Lease da tarefa<br>(segundos) <span class="help" tabindex="0" data-help="Tempo de posse temporária de uma tarefa por um worker. Se o worker parar e não renovar o lease, a tarefa volta para a fila, permitindo recuperação após falha ou reinicialização.">i</span></span></span><input id="set-lease" type="number" min="30" max="3600" required></label>
       <label class="field"><span class="field-label"><span class="with-help">Margem de restore<br>(horas) <span class="help" tabindex="0" data-help="Margem acrescentada à janela máxima do tier para agendar o restore antes da transferência prevista.">i</span></span></span><input id="set-dynamic-safety-hours" type="number" min="0" max="168" step="0.1" required></label>
       <label class="field"><span class="field-label"><span class="with-help">Horizonte de restores<br>(waves) <span class="help" tabindex="0" data-help="Quantidade máxima de waves dinâmicas materializadas. O padrão de 3 mantém duas elegíveis para restore e uma próxima wave sem submissão AWS, reservada para recálculo adaptativo. A mudança vale para novos ciclos do scheduler.">i</span></span></span><input id="set-dynamic-restore-horizon" type="number" min="1" max="20" step="1" required></label>
+      <label class="field"><span class="field-label"><span class="with-help">Teto de restores<br>simultâneos <span class="help" tabindex="0" data-help="Máximo que Raikou pode liberar ao mesmo tempo. Ele inicia com dois restores e só aumenta quando o histórico indica que isso reduz lacunas sem pressionar a retenção. O limite de 4 evita fan-out excessivo e custo antecipado.">i</span></span></span><input id="set-dynamic-restore-max-slots" type="number" min="2" max="4" step="1" required></label>
       <label class="field toggle"><span class="field-label"><span class="with-help">Preservar tags<br>dos objetos S3 <span class="help" tabindex="0" data-help="Quando habilitado, preserva tags S3 como evidência no banco e como metadado compatível no OCI. Desabilite apenas se tags não forem necessárias: isso elimina uma chamada AWS GetObjectTagging por arquivo.">i</span></span></span><span class="toggle-box"><input id="set-preserve-s3-tags" type="checkbox"> Habilitar</span></label>
       <label class="field toggle"><span class="field-label"><span class="with-help">Estimativa de custo<br>por wave <span class="help" tabindex="0" data-help="Habilita o cálculo sob demanda de custos estimados nas waves. Quando desligado, a plataforma não calcula estimativas nem permite abri-las; as tarifas cadastradas por conexão AWS são preservadas.">i</span></span></span><span class="toggle-box"><input id="set-cost-estimation" type="checkbox"> Habilitar</span></label>
       <div class="field action"><span class="field-label">Salvar parâmetros<br>operacionais</span><button>Salvar configuração</button></div>
@@ -764,6 +765,51 @@ refreshAll();
       if(state)show(state);
     });
     document.addEventListener('focusout',hide);
+  })();
+</script>
+<script>
+  // The ceiling is deliberately separate from the initial pipeline horizon:
+  // Raikou starts with two restore slots and may grow only when the observed
+  // pipeline requires it, never beyond this explicit global guardrail.
+  (()=>{
+    const loadSettingsWithRestoreSlotCeiling=loadSettings;
+    loadSettings=async function(){
+      await loadSettingsWithRestoreSlotCeiling();
+      try{
+        const data=await api('/api/settings');
+        const input=$('#set-dynamic-restore-max-slots');
+        if(input)input.value=data.dynamic_restore_max_slots||4;
+      }catch(error){say(`Configuração: ${error.message}`,true)}
+    };
+    saveSettings=async function(){
+      try{
+        const data=await api('/api/settings',{
+          method:'PUT',headers:{'content-type':'application/json'},
+          body:JSON.stringify({
+            max_throughput_mbps:Number($('#set-throughput').value),
+            multipart_part_size_mib:Number($('#set-multipart-part-size').value),
+            default_wave_size_bytes:Math.floor(Number($('#set-wave-tb').value)*1024**4),
+            default_restore_days:Number($('#set-restore-days').value),
+            default_restore_tier:$('#set-restore-tier').value,
+            task_lease_seconds:Number($('#set-lease').value),
+            dynamic_restore_safety_seconds:Math.round(Number($('#set-dynamic-safety-hours').value)*3600),
+            dynamic_restore_horizon_waves:Number($('#set-dynamic-restore-horizon').value),
+            dynamic_restore_max_slots:Number($('#set-dynamic-restore-max-slots').value),
+            preserve_s3_tags:$('#set-preserve-s3-tags').checked,
+            cost_estimation_enabled:$('#set-cost-estimation').checked,
+            cost_pricing_auto_refresh_enabled:$('#set-cost-pricing-auto-refresh').checked,
+            cost_pricing_refresh_days:Number($('#set-cost-pricing-refresh-days').value)
+          })
+        });
+        costEstimationEnabled=Boolean(data.cost_estimation_enabled);
+        $('#global-pricing-settings').classList.toggle('hidden',!costEstimationEnabled);
+        addWaveCostButtons();addSourceCostButton();
+        if(operationMode==='REAL')await loadAwsConnections();
+        if(costEstimationEnabled)await loadGlobalAwsPricing();
+        say('Configuração operacional salva.');
+        await Promise.all([loadSettings(),loadEvents(),loadHealth()]);
+      }catch(error){say(error.message,true)}
+    };
   })();
 </script>
 </body></html>

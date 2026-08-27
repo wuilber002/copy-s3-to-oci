@@ -731,6 +731,9 @@ class RuntimeSettings(Base):
     dynamic_wave_max_objects: Mapped[int] = mapped_column(Integer, default=50000)
     dynamic_restore_safety_seconds: Mapped[int] = mapped_column(Integer, default=6 * 3600)
     dynamic_restore_horizon_waves: Mapped[int] = mapped_column(Integer, default=3)
+    # Raikou starts with two restore slots and may grow only up to this
+    # operator-defined ceiling after it has timing evidence.
+    dynamic_restore_max_slots: Mapped[int] = mapped_column(Integer, default=4)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
 
@@ -1006,6 +1009,7 @@ class RuntimeSettingsUpdate(BaseModel):
     cost_pricing_refresh_days: int = Field(default=7, ge=1, le=90)
     dynamic_restore_safety_seconds: int = Field(default=6 * 3600, ge=0, le=7 * 24 * 3600)
     dynamic_restore_horizon_waves: int = Field(default=3, ge=1, le=20)
+    dynamic_restore_max_slots: int = Field(default=4, ge=2, le=4)
 
 
 class GlobalOutboundCostUpdate(BaseModel):
@@ -1140,6 +1144,7 @@ def create_schema() -> None:
         "dynamic_wave_max_objects": "INTEGER NOT NULL DEFAULT 50000",
         "dynamic_restore_safety_seconds": "INTEGER NOT NULL DEFAULT 21600",
         "dynamic_restore_horizon_waves": "INTEGER NOT NULL DEFAULT 3",
+        "dynamic_restore_max_slots": "INTEGER NOT NULL DEFAULT 4",
     }
     source_columns = {"discovery_requested_at": "TIMESTAMP WITH TIME ZONE", "discovery_started_at": "TIMESTAMP WITH TIME ZONE", "discovery_elapsed_seconds": "DOUBLE PRECISION NOT NULL DEFAULT 0", "discovery_completed_at": "TIMESTAMP WITH TIME ZONE", "discovery_error": "TEXT", "discovery_continuation_token": "TEXT", "discovery_prefix_index": "INTEGER NOT NULL DEFAULT 0", "discovery_pages_completed": "INTEGER NOT NULL DEFAULT 0", "discovery_objects_inserted": "BIGINT NOT NULL DEFAULT 0", "last_discovery_mode": "VARCHAR(32)", "discovery_generation": "INTEGER NOT NULL DEFAULT 0", "aws_connection_id": "INTEGER", "aws_bucket_region": "VARCHAR(64)", "transfer_strategy": "VARCHAR(32) NOT NULL DEFAULT 'AFTER_ALL_RESTORED'", "early_transfer_minimum_percent": "DOUBLE PRECISION NOT NULL DEFAULT 15", "backend_kind": "VARCHAR(16) NOT NULL DEFAULT 'REAL'", "simulation_scenario_id": "VARCHAR(36)", "simulation_execution_id": "VARCHAR(36)", "simulation_correlation_id": "VARCHAR(36)", "simulation_tenant_id": "VARCHAR(36)", "simulation_project_id": "VARCHAR(36)", "simulation_fidelity": "VARCHAR(16)"}
     source_columns["archived_at"] = "TIMESTAMP WITH TIME ZONE"
@@ -1422,6 +1427,7 @@ def settings_dict(settings: RuntimeSettings) -> dict:
             "activity_refresh_seconds": settings.activity_refresh_seconds,
             "dynamic_restore_safety_seconds": settings.dynamic_restore_safety_seconds,
             "dynamic_restore_horizon_waves": settings.dynamic_restore_horizon_waves,
+            "dynamic_restore_max_slots": settings.dynamic_restore_max_slots,
             "updated_at": settings.updated_at}
 
 
@@ -2819,12 +2825,18 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
             Source.archived_at.is_(None),
         ).order_by(Task.available_at, Task.id)
     ))
-    # At most one current task represents each wave.  Prefer a running task
-    # when a stale/retried READY row exists for the same wave.
+    # At most one current task represents each wave.  Prefer a running Raiju
+    # transfer over an availability poll: an early-release wave can be both
+    # RESTORING and actively TRANSFERRING at the same time.
     by_wave: dict[int, Task] = {}
     for task in tasks:
         previous = by_wave.get(task.wave_id)
-        if not previous or (task.state == TaskState.RUNNING and previous.state != TaskState.RUNNING):
+        score = (2 if task.kind == "TRANSFER_WAVE" and task.state == TaskState.RUNNING else
+                 1 if task.state == TaskState.RUNNING else 0)
+        previous_score = (-1 if previous is None else
+                          2 if previous.kind == "TRANSFER_WAVE" and previous.state == TaskState.RUNNING else
+                          1 if previous.state == TaskState.RUNNING else 0)
+        if previous is None or score > previous_score:
             by_wave[task.wave_id] = task
 
     def elapsed_seconds(objects: list[ObjectRecord]) -> int:
@@ -4752,11 +4764,36 @@ def adaptive_restore_slot_limit(session: Session, run: DynamicPipelineRun,
     transfer_seconds = predicted[len(predicted) // 2]
     if transfer_seconds <= 0:
         return baseline
-    restore_seconds = restore_service_window_seconds(run.restore_tier)
+    # Prefer observed end-to-end restore timings once the source has enough
+    # completed waves.  The service-window fallback remains intentionally
+    # conservative for a cold source and for sparse/partial evidence.
+    observed_restore_seconds: list[float] = []
+    completed_by_id = {wave.id: wave for wave in completed}
+    for wave_id, requested_at, available_at in session.execute(select(
+        ObjectRecord.wave_id,
+        func.min(ObjectRecord.restore_requested_at),
+        func.max(ObjectRecord.restored_at),
+    ).where(
+        ObjectRecord.wave_id.in_(tuple(completed_by_id)),
+        ObjectRecord.restore_requested_at.is_not(None),
+        ObjectRecord.restored_at.is_not(None),
+    ).group_by(ObjectRecord.wave_id)):
+        wave = completed_by_id[wave_id]
+        if wave.source.backend_kind == "SIMULATED":
+            requested_at = wave.restore_requested_virtual_at or requested_at
+            available_at = wave.last_restore_available_virtual_at or available_at
+        if requested_at and available_at and available_at >= requested_at:
+            observed_restore_seconds.append((available_at - requested_at).total_seconds())
+    restore_seconds = (
+        percentile_75(observed_restore_seconds)
+        if len(observed_restore_seconds) >= 3
+        else restore_service_window_seconds(run.restore_tier)
+    )
     needed_for_continuity = math.ceil(restore_seconds / transfer_seconds)
     retention_seconds = max(1, int(run.restore_days)) * 24 * 3600
     safe_by_retention = max(baseline, int(retention_seconds // transfer_seconds))
-    return max(baseline, min(6, safe_by_retention, needed_for_continuity))
+    configured_ceiling = max(baseline, min(4, int(settings.dynamic_restore_max_slots or 4)))
+    return max(baseline, min(configured_ceiling, safe_by_retention, needed_for_continuity))
 
 
 def materialize_dynamic_pipeline_horizon(session: Session, settings: RuntimeSettings,
@@ -5028,6 +5065,16 @@ def release_dynamic_restore_horizon(session: Session, settings: RuntimeSettings,
             # Task leases always use wall time. A virtual timestamp here would
             # make the real durable queue wait until that future date.
             session.add(Task(wave_id=wave.id, kind="SUBMIT_BATCH_RESTORE", available_at=queue_now))
+            if release_capacity > 2:
+                record_event(
+                    session,
+                    "DYNAMIC_RESTORE_CAPACITY_SCALED",
+                    f"Raikou released restore capacity {release_capacity}/"
+                    f"{settings.dynamic_restore_max_slots}: observed history indicates "
+                    "additional restore overlap is needed to protect transfer continuity.",
+                    source_id=wave.source_id,
+                    wave_id=wave.id,
+                )
             record_event(session, "DYNAMIC_RESTORE_RELEASED",
                          f"Dynamic pipeline run {run.id} released restore for wave '{wave.name}' within release capacity {release_capacity} of materialized horizon {horizon}",
                          source_id=wave.source_id, wave_id=wave.id)
@@ -5375,7 +5422,10 @@ def list_waves(source_id: int, session: Session = Depends(get_session)) -> list[
         # A task lease is the source of truth while a worker owns the wave.
         # This also heals UI state left behind by a controlled worker restart:
         # a re-queued transfer must be RESTORED, never READY_FOR_RESTORE.
-        if wave.id in transferring_wave_ids:
+        # Partial release is deliberately dual-state: RESTORING remains the
+        # primary lifecycle state while ``is_transferring`` renders the live
+        # Raiju lane as a secondary tag in the interface.
+        if wave.id in transferring_wave_ids and wave.status != "RESTORING":
             return "TRANSFERRING"
         if wave.id in ready_transfer_wave_ids and wave.status in {"READY_FOR_RESTORE", "RESTORED", "TRANSFERRING"}:
             return "RESTORED"

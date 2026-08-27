@@ -352,52 +352,130 @@ def succeed(session, task: Task, next_kind: str | None = None) -> None:
     session.commit()
 
 
-def ensure_transfer_task(session, wave: Wave) -> bool:
-    """Ensure one eligible transfer task exists while restore polling continues.
+def transfer_lane_readiness(session, source: Source, wave: Wave) -> tuple[bool, dict[str, int | float | bool]]:
+    """Return whether a wave has enough concrete restored work for Raiju.
 
-    A source owns a single transfer lane.  ``AS_OBJECTS_AVAILABLE`` changes
-    *when* files from the current wave may start moving; it does not allow a
-    later wave to overtake an earlier wave.  Keeping this gate here (rather
-    than only in the task claimer) avoids a misleading pile of READY transfer
-    tasks and makes the persisted pipeline order authoritative.
+    The byte percentage is a release threshold, not a guarantee that workers
+    will remain busy.  A partially restored wave therefore also needs a small
+    reservoir of objects already readable from S3.  This lets Raikou release
+    the lane when that reservoir ends and give another eligible wave a turn.
     """
-    terminal = {"COMPLETED", "VERIFIED", "TRANSFERRED"}
-    predecessor_filters = [Wave.id != wave.id, Wave.status.notin_(terminal)]
-    if wave.pipeline_run_id is not None:
-        predecessor_filters.append(Wave.pipeline_run_id == wave.pipeline_run_id)
-    else:
-        predecessor_filters.append(Wave.source_id == wave.source_id)
+    total, released, copyable, copyable_seconds, pending = session.execute(select(
+        func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
+        func.coalesce(func.sum(case((ObjectRecord.state.in_([
+            ObjectState.RESTORED, ObjectState.TRANSFERRING,
+            ObjectState.TRANSFERRED, ObjectState.VERIFIED,
+        ]), ObjectRecord.size_bytes), else_=0)), 0),
+        func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.RESTORED,
+            ObjectRecord.size_bytes), else_=0)), 0),
+        func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.RESTORED,
+            ObjectRecord.planned_transfer_seconds), else_=0)), 0),
+        func.count(ObjectRecord.id).filter(ObjectRecord.state.in_([
+            ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED,
+            ObjectState.RESTORING,
+        ])),
+    ).where(ObjectRecord.wave_id == wave.id)).one()
+    total = int(total or 0)
+    released = int(released or 0)
+    copyable = int(copyable or 0)
+    copyable_seconds = int(copyable_seconds or 0)
+    pending = int(pending or 0)
+    released_percent = (released * 100 / total) if total else 100.0
+    threshold = float(source.early_transfer_minimum_percent or 15)
+    # The reservoir is deliberately bounded: a small-wave source should not
+    # wait for fifteen minutes merely because its predicted duration is long.
+    minimum_reservoir_seconds = min(
+        15 * 60,
+        max(60, int(max(1, wave.predicted_transfer_seconds or 1) * threshold / 100)),
+    )
+    all_available = pending == 0
+    eligible = copyable > 0 and (
+        all_available
+        or (
+            source.transfer_strategy == "AS_OBJECTS_AVAILABLE"
+            and released_percent >= threshold
+            and copyable_seconds >= minimum_reservoir_seconds
+        )
+    )
+    return eligible, {
+        "total_bytes": total,
+        "released_bytes": released,
+        "copyable_bytes": copyable,
+        "copyable_seconds": copyable_seconds,
+        "pending_objects": pending,
+        "released_percent": released_percent,
+        "minimum_reservoir_seconds": minimum_reservoir_seconds,
+        "all_available": all_available,
+    }
 
-    if wave.planned_transfer_start_at is not None:
-        predecessor_filters.append(or_(
-            Wave.planned_transfer_start_at < wave.planned_transfer_start_at,
-            and_(Wave.planned_transfer_start_at == wave.planned_transfer_start_at, Wave.id < wave.id),
-        ))
-    else:
-        predecessor_filters.append(Wave.id < wave.id)
-    predecessor = session.scalar(select(Wave.id).where(*predecessor_filters).limit(1))
-    if predecessor is not None:
-        return False
-    # A reconciliation cycle can outlive the transfer worker's commit. Do
-    # not create another transfer merely because the prior task is already
-    # terminal: there must still be a concrete restored object waiting for
-    # this wave. This also preserves legitimate early-release behaviour,
-    # where a later availability poll exposes a new RESTORED subset.
-    pending_restored = session.scalar(select(ObjectRecord.id).where(
-        ObjectRecord.wave_id == wave.id,
-        ObjectRecord.state == ObjectState.RESTORED,
-    ).limit(1))
-    if pending_restored is None:
-        return False
-    existing = session.scalar(select(Task.id).where(
-        Task.wave_id == wave.id,
+
+def ensure_transfer_task(session, wave: Wave, settings=None) -> bool:
+    """Assign Raiju's one global transfer lane to the best eligible wave.
+
+    Restore is intentionally parallel, whereas the transfer lane is global
+    and exclusive.  Unlike the former predecessor gate, an early-release wave
+    that temporarily runs out of restored objects no longer blocks a later
+    wave with a usable reservoir.  Submitted restore work remains immutable;
+    only the choice of the next local transfer task is adaptive.
+    """
+    live_lane = session.scalar(select(Task.id).join(Wave).join(Source).where(
         Task.kind == "TRANSFER_WAVE",
         Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+        Wave.status != "PAUSED",
+        Source.archived_at.is_(None),
     ).limit(1))
-    if existing:
+    if live_lane is not None:
         return False
-    session.add(Task(wave_id=wave.id, kind="TRANSFER_WAVE"))
-    event(session, "TRANSFER_RELEASED", "Transfer task released for restored objects", source_id=wave.source_id, wave_id=wave.id)
+
+    source = wave.source
+    scope = [Wave.source_id == source.id, Wave.status.in_(["RESTORING", "RESTORED"])]
+    if wave.pipeline_run_id is not None:
+        scope.append(Wave.pipeline_run_id == wave.pipeline_run_id)
+    candidates: list[tuple[Wave, dict[str, int | float | bool]]] = []
+    for candidate in session.scalars(select(Wave).where(*scope).order_by(Wave.id)):
+        existing = session.scalar(select(Task.id).where(
+            Task.wave_id == candidate.id,
+            Task.kind == "TRANSFER_WAVE",
+            Task.state.in_([TaskState.READY, TaskState.RUNNING]),
+        ).limit(1))
+        if existing:
+            continue
+        eligible, readiness = transfer_lane_readiness(session, source, candidate)
+        if eligible:
+            candidates.append((candidate, readiness))
+    if not candidates:
+        return False
+
+    far_future = datetime.max.replace(tzinfo=utcnow().tzinfo)
+    selected, readiness = min(
+        candidates,
+        key=lambda item: (
+            session.scalar(select(func.min(ObjectRecord.restore_expires_at)).where(
+                ObjectRecord.wave_id == item[0].id,
+                ObjectRecord.state == ObjectState.RESTORED,
+            )) or far_future,
+            item[0].planned_transfer_start_at or far_future,
+            item[0].id,
+        ),
+    )
+    # In simulation, freeze only the wave that actually received Raiju's
+    # transfer lane. Holding every partially restored candidate would stop
+    # its source clock and prevent the remaining restore polls from making
+    # forward progress.
+    retain_simulation_clock_for_transfer(session, selected)
+    session.add(Task(wave_id=selected.id, kind="TRANSFER_WAVE"))
+    event(
+        session,
+        "TRANSFER_LANE_ASSIGNED",
+        "Raikou assigned the exclusive transfer lane: "
+        f"{readiness['copyable_bytes']} immediately copyable byte(s), "
+        f"{readiness['released_percent']:.2f}% released, "
+        f"{readiness['copyable_seconds']}s reservoir "
+        f"(minimum {readiness['minimum_reservoir_seconds']}s), "
+        f"{readiness['pending_objects']} object(s) still restoring.",
+        source_id=source.id,
+        wave_id=selected.id,
+    )
     return True
 
 
@@ -420,13 +498,14 @@ def early_transfer_threshold_reached(session, source: Source, wave: Wave) -> tup
     return percent >= threshold, available, total, percent
 
 
-def reconcile_restored_transfer_lane(session) -> int:
-    """Release the next restored wave when its source transfer lane is free.
+def reconcile_restored_transfer_lane(session, settings=None) -> int:
+    """Release the next eligible wave when Raiju's transfer lane is free.
 
     Restore polling is intentionally not the sole place that releases a
-    transfer.  A poll can finish while an earlier wave still occupies the
-    lane; without this reconciliation the restored wave would remain in the
-    ``RESTORED`` state indefinitely after that earlier wave completes.
+    transfer. A poll can finish while an earlier wave still occupies the
+    lane; without this reconciliation a fully restored wave — or a partially
+    restored wave with a sufficient byte/time reservoir — would remain idle
+    after that earlier wave completes.
 
     The ordering and single-lane rules stay centralized in
     :func:`ensure_transfer_task`.  This pass merely retries the durable
@@ -437,17 +516,13 @@ def reconcile_restored_transfer_lane(session) -> int:
         select(Wave)
         .join(Source)
         .where(
-            Wave.status == "RESTORED",
+            Wave.status.in_(["RESTORING", "RESTORED"]),
             Source.archived_at.is_(None),
         )
         .order_by(Wave.source_id, Wave.planned_transfer_start_at, Wave.id)
     )
     for wave in waves:
-        # In simulation preserve the restored-copy window through the durable
-        # poll-to-transfer hand-off, including waves restored by an older
-        # release before this reconciliation existed.
-        retain_simulation_clock_for_transfer(session, wave)
-        if ensure_transfer_task(session, wave):
+        if ensure_transfer_task(session, wave, settings):
             released += 1
             event(
                 session,
@@ -1512,8 +1587,7 @@ def poll_restore_simulated(
             )
         threshold_reached, available_bytes, total_bytes, available_percent = early_transfer_threshold_reached(session, source, wave)
         if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and threshold_reached:
-            retain_simulation_clock_for_transfer(session, wave)
-            ensure_transfer_task(session, wave)
+            ensure_transfer_task(session, wave, settings)
             event(
                 session,
                 "SIMULATED_RESTORE_PARTIALLY_AVAILABLE",
@@ -1591,8 +1665,7 @@ def poll_restore_simulated(
     # Keep a second hold beyond the polling context.  It is released only by
     # the transfer worker, preventing a 3,600x virtual clock from expiring a
     # freshly available object in the durable-queue hand-off.
-    retain_simulation_clock_for_transfer(session, wave)
-    ensure_transfer_task(session, wave)
+    ensure_transfer_task(session, wave, settings)
     succeed(session, task)
 
 
@@ -1735,7 +1808,7 @@ def poll_restore(session, task: Task, settings) -> None:
         )) or 0
         threshold_reached, available_bytes, total_bytes, available_percent = early_transfer_threshold_reached(session, source, wave)
         if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and threshold_reached:
-            ensure_transfer_task(session, wave)
+            ensure_transfer_task(session, wave, settings)
             event(session, "RESTORE_PARTIALLY_AVAILABLE", f"{ready_for_transfer} restored object(s) / {available_bytes} of {total_bytes} byte(s) ({available_percent:.2f}%) released for transfer while {pending} remain unavailable; threshold {source.early_transfer_minimum_percent:g}%", source_id=source.id, wave_id=wave.id)
         session.commit()
         delay = restore_availability_poll_delay_seconds(
@@ -1752,7 +1825,7 @@ def poll_restore(session, task: Task, settings) -> None:
     expiries = [obj.restore_expires_at for obj in objects if obj.restore_expires_at]
     expiry_text = f"; earliest temporary-copy expiry {min(expiries).isoformat()}" if expiries else ""
     event(session, "RESTORE_AVAILABLE", f"All wave objects are available for transfer; readiness checked with {poll_method}{expiry_text}", source_id=source.id, wave_id=wave.id)
-    ensure_transfer_task(session, wave)
+    ensure_transfer_task(session, wave, settings)
     succeed(session, task)
 
 
@@ -2364,11 +2437,24 @@ def _transfer_wave(session, task: Task, settings) -> None:
         task.error = "Superseded: the wave requires explicit approval for a new restore"
         session.commit()
         return
-    # Reflect the claimed transfer immediately.  Establishing AWS clients can
-    # take a few seconds (or retry credentials), and leaving the wave as
-    # READY_FOR_RESTORE during that interval is misleading for Standard data,
-    # which never needs a restore request.
-    wave.status = "TRANSFERRING"
+    # A partially-restored wave has two simultaneous operational dimensions:
+    # it is still RESTORING while it temporarily owns the single transfer
+    # lane.  Keep RESTORING as its primary durable status; the live
+    # TRANSFER_WAVE task is the secondary transfer state exposed by the API.
+    # This prevents a polling cycle from visually oscillating the wave between
+    # two mutually exclusive labels and makes a later lane hand-off safe.
+    pending_restore_at_start = session.scalar(select(func.count(ObjectRecord.id)).where(
+        ObjectRecord.wave_id == wave.id,
+        ObjectRecord.state.in_([
+            ObjectState.RESTORE_REQUESTED, ObjectState.RESTORE_REQUEST_ACCEPTED,
+            ObjectState.RESTORING,
+        ]),
+    )) or 0
+    wave.status = (
+        "RESTORING"
+        if source.transfer_strategy == "AS_OBJECTS_AVAILABLE" and pending_restore_at_start
+        else "TRANSFERRING"
+    )
     if runtime_context.is_simulation:
         wave.transfer_started_virtual_at = wave.transfer_started_virtual_at or simulation_virtual_now(source)
     session.commit()
@@ -2738,7 +2824,7 @@ def run_once(role: str = WORKER_ROLE) -> None:
             # transfer at the exact moment its polling task finished.
             # Revisit durable RESTORED waves on every governance cycle so
             # the next one advances as soon as the lane is free.
-            reconcile_restored_transfer_lane(session)
+            reconcile_restored_transfer_lane(session, settings)
             session.commit()
         # There is exactly one real worker per VM.  If it was interrupted while
         # discovery was running, its page checkpoint is already committed. Make

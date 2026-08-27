@@ -22,8 +22,8 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
-from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, require_new_restore_approval, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, adaptive_restore_slot_limit, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
+from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, require_new_restore_approval, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, transfer_lane_readiness, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -564,7 +564,7 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     from app.main import DynamicPipelineRun, Wave, RuntimeSettings
     assert {"planner_mode", "pipeline_run_id", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
     assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "restore_horizon_waves", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
-    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves"} <= set(RuntimeSettings.__table__.columns.keys())
+    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves", "dynamic_restore_max_slots"} <= set(RuntimeSettings.__table__.columns.keys())
     payload = DynamicWaveCreate(restore_days=3, restore_tier="BULK")
     assert payload.restore_days == 3
     assert automatic_dynamic_duration_limit(1) == (16 * 3600, 8 * 3600)
@@ -673,9 +673,11 @@ def test_simulated_restore_reapproval_requires_confirmed_expiry_evidence():
     assert "not simulation_restore_expiry_confirmed(session, wave, source)" in worker
 
 
-def test_transfer_reconciliation_requires_a_pending_restored_object():
+def test_transfer_reconciliation_requires_a_copyable_reservoir():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
-    assert "pending_restored = session.scalar(select(ObjectRecord.id)" in worker
+    assert "def transfer_lane_readiness" in worker
+    assert '"copyable_seconds"' in worker
+    assert "minimum_reservoir_seconds" in worker
     assert "ObjectRecord.state == ObjectState.RESTORED" in worker
 
 
@@ -857,7 +859,7 @@ def test_connection_api_limits_are_durable_and_used_by_workers():
     assert 'getattr(connection, "restore_poll_requests_per_second"' in worker
 
 
-def test_transfer_lane_releases_only_the_earliest_nonterminal_wave():
+def test_transfer_lane_releases_the_best_eligible_wave_and_remains_exclusive():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -874,11 +876,73 @@ def test_transfer_lane_releases_only_the_earliest_nonterminal_wave():
         restored = ObjectRecord(id=984, source_id=source.id, wave_id=later.id, object_key="ready.bin",
                                 size_bytes=1, state=ObjectState.RESTORED)
         session.add_all([source, run, first, later, restored]); session.flush()
-        assert ensure_transfer_task(session, later) is False
-        assert session.scalar(select(Task.id).where(Task.wave_id == later.id)) is None
-        first.status = "COMPLETED"
+        # The earlier wave is still restoring but has no readable reservoir.
+        # Raikou must not leave the one transfer lane idle waiting for it.
         assert ensure_transfer_task(session, later) is True
         assert session.scalar(select(Task.id).where(Task.wave_id == later.id)) is not None
+        session.add(ObjectRecord(id=985, source_id=source.id, wave_id=first.id,
+                                 object_key="first-ready.bin", size_bytes=1,
+                                 state=ObjectState.RESTORED))
+        session.flush()
+        # A second durable transfer task cannot be created while the lane is
+        # already assigned, even if another wave is now eligible.
+        assert ensure_transfer_task(session, first) is False
+
+
+def test_partial_transfer_requires_percent_threshold_and_copyable_reservoir():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(
+            id=988, name="partial-reservoir", s3_bucket="source",
+            aws_region="us-east-1", destination_bucket="destination",
+            transfer_strategy="AS_OBJECTS_AVAILABLE", early_transfer_minimum_percent=15,
+        )
+        wave = Wave(
+            id=989, source_id=source.id, name="wave-001", max_bytes=100,
+            restore_days=1, restore_tier="BULK", status="RESTORING",
+            predicted_transfer_seconds=600,
+        )
+        session.add_all([source, wave])
+        # Fifteen percent is visible, but sixty predicted seconds is below the
+        # ninety-second reservoir demanded by this wave's 15% threshold.
+        session.add_all([
+            ObjectRecord(id=990, source_id=source.id, wave_id=wave.id, object_key="ready.bin",
+                         size_bytes=15, state=ObjectState.RESTORED,
+                         planned_transfer_seconds=60),
+            ObjectRecord(id=991, source_id=source.id, wave_id=wave.id, object_key="pending.bin",
+                         size_bytes=85, state=ObjectState.RESTORING,
+                         planned_transfer_seconds=540),
+        ])
+        session.flush()
+        eligible, readiness = transfer_lane_readiness(session, source, wave)
+        assert eligible is False
+        assert readiness["released_percent"] == 15
+        assert readiness["minimum_reservoir_seconds"] == 90
+        session.get(ObjectRecord, 990).planned_transfer_seconds = 90
+        eligible, readiness = transfer_lane_readiness(session, source, wave)
+        assert eligible is True
+        assert readiness["copyable_seconds"] == 90
+
+
+def test_adaptive_restore_capacity_honors_global_ceiling_after_history():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    with Session() as session:
+        source = Source(id=992, name="slot-ceiling", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        run = DynamicPipelineRun(id=993, source_id=source.id, scheduled_restores=True, restore_days=7, restore_tier="BULK")
+        settings = RuntimeSettings(id=1, dynamic_restore_max_slots=3)
+        session.add_all([source, run, settings])
+        session.add_all([
+            Wave(id=994 + index, source_id=source.id, pipeline_run_id=run.id,
+                 name=f"completed-{index}", max_bytes=1, restore_days=7,
+                 restore_tier="BULK", status="COMPLETED", predicted_transfer_seconds=3600)
+            for index in range(3)
+        ])
+        session.flush()
+        assert adaptive_restore_slot_limit(session, run, settings) == 3
 
 
 def test_failed_dynamic_wave_stops_future_restore_releases():

@@ -53,8 +53,22 @@ no modo isolado, delega as integrações simuladas ao FUJIN.
   equivalente, sem criar um restore duplicado.
 - Permite duas estratégias: iniciar transferência somente após toda a wave estar
   restaurada ou liberar objetos à medida que se tornam disponíveis.
-- Opera uma wave de transferência por vez. O scheduler inicia com cinco
-  **Raijus**, aumenta ou reduz a concorrência de cópia conforme a banda medida
+- Opera uma wave de transferência por vez. O scheduler mantém inicialmente
+  dois restores concorrentes e uma terceira wave futura, ainda replanejável;
+  com histórico suficiente, o Raikou pode ampliar restores até o teto global
+  configurado de quatro, sem criar uma transferência concorrente.
+- Quando a estratégia permite liberar arquivos à medida que ficam disponíveis,
+  uma wave pode permanecer em **RESTORING** e temporariamente ocupar a faixa
+  de transferência. A liberação exige o limiar de bytes configurado (15% por
+  padrão) e uma reserva mínima prevista de trabalho; ao esgotar os objetos
+  legíveis, ela devolve a faixa para a próxima wave elegível. Assim, restores
+  continuam paralelos sem deixar o link parado por uma ordem numérica rígida.
+- O scheduler prioriza objetos já legíveis, proximidade de expiração da cópia
+  temporária e continuidade estimada. Somente waves sem submissão AWS podem
+  ser reempacotadas ou ter horários alterados; Batch Jobs aceitos permanecem
+  como evidência e não são recriados automaticamente.
+- A transferência interna inicia com cinco **Raijus**, aumenta ou reduz a
+  concorrência de cópia conforme a banda medida
   e nunca fica abaixo desse piso quando houver objetos suficientes.
 - O **Raikou** é o worker de governança: executa discovery, planejamento, S3
   Batch Operations, polling de restore, reconciliação e auditorias. O **Raiju**
