@@ -1922,6 +1922,18 @@ def runtime_clock(source_id: int | None = Query(default=None, ge=1),
             clock = source_scheduler_clock(source)
         except (OSError, TimeoutError, ValueError):
             clock_available = False
+    # A simulated source uses a deliberately discrete clock.  Expose the
+    # active durable phase so the UI can distinguish a harmless polling hold
+    # from a transfer hold or a genuinely idle/paused execution.
+    active_task_kind = None
+    if source and runtime_context.is_simulation:
+        active_task_kind = session.scalar(
+            select(Task.kind)
+            .join(Wave, Wave.id == Task.wave_id)
+            .where(Wave.source_id == source.id, Task.state == TaskState.RUNNING)
+            .order_by(Task.created_at.desc(), Task.id.desc())
+            .limit(1)
+        )
     system_now = clock.real_now if clock else utcnow()
     return {
         "operation_mode": runtime_context.mode.value,
@@ -1937,6 +1949,7 @@ def runtime_clock(source_id: int | None = Query(default=None, ge=1),
         # worker streams or polls objects.  The browser must not extrapolate
         # it at the configured acceleration rate.
         "held": clock.held if clock else False,
+        "activity": active_task_kind,
         "clock_available": clock_available,
     }
 
