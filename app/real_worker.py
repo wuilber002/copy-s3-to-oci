@@ -383,6 +383,45 @@ def ensure_transfer_task(session, wave: Wave) -> bool:
     return True
 
 
+def reconcile_restored_transfer_lane(session) -> int:
+    """Release the next restored wave when its source transfer lane is free.
+
+    Restore polling is intentionally not the sole place that releases a
+    transfer.  A poll can finish while an earlier wave still occupies the
+    lane; without this reconciliation the restored wave would remain in the
+    ``RESTORED`` state indefinitely after that earlier wave completes.
+
+    The ordering and single-lane rules stay centralized in
+    :func:`ensure_transfer_task`.  This pass merely retries the durable
+    hand-off on subsequent governance cycles.
+    """
+    released = 0
+    waves = session.scalars(
+        select(Wave)
+        .join(Source)
+        .where(
+            Wave.status == "RESTORED",
+            Source.archived_at.is_(None),
+        )
+        .order_by(Wave.source_id, Wave.planned_transfer_start_at, Wave.id)
+    )
+    for wave in waves:
+        # In simulation preserve the restored-copy window through the durable
+        # poll-to-transfer hand-off, including waves restored by an older
+        # release before this reconciliation existed.
+        retain_simulation_clock_for_transfer(session, wave)
+        if ensure_transfer_task(session, wave):
+            released += 1
+            event(
+                session,
+                "RESTORED_TRANSFER_RECONCILED",
+                "Restored wave promoted after its transfer lane became available",
+                source_id=wave.source_id,
+                wave_id=wave.id,
+            )
+    return released
+
+
 def retry(session, task: Task, error: Exception | str, seconds: int | None = None) -> None:
     delay = seconds if seconds is not None else min(1800, max(60, task.attempts * 60))
     task.state, task.lease_expires_at = TaskState.READY, None
@@ -2467,6 +2506,11 @@ def run_once(role: str = WORKER_ROLE) -> None:
                 )):
                     materialize_dynamic_pipeline_horizon(session, settings, run)
                 release_dynamic_restore_horizon(session, settings)
+                # A completed restore may have been held behind an earlier
+                # transfer at the exact moment its polling task finished.
+                # Revisit durable RESTORED waves on every governance cycle so
+                # the next one advances as soon as the lane is free.
+                reconcile_restored_transfer_lane(session)
                 session.commit()
         # There is exactly one real worker per VM.  If it was interrupted while
         # discovery was running, its page checkpoint is already committed. Make
