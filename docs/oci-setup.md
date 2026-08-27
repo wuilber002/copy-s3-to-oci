@@ -337,62 +337,12 @@ novos buckets no mesmo compartment podem ser adicionados ao mesmo statement.
 Essa consolidação reduz o consumo de statements na ramificação de policies do
 cliente.
 
-## 10. Instalar a plataforma na VM
+## 10. Configurar backups persistentes
 
-Conecte-se à VM por SSH e execute o procedimento abaixo como usuário com `sudo`.
-O repositório deve ser obtido por meio do canal GitHub aprovado pelo cliente.
-O bootstrap instala e inicia PostgreSQL, interface, Raikou e Raiju como
-containers Podman, registra o serviço `s3-oci-migration.service`, configura
-SSH somente por chave e cria os timers de backup e de estado.
-
-Crie primeiro o arquivo de runtime. Ele contém apenas OCIDs e nomes, nunca os
-valores dos *Secrets*. Substitua todos os valores entre `<...>`:
-
-```json
-{
-  "object_storage_namespace": "<OBJECT_STORAGE_NAMESPACE>",
-  "destination_compartment_names": {
-    "<DESTINATION_COMPARTMENT_OCID>": "<DESTINATION_COMPARTMENT_NAME>"
-  },
-  "secret_ocids": {
-    "postgres_password": "<POSTGRES_PASSWORD_SECRET_OCID>",
-    "simulation_postgres_password": "<SIMULATION_POSTGRES_PASSWORD_SECRET_OCID>"
-  },
-  "secrets_compartment_ocid": "<SECRETS_COMPARTMENT_OCID>",
-  "secret_compartment_ocids": [
-    "<SECRETS_COMPARTMENT_OCID>"
-  ]
-}
-```
-
-Na VM:
-
-```bash
-sudo dnf install -y git podman
-sudo install -d -m 0755 /opt/s3-oci-migration
-sudo git clone --depth 1 https://github.com/wuilber002/raijin-data-migration.git \
-  /opt/s3-oci-migration/release
-
-sudo install -d -m 0755 /etc/s3-oci-migration
-sudo install -m 0600 /dev/null /etc/s3-oci-migration/oci-runtime.json
-sudo vi /etc/s3-oci-migration/oci-runtime.json
-
-sudo /opt/s3-oci-migration/release/scripts/bootstrap.sh
-sudo systemctl enable --now s3-oci-migration.service
-sudo systemctl status s3-oci-migration.service --no-pager
-```
-
-Use uma *release* ou referência Git aprovada para instalações produtivas, em
-vez de acompanhar automaticamente alterações de uma ramificação. O bootstrap
-materializa as senhas em arquivos locais de permissão restrita para permitir
-reinício seguro; o Vault permanece a fonte de verdade.
-
-## 11. Configurar backups persistentes
-
-O bootstrap cria backup lógico diário do PostgreSQL às 02:15 UTC e mantém os
-dados no boot volume. Crie também uma policy de backup do boot volume, diária,
-com retenção inicial de 35 dias. Isso protege a VM e o disco contra exclusão ou
-falha acidental; o backup lógico acelera uma recuperação seletiva do banco.
+Crie ou associe uma policy de backup do boot volume, diária, com retenção
+inicial de 35 dias. Isso protege a VM e o disco contra exclusão ou falha
+acidental. Os backups lógicos e sua configuração fazem parte da instalação da
+plataforma e estão no [guia de instalação](installation.md).
 
 Na Console OCI:
 
@@ -402,43 +352,7 @@ Na Console OCI:
 4. Confirme que há pelo menos um backup bem-sucedido antes de iniciar a
    migração de produção.
 
-## 12. Acessar a interface por túnel SSH
-
-Na estação administrativa, execute:
-
-```bash
-ssh -N -L 8080:127.0.0.1:8080 <USUARIO_LINUX>@<IP_OU_HOSTNAME_DA_VM>
-```
-
-Abra `http://127.0.0.1:8080` no navegador local. Não publique esse endereço
-por balanceador, regra de entrada, *reverse proxy* ou IP público.
-
-## 13. Validar o ambiente antes da primeira origem
-
-Na VM, confira serviço e API:
-
-```bash
-sudo systemctl is-active s3-oci-migration.service
-curl --fail --silent http://127.0.0.1:8080/healthz
-curl --fail --silent http://127.0.0.1:8080/api/runtime
-```
-
-Pela interface, abra **Configurações**, atualize o inventário de buckets OCI,
-selecione o destino e execute o pré-check. A validação lê a versão corrente
-dos *Secrets* e lista no máximo um objeto de cada bucket configurado; ela não
-altera objetos nem chama a AWS.
-
-Se o *bucket* não aparecer ou o pré-check falhar, confirme nesta ordem:
-
-1. A VM pertence à Dynamic Group indicada.
-2. A policy foi criada no compartment correto e já propagou.
-3. O nome do bucket no statement é idêntico ao nome real.
-4. O compartment do *Secret* possui `inspect secret-family` e
-   `read secret-bundles`.
-5. O arquivo `/etc/s3-oci-migration/oci-runtime.json` tem os OCIDs corretos e
-   nenhuma senha.
-
-## 14. Incluir novos destinos ou novos compartments de Secrets
+## 11. Incluir novos destinos ou novos compartments de Secrets
 
 Para um novo bucket no mesmo compartment, inclua seu nome na condição `any`
 do statement `manage objects`, aguarde a propagação e atualize o inventário de
@@ -446,13 +360,9 @@ buckets OCI na interface.
 
 Para um novo compartment de destino, acrescente os dois statements desse
 compartment (`inspect buckets` e `manage objects`). Para um novo compartment de
-*Secrets*, acrescente os dois statements de leitura e inclua seu OCID em
-`secret_compartment_ocids` no arquivo de runtime; em seguida, reinicie o
-serviço de forma controlada:
-
-```bash
-sudo systemctl restart s3-oci-migration.service
-```
+*Secrets*, acrescente os dois statements de leitura. A atualização da
+configuração de runtime e o reinício controlado do serviço são descritos no
+[guia de instalação](installation.md).
 
 ## Anexo A — Lista de abreviaturas, siglas e termos
 
