@@ -616,6 +616,8 @@ class TransferQueueItem(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    dispatch_batch_id: Mapped[int | None] = mapped_column(ForeignKey("transfer_dispatch_batches.id"), nullable=True, index=True)
+    preemption_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     priority_details_json: Mapped[str] = mapped_column(Text, default="{}")
     last_dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -623,6 +625,38 @@ class TransferQueueItem(Base):
     transferred_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class TransferDispatchBatch(Base):
+    """Durable Raikou decision for one continuous-lane dispatch cycle.
+
+    Queue items retain their individual lease and retry ownership.  This
+    aggregate only records the decision that grouped them, which makes
+    priority, preemption and worker-capacity behaviour explainable without
+    treating a batch as an atomic transfer unit.
+    """
+    __tablename__ = "transfer_dispatch_batches"
+    __table_args__ = (
+        Index("ix_transfer_dispatch_batches_source_started", "source_id", "started_at"),
+        Index("ix_transfer_dispatch_batches_wave_started", "wave_id", "started_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_id: Mapped[int] = mapped_column(ForeignKey("sources.id"), index=True)
+    wave_id: Mapped[int | None] = mapped_column(ForeignKey("waves.id"), nullable=True, index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), nullable=True, index=True)
+    priority_band: Mapped[str] = mapped_column(String(16), default="NORMAL", index=True)
+    priority_score: Mapped[int] = mapped_column(Integer, default=0)
+    object_limit: Mapped[int] = mapped_column(Integer, default=100)
+    byte_limit: Mapped[int] = mapped_column(BigInteger, default=1024**3)
+    object_count: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_planned: Mapped[int] = mapped_column(BigInteger, default=0)
+    worker_target: Mapped[int] = mapped_column(Integer, default=0)
+    state: Mapped[str] = mapped_column(String(24), default="CLAIMED", index=True)
+    reason: Mapped[str] = mapped_column(Text, default="continuous lane dispatch")
+    preempted_batch_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
 class TransferLaneSegment(Base):
@@ -1284,6 +1318,13 @@ def create_schema() -> None:
         for column, sql_type in runtime_columns.items():
             if column not in existing_runtime_columns:
                 connection.execute(text(f"ALTER TABLE runtime_settings ADD COLUMN {column} {sql_type}"))
+        lane_columns = {
+            "dispatch_batch_id": "BIGINT",
+            "preemption_cooldown_until": "TIMESTAMP WITH TIME ZONE",
+        }
+        for column, sql_type in lane_columns.items():
+            if column not in existing_lane_columns:
+                connection.execute(text(f"ALTER TABLE transfer_queue_items ADD COLUMN {column} {sql_type}"))
         for column, sql_type in source_columns.items():
             if column not in existing_source_columns:
                 connection.execute(text(f"ALTER TABLE sources ADD COLUMN {column} {sql_type}"))
@@ -6061,6 +6102,9 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
     lane_segments = list(session.scalars(select(TransferLaneSegment).where(
         TransferLaneSegment.wave_id == wave_id
     ).order_by(TransferLaneSegment.started_at, TransferLaneSegment.id)))
+    dispatch_batches = list(session.scalars(select(TransferDispatchBatch).where(
+        TransferDispatchBatch.wave_id == wave_id
+    ).order_by(TransferDispatchBatch.started_at, TransferDispatchBatch.id)))
     transfer_started_at, transfer_completed_at, transferred_files, transferred_bytes, failed_objects = session.execute(
         select(
             func.min(ObjectRecord.transfer_started_at),
@@ -6162,6 +6206,18 @@ def wave_report(wave_id: int, session: Session = Depends(get_session)) -> dict:
                                        "completion_report_get_requests": int(sum(attempt.completion_report_get_requests or 0 for attempt in attempts))},
             "integrity": {"verified": integrity_verified, "failed": integrity_failed, "pending": total_objects - integrity_verified - integrity_failed},
             "continuous_lane": {
+                "dispatch_batches": [{
+                    "id": batch.id, "state": batch.state,
+                    "priority_band": batch.priority_band,
+                    "priority_score": int(batch.priority_score or 0),
+                    "object_limit": int(batch.object_limit or 0),
+                    "byte_limit": int(batch.byte_limit or 0),
+                    "object_count": int(batch.object_count or 0),
+                    "bytes_planned": int(batch.bytes_planned or 0),
+                    "worker_target": int(batch.worker_target or 0),
+                    "reason": batch.reason, "preempted_batch_id": batch.preempted_batch_id,
+                    "started_at": batch.started_at, "completed_at": batch.completed_at,
+                } for batch in dispatch_batches],
                 "segments": [{
                     "id": segment.id, "worker_slot": segment.worker_slot,
                     "started_at": segment.started_at, "completed_at": segment.completed_at,

@@ -87,6 +87,17 @@ def test_wave_release_policy_and_report_operational_summary_are_visible():
     assert "Média entre disponibilizações" in page
 
 
+def test_dynamic_pipeline_exposes_its_fixed_immediate_release_and_source_priority():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert '<option value="dynamic">Pipeline contínuo</option>' in page
+    assert 'id="dynamic-transfer-release-policy"' in page
+    assert 'value="Assim que disponível" readonly' in page
+    assert 'id="source-business-priority"' in page
+    assert '<option value="999">Sem preferência</option>' in page
+    assert '<option value="1">#1</option>' in page
+    assert '<option value="20">#20</option>' in page
+
+
 def test_aws_connection_sync_and_safe_configuration_controls_are_available():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert "viewAwsConnectionConfiguration" in page

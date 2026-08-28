@@ -74,7 +74,11 @@ no modo isolado, delega as integrações simuladas ao FUJIN.
   viabilidade dentro da janela, tamanho e proteção contra starvation. Lotes
   normais têm até 100 objetos ou 1 GiB; urgências críticas usam micro-lotes de
   até 20 objetos ou 256 MiB e fazem preempção cooperativa somente entre objetos
-  ou partes multipart seguras. Somente waves sem submissão AWS podem ser
+  ou partes multipart seguras. Cada lote de despacho, motivo, prioridade,
+  capacidade Raiju e intervalo executado ficam persistidos para auditoria. A
+  cada vaga Raiju liberada, a prioridade e a capacidade são recalculadas e a
+  parcela livre do limite de throughput é distribuída sem interromper I/O em
+  curso. Somente waves sem submissão AWS podem ser
   reempacotadas ou ter horários alterados; Batch Jobs aceitos permanecem como
   evidência e não são recriados automaticamente.
 - A transferência interna inicia com cinco **Raijus**, aumenta ou reduz a
