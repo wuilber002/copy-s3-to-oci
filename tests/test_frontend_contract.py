@@ -74,11 +74,15 @@ def test_transfer_queue_uses_compact_style_for_batch_job_id():
     assert "padding:.18rem .35rem" in page
 
 
-def test_source_transfer_strategy_and_report_operational_summary_are_visible():
+def test_wave_release_policy_and_report_operational_summary_are_visible():
     page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
     assert 'id="source-transfer-strategy"' not in page
-    assert 'id="selected-source-transfer-strategy"' in page
-    assert "/transfer-strategy" in page
+    assert 'id="wave-transfer-release-policy"' in page
+    assert 'id="automatic-transfer-release-policy"' in page
+    assert 'id="prefix-transfer-release-policy"' in page
+    assert 'id="dynamic-transfer-release-policy"' in page
+    assert 'A criação dinâmica sempre libera objetos assim que ficam disponíveis.' in page
+    assert "/transfer-strategy" not in page
     assert "Resumo operacional" in page
     assert "Média entre disponibilizações" in page
 
@@ -259,6 +263,14 @@ def test_wave_cost_estimate_and_connection_pricing_are_available_in_modals():
     assert "editCostPricing" in page
     assert "showWaveCost" in page
     assert "Estimativa de custo" in page
+
+
+def test_continuous_lane_queue_exposes_priority_and_idle_diagnosis():
+    page = (ROOT / "app/static/index.html").read_text(encoding="utf-8")
+    assert "priority_bands" in page
+    assert "oldest_wait_seconds" in page
+    assert "idle_diagnosis" in page
+    assert "Prioridades:" in page
 
 
 def test_cost_estimation_has_a_global_operational_toggle():

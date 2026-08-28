@@ -22,8 +22,8 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, SourceTransferStrategyUpdate, Task, TaskState, Wave, active_source_scope_conflicts, adaptive_restore_slot_limit, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, source_transfer_strategy_locked, wave_cost_estimate
-from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, require_new_restore_approval, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, transfer_lane_readiness, validate_restore_preflight
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, Task, TaskState, TransferQueueItem, TransferQueueState, Wave, WaveCreate, active_source_scope_conflicts, adaptive_restore_slot_limit, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, enqueue_available_transfer_objects, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, wave_cost_estimate
+from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, ensure_transfer_task, require_new_restore_approval, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
 def test_object_model_contains_durable_multipart_checkpoint_fields():
@@ -43,12 +43,12 @@ def test_source_model_has_a_durable_discovery_page_checkpoint():
     assert "Atomically persist a bounded discovery batch" in worker
 
 
-def test_source_transfer_strategy_is_durable_and_only_accepts_known_modes():
-    assert "transfer_strategy" in Source.__table__.columns
-    assert SourceTransferStrategyUpdate(transfer_strategy="AFTER_ALL_RESTORED").transfer_strategy == "AFTER_ALL_RESTORED"
-    assert SourceTransferStrategyUpdate(transfer_strategy="AS_OBJECTS_AVAILABLE").transfer_strategy == "AS_OBJECTS_AVAILABLE"
+def test_wave_transfer_release_policy_is_durable_and_only_accepts_known_modes():
+    assert "transfer_release_policy" in Wave.__table__.columns
+    assert WaveCreate(name="wave", max_bytes=1, restore_days=1, restore_tier="BULK", transfer_release_policy="AFTER_ALL_RESTORED").transfer_release_policy == "AFTER_ALL_RESTORED"
+    assert WaveCreate(name="wave", max_bytes=1, restore_days=1, restore_tier="BULK", transfer_release_policy="AS_OBJECTS_AVAILABLE").transfer_release_policy == "AS_OBJECTS_AVAILABLE"
     with pytest.raises(ValidationError):
-        SourceTransferStrategyUpdate(transfer_strategy="anything")
+        WaveCreate(name="wave", max_bytes=1, restore_days=1, restore_tier="BULK", transfer_release_policy="anything")
 
 
 def test_source_scope_supports_multiple_non_overlapping_prefixes():
@@ -114,8 +114,8 @@ def test_global_actionable_failure_banner_ignores_archived_sources():
         session.add_all([archived_wave, active_wave])
         session.flush()
         session.add_all([
-            Task(wave_id=archived_wave.id, kind="TRANSFER_WAVE", state=TaskState.FAILED),
-            Task(wave_id=active_wave.id, kind="TRANSFER_WAVE", state=TaskState.SUCCEEDED),
+            Task(wave_id=archived_wave.id, kind="TRANSFER_CONTINUOUS", state=TaskState.FAILED),
+            Task(wave_id=active_wave.id, kind="TRANSFER_CONTINUOUS", state=TaskState.SUCCEEDED),
         ])
         session.commit()
         assert operations_overview(session)["tasks"]["ACTIONABLE_FAILED"] == 0
@@ -136,9 +136,12 @@ def test_operations_overview_reports_raiju_and_raikou_occupancy():
         )
         session.add(wave)
         session.flush()
+        in_flight = ObjectRecord(source_id=source.id, wave_id=wave.id, object_key="in-flight.bin", size_bytes=1024, state=ObjectState.TRANSFERRING)
+        session.add(in_flight)
+        session.flush()
         session.add_all([
-            ObjectRecord(source_id=source.id, wave_id=wave.id, object_key="in-flight.bin", size_bytes=1024, state=ObjectState.TRANSFERRING),
-            Task(wave_id=wave.id, kind="TRANSFER_WAVE", state=TaskState.RUNNING),
+            TransferQueueItem(source_id=source.id, wave_id=wave.id, object_id=in_flight.id, size_bytes=1024, state=TransferQueueState.LEASED),
+            Task(wave_id=wave.id, kind="TRANSFER_CONTINUOUS", state=TaskState.RUNNING),
             Task(wave_id=wave.id, kind="POLL_RESTORE", state=TaskState.RUNNING),
         ])
         session.commit()
@@ -162,7 +165,7 @@ def test_restore_reapproval_is_terminal_and_cancels_pending_polling():
         pending = ObjectRecord(source_id=source.id, wave_id=wave.id, object_key="pending.bin", size_bytes=1024, state=ObjectState.RESTORED)
         completed = ObjectRecord(source_id=source.id, wave_id=wave.id, object_key="done.bin", size_bytes=1024, state=ObjectState.TRANSFERRED)
         queued_poll = Task(wave_id=wave.id, kind="POLL_RESTORE", state=TaskState.READY)
-        active_transfer = Task(wave_id=wave.id, kind="TRANSFER_WAVE", state=TaskState.RUNNING)
+        active_transfer = Task(wave_id=wave.id, kind="TRANSFER_CONTINUOUS", state=TaskState.RUNNING)
         session.add_all([pending, completed, queued_poll, active_transfer]); session.commit()
 
         require_new_restore_approval(session, wave, "temporary copy expired")
@@ -197,7 +200,7 @@ def test_active_sources_cannot_silently_share_an_s3_prefix_scope():
         assert not active_source_scope_conflicts(session, "shared", ["unrelated/"], child.id)
 
 
-def test_transfer_strategy_locks_when_a_wave_enters_the_pipeline():
+def test_transfer_release_policy_is_captured_by_a_wave_not_the_source():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
@@ -206,15 +209,12 @@ def test_transfer_strategy_locks_when_a_wave_enters_the_pipeline():
         session.add(source); session.flush()
         wave = Wave(id=1, source_id=source.id, name="draft", max_bytes=1, restore_days=1, restore_tier="BULK", status="PLANNED")
         session.add(wave); session.flush()
-        assert not source_transfer_strategy_locked(session, source.id)
-        wave.status = "RESTORE_SCHEDULED"
-        session.flush()
-        assert source_transfer_strategy_locked(session, source.id)
+        assert wave.transfer_release_policy == "AS_OBJECTS_AVAILABLE"
 
 
 def test_governance_and_transfer_workers_claim_disjoint_durable_responsibilities():
     assert GOVERNANCE_TASK_KINDS == {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE", "VERIFY_WAVE"}
-    assert TRANSFER_TASK_KINDS == {"TRANSFER_WAVE"}
+    assert TRANSFER_TASK_KINDS == {"TRANSFER_CONTINUOUS"}
     assert GOVERNANCE_TASK_KINDS.isdisjoint(TRANSFER_TASK_KINDS)
     assert task_kinds_for_role("governance") == GOVERNANCE_TASK_KINDS
     assert task_kinds_for_role("raikou") == GOVERNANCE_TASK_KINDS
@@ -223,8 +223,8 @@ def test_governance_and_transfer_workers_claim_disjoint_durable_responsibilities
     assert task_kinds_for_role("all") is None
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
     assert "def ensure_transfer_task" in worker
-    assert "RESTORE_PARTIALLY_AVAILABLE" in worker
-    assert "PARTIAL_TRANSFER_COMPLETED" in worker
+    assert "TransferQueueItem" in worker
+    assert "claim_continuous_transfer_batch" in worker
 
 
 def test_remote_discovery_has_a_durable_observable_queue_and_adaptive_throttle():
@@ -551,6 +551,15 @@ def test_multipart_size_runtime_setting_has_safe_bounds():
     }
     assert RuntimeSettingsUpdate(**payload).multipart_part_size_mib == 64
     assert RuntimeSettingsUpdate(**payload).cost_estimation_enabled is False
+    continuous = RuntimeSettingsUpdate(**payload)
+    assert (continuous.continuous_transfer_min_buffer_seconds,
+            continuous.continuous_transfer_target_buffer_seconds,
+            continuous.continuous_transfer_max_buffer_seconds) == (3 * 3600, 6 * 3600, 24 * 3600)
+    assert (continuous.continuous_transfer_batch_max_objects,
+            continuous.continuous_transfer_batch_max_bytes,
+            continuous.continuous_transfer_critical_batch_max_objects,
+            continuous.continuous_transfer_critical_batch_max_bytes,
+            continuous.continuous_transfer_critical_priority) == (100, 1024**3, 20, 256 * 1024**2, 90)
     with pytest.raises(ValidationError):
         RuntimeSettingsUpdate(**(payload | {"laboratory_mode_enabled": False}))
     with pytest.raises(ValidationError):
@@ -564,7 +573,7 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     from app.main import DynamicPipelineRun, Wave, RuntimeSettings
     assert {"planner_mode", "pipeline_run_id", "predicted_transfer_seconds", "prediction_samples", "planned_restore_at", "planned_transfer_start_at"} <= set(Wave.__table__.columns.keys())
     assert {"source_id", "planner_version", "status", "target_max_bytes", "transfer_strategy", "restore_horizon_waves", "completed_at"} <= set(DynamicPipelineRun.__table__.columns.keys())
-    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves", "dynamic_restore_max_slots"} <= set(RuntimeSettings.__table__.columns.keys())
+    assert {"dynamic_wave_target_seconds", "dynamic_wave_max_objects", "dynamic_restore_safety_seconds", "dynamic_restore_horizon_waves", "dynamic_restore_max_slots", "continuous_transfer_min_buffer_seconds", "continuous_transfer_target_buffer_seconds", "continuous_transfer_max_buffer_seconds", "continuous_transfer_batch_max_objects", "continuous_transfer_batch_max_bytes", "continuous_transfer_critical_batch_max_objects", "continuous_transfer_critical_batch_max_bytes", "continuous_transfer_critical_priority"} <= set(RuntimeSettings.__table__.columns.keys())
     payload = DynamicWaveCreate(restore_days=3, restore_tier="BULK")
     assert payload.restore_days == 3
     assert automatic_dynamic_duration_limit(1) == (16 * 3600, 8 * 3600)
@@ -673,12 +682,11 @@ def test_simulated_restore_reapproval_requires_confirmed_expiry_evidence():
     assert "not simulation_restore_expiry_confirmed(session, wave, source)" in worker
 
 
-def test_transfer_reconciliation_requires_a_copyable_reservoir():
+def test_continuous_lane_releases_each_observed_object_without_a_percent_threshold():
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
-    assert "def transfer_lane_readiness" in worker
-    assert '"copyable_seconds"' in worker
-    assert "minimum_reservoir_seconds" in worker
-    assert "ObjectRecord.state == ObjectState.RESTORED" in worker
+    assert "def reconcile_restored_transfer_lane" in worker
+    assert "def enqueue_available_transfer_objects" in Path("app/main.py").read_text(encoding="utf-8")
+    assert "early_transfer_minimum_percent" not in worker
 
 
 def test_dynamic_prediction_prefers_p75_history_then_conservative_link_model():
@@ -876,37 +884,36 @@ def test_transfer_lane_releases_the_best_eligible_wave_and_remains_exclusive():
         restored = ObjectRecord(id=984, source_id=source.id, wave_id=later.id, object_key="ready.bin",
                                 size_bytes=1, state=ObjectState.RESTORED)
         session.add_all([source, run, first, later, restored]); session.flush()
-        # The earlier wave is still restoring but has no readable reservoir.
-        # Raikou must not leave the one transfer lane idle waiting for it.
+        # The earlier wave is still restoring but has no readable object.
+        # Raikou must not leave the continuous lane idle waiting for it.
+        enqueue_available_transfer_objects(session, later)
         assert ensure_transfer_task(session, later) is True
         assert session.scalar(select(Task.id).where(Task.wave_id == later.id)) is not None
         session.add(ObjectRecord(id=985, source_id=source.id, wave_id=first.id,
                                  object_key="first-ready.bin", size_bytes=1,
                                  state=ObjectState.RESTORED))
         session.flush()
+        enqueue_available_transfer_objects(session, first)
         # A second durable transfer task cannot be created while the lane is
         # already assigned, even if another wave is now eligible.
         assert ensure_transfer_task(session, first) is False
 
 
-def test_partial_transfer_requires_percent_threshold_and_copyable_reservoir():
+def test_continuous_lane_uses_each_available_object_without_a_percent_threshold():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine)
     with Session() as session:
-        source = Source(
-            id=988, name="partial-reservoir", s3_bucket="source",
-            aws_region="us-east-1", destination_bucket="destination",
-            transfer_strategy="AS_OBJECTS_AVAILABLE", early_transfer_minimum_percent=15,
-        )
+        source = Source(id=988, name="continuous-release", s3_bucket="source",
+                        aws_region="us-east-1", destination_bucket="destination")
         wave = Wave(
             id=989, source_id=source.id, name="wave-001", max_bytes=100,
             restore_days=1, restore_tier="BULK", status="RESTORING",
             predicted_transfer_seconds=600,
         )
         session.add_all([source, wave])
-        # Fifteen percent is visible, but sixty predicted seconds is below the
-        # ninety-second reservoir demanded by this wave's 15% threshold.
+        # One observed object is sufficient.  The global reservoir drives
+        # restore scheduling; it must not delay an already restored object.
         session.add_all([
             ObjectRecord(id=990, source_id=source.id, wave_id=wave.id, object_key="ready.bin",
                          size_bytes=15, state=ObjectState.RESTORED,
@@ -916,14 +923,11 @@ def test_partial_transfer_requires_percent_threshold_and_copyable_reservoir():
                          planned_transfer_seconds=540),
         ])
         session.flush()
-        eligible, readiness = transfer_lane_readiness(session, source, wave)
-        assert eligible is False
-        assert readiness["released_percent"] == 15
-        assert readiness["minimum_reservoir_seconds"] == 90
-        session.get(ObjectRecord, 990).planned_transfer_seconds = 90
-        eligible, readiness = transfer_lane_readiness(session, source, wave)
-        assert eligible is True
-        assert readiness["copyable_seconds"] == 90
+        assert enqueue_available_transfer_objects(session, wave) == 1
+        item = session.scalar(select(TransferQueueItem).where(TransferQueueItem.wave_id == wave.id))
+        assert item is not None
+        assert item.state == TransferQueueState.READY
+        assert item.object_id == 990
 
 
 def test_adaptive_restore_capacity_honors_global_ceiling_after_history():
@@ -1166,6 +1170,8 @@ def test_wave_cost_estimator_documents_transparent_unit_assumptions():
     assert "include_oci_costs =" in estimator
     assert '"total_completeness"' in estimator
     assert "never a promise" in estimator
+    assert '"observed_temporary_restore"' in estimator
+    assert "observed_temp_gib_months" in estimator
 
 
 def test_cost_estimate_endpoint_is_explicitly_gated_by_operational_setting():

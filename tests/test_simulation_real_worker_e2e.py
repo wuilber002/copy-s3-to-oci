@@ -173,7 +173,10 @@ def test_real_workers_complete_simulated_discovery_restore_and_transfer(tmp_path
         objects = list(
             session.scalars(select(main.ObjectRecord).where(main.ObjectRecord.wave_id == wave_id))
         )
-        assert wave.status == "COMPLETED"
+        assert wave.status == "COMPLETED", [
+            (task.kind, task.state, task.error)
+            for task in session.scalars(select(main.Task).where(main.Task.wave_id == wave_id))
+        ]
         assert {item.state for item in objects} == {main.ObjectState.TRANSFERRED}
         assert all(item.delivery_integrity_status == "OCI_ACCEPTED" for item in objects)
         assert all(item.delivery_integrity_checksum for item in objects)

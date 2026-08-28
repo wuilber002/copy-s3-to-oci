@@ -51,22 +51,32 @@ no modo isolado, delega as integrações simuladas ao FUJIN.
   da wave o código HTTP/AWS, a quantidade afetada, chaves de exemplo, causa e
   ação recomendada. `RestoreAlreadyInProgress` é reconhecido como aceite
   equivalente, sem criar um restore duplicado.
-- Permite duas estratégias: iniciar transferência somente após toda a wave estar
-  restaurada ou liberar objetos à medida que se tornam disponíveis.
-- Opera uma wave de transferência por vez. O scheduler mantém inicialmente
-  dois restores concorrentes e uma terceira wave futura, ainda replanejável;
-  com histórico suficiente, o Raikou pode ampliar restores até o teto global
-  configurado de quatro, sem criar uma transferência concorrente.
-- Quando a estratégia permite liberar arquivos à medida que ficam disponíveis,
-  uma wave pode permanecer em **RESTORING** e temporariamente ocupar a faixa
-  de transferência. A liberação exige o limiar de bytes configurado (15% por
-  padrão) e uma reserva mínima prevista de trabalho; ao esgotar os objetos
-  legíveis, ela devolve a faixa para a próxima wave elegível. Assim, restores
-  continuam paralelos sem deixar o link parado por uma ordem numérica rígida.
-- O scheduler prioriza objetos já legíveis, proximidade de expiração da cópia
-  temporária e continuidade estimada. Somente waves sem submissão AWS podem
-  ser reempacotadas ou ter horários alterados; Batch Jobs aceitos permanecem
-  como evidência e não são recriados automaticamente.
+- Cada wave define sua política de liberação: iniciar a cópia após todos os
+  objetos restaurados ou liberar cada objeto assim que sua disponibilidade é
+  observada. Waves dinâmicas usam obrigatoriamente a liberação imediata.
+- Opera uma **fila contínua de transferência** por source: a wave mantém as
+  fronteiras de restore, custo e auditoria, mas não monopoliza os Raiju. Um
+  objeto disponível de outra wave pode ser copiado assim que se torna mais
+  urgente ou necessário para manter a lane ocupada.
+- O operador configura globalmente o estoque mínimo, alvo e máximo da lane
+  (padrões de 3h, 6h e 24h), os lotes normais (100 objetos ou 1 GiB) e os
+  micro-lotes críticos (20 objetos ou 256 MiB). O Raikou usa esses limites
+  para antecipar restores sem abrir janelas temporárias em excesso.
+- Uma wave pode permanecer em **RESTORING** enquanto seus objetos disponíveis
+  são drenados. Não existe limiar percentual de liberação: o Raikou usa o
+  estoque real de trabalho com reserva mínima de 3 h, alvo de 6 h e máximo de
+  24 h para alimentar a lane sem antecipar cópias restauradas sem necessidade.
+- O scheduler mantém inicialmente dois restores concorrentes e uma terceira
+  wave futura replanejável; com histórico suficiente, pode ampliar restores
+  até o teto global configurado de quatro. Um slot de restore é liberado assim
+  que a wave fica 100% disponível, mesmo que seus objetos ainda estejam na lane.
+- O Raikou prioriza objetos já legíveis por expiração, duração prevista,
+  viabilidade dentro da janela, tamanho e proteção contra starvation. Lotes
+  normais têm até 100 objetos ou 1 GiB; urgências críticas usam micro-lotes de
+  até 20 objetos ou 256 MiB e fazem preempção cooperativa somente entre objetos
+  ou partes multipart seguras. Somente waves sem submissão AWS podem ser
+  reempacotadas ou ter horários alterados; Batch Jobs aceitos permanecem como
+  evidência e não são recriados automaticamente.
 - A transferência interna inicia com cinco **Raijus**, aumenta ou reduz a
   concorrência de cópia conforme a banda medida
   e nunca fica abaixo desse piso quando houver objetos suficientes.
@@ -106,6 +116,10 @@ no modo isolado, delega as integrações simuladas ao FUJIN.
   específicas da conexão, quando habilitado.
 - Considera Batch Operations, restore, requests S3, saída AWS, cópia temporária
   restaurada e, opcionalmente, componentes OCI configurados.
+- Após a transferência, registra separadamente o custo observado da cópia
+  temporária restaurada: o intervalo entre disponibilidade e entrega (ou
+  expiração/instante atual, quando ainda aberto) é convertido para GiB-mês sem
+  substituir a estimativa de retenção originalmente solicitada.
 - Executa em uma única VM OCI com PostgreSQL como banco e fila durável.
 - Mantém backup lógico local do PostgreSQL, estado da VM e procedimentos de
   recuperação documentados.
