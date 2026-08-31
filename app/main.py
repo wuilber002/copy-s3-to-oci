@@ -3789,12 +3789,15 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         board_wave = board_by_id[wave_id]
         terminal_at = board_timestamp(board_wave.get("transfer_completed_at"))
         effective_now = board_timestamp(source_clock_now.get(wave_by_id[wave_id].source_id, now))
+        has_prior_segment_before_terminal = bool(
+            terminal_at and any(board_timestamp(segment.started_at) < terminal_at for segment, _elapsed in entries)
+        )
         for segment, logical_elapsed in entries:
             start = board_timestamp(segment.started_at)
             completed = board_timestamp(segment.completed_at)
             if completed and completed > start:
                 end = completed
-            elif terminal_at is not None:
+            elif terminal_at is not None and (terminal_at > start or has_prior_segment_before_terminal):
                 # Older CONTROL runs recorded a zero-width segment for every
                 # object while preserving the wave's virtual completion.
                 end = max(start + timedelta(seconds=1), terminal_at)
@@ -5990,12 +5993,16 @@ def observed_transfer_lane_window(session: Session, wave: Wave) -> tuple[datetim
         return None, None
     starts: list[datetime] = []
     ends: list[datetime] = []
+    terminal_at = wave.transfer_completed_virtual_at
+    has_prior_segment_before_terminal = bool(
+        terminal_at and any(started_at < terminal_at for started_at, _completed_at, _elapsed in rows)
+    )
     for started_at, completed_at, logical_elapsed in rows:
         starts.append(started_at)
         if completed_at and completed_at > started_at:
             ends.append(completed_at)
-        elif wave.transfer_completed_virtual_at is not None:
-            ends.append(max(started_at, wave.transfer_completed_virtual_at))
+        elif terminal_at is not None and (terminal_at > started_at or has_prior_segment_before_terminal):
+            ends.append(max(started_at, terminal_at))
         elif float(logical_elapsed or 0) > 0:
             ends.append(started_at + timedelta(seconds=float(logical_elapsed)))
         else:
