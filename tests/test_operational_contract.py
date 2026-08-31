@@ -22,7 +22,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, Task, TaskState, TransferDispatchBatch, TransferLaneSegment, TransferQueueItem, TransferQueueState, Wave, WaveCreate, active_source_scope_conflicts, adaptive_restore_slot_limit, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, enqueue_available_transfer_objects, flight_board, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, transfer_queue, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, Task, TaskState, TransferDispatchBatch, TransferLaneSegment, TransferQueueItem, TransferQueueState, Wave, WaveCreate, active_source_scope_conflicts, adaptive_restore_slot_limit, automatic_dynamic_duration_limit, continuous_lane_capacity_profile, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, enqueue_available_transfer_objects, flight_board, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, transfer_queue, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, choose_cooperative_preemption_target, ensure_transfer_task, require_new_restore_approval, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -83,9 +83,14 @@ def test_source_selector_exposes_one_operational_status_per_source():
             Wave(id=902, source_id=transferring.id, name="transferring", max_bytes=1, restore_days=1, restore_tier="BULK", status="TRANSFERRING"),
             Wave(id=903, source_id=restoring.id, name="restoring", max_bytes=1, restore_days=1, restore_tier="BULK", status="RESTORING"),
         ])
+        session.add(DynamicPipelineRun(id=905, source_id=restoring.id, status="IN_PROGRESS", scheduled_restores=True))
         session.commit()
-        statuses = {row["name"]: row["operational_status"] for row in list_sources(session)}
+        rows = list_sources(session)
+        statuses = {row["name"]: row["operational_status"] for row in rows}
         assert statuses == {"discovered": "DISCOVERED", "queued": "QUEUED", "transferring": "TRANSFERRING", "restoring": "RESTORING"}
+        restoring_row = next(row for row in rows if row["name"] == "restoring")
+        assert restoring_row["inventory_status"] == "DISCOVERED"
+        assert restoring_row["pipeline_status"] == "IN_PROGRESS"
 
 
 def test_global_actionable_failure_banner_ignores_archived_sources():
@@ -641,6 +646,34 @@ def test_dynamic_wave_contract_keeps_prediction_and_scheduling_durable():
     assert payload.restore_days == 3
     assert automatic_dynamic_duration_limit(1) == (16 * 3600, 8 * 3600)
     assert automatic_dynamic_duration_limit(2) == (36 * 3600, 12 * 3600)
+
+
+def test_continuous_lane_history_is_aggregate_and_never_exceeds_link_cap():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    started = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
+    with Session() as session:
+        source = Source(id=950, name="lane-cap", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        wave = Wave(id=951, source_id=source.id, name="done", max_bytes=1, restore_days=1,
+                    restore_tier="BULK", status="COMPLETED")
+        obj = ObjectRecord(id=952, source_id=source.id, wave_id=wave.id, object_key="done.bin",
+                           size_bytes=20 * 1024**4, state=ObjectState.TRANSFERRED)
+        session.add_all([source, wave, obj]); session.flush()
+        item = TransferQueueItem(id=953, source_id=source.id, wave_id=wave.id, object_id=obj.id,
+                                 size_bytes=obj.size_bytes, state=TransferQueueState.TRANSFERRED)
+        session.add(item); session.flush()
+        # This deliberately represents historic malformed CONTROL evidence:
+        # 20 TiB looked like three hours.  It must not teach the planner that
+        # it may exceed its 1.1 Gbps physical contract.
+        session.add(TransferLaneSegment(source_id=source.id, wave_id=wave.id, queue_item_id=item.id,
+                                        started_at=started, completed_at=started + timedelta(hours=3),
+                                        bytes_transferred=obj.size_bytes))
+        session.flush()
+        profile = continuous_lane_capacity_profile(session, source.id, 1100)
+        assert profile["samples"] == 1
+        assert profile["p25_mbps"] > 1100
+        assert profile["effective_mbps"] == 1100
 
 
 def test_dynamic_planner_uses_scalar_boundaries_and_assigns_every_object_once():

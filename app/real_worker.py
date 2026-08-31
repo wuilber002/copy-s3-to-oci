@@ -2331,6 +2331,11 @@ def _continuous_source_now(source: Source) -> datetime:
     return utcnow()
 
 
+def _utc_timestamp(value: datetime) -> datetime:
+    """Normalize SQLite test rows without changing PostgreSQL UTC values."""
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
 def _raiju_host_capacity_factor() -> tuple[float, str]:
     """Return a conservative local capacity factor for lane autoscaling.
 
@@ -2394,12 +2399,20 @@ def _continuous_raiju_worker_count(session, source: Source, available_objects: i
     capped_request = max(floor, math.floor(requested * capacity_factor))
     chosen = min(RAIJU_MAX_WORKERS, available_objects, capped_request)
     if capacity_factor < 1:
-        event(
-            session,
-            "RAIJU_AUTOSCALE_HOST_GUARD",
-            f"Raikou limited Raiju expansion to {chosen}/{requested}: {capacity_reason}",
-            source_id=source.id,
+        message = f"Raikou limited Raiju expansion to {chosen}/{requested}: {capacity_reason}"
+        # This decision is evaluated on every dispatcher heartbeat.  Keep the
+        # evidence when it changes, but avoid turning a persistent capacity
+        # guard into an event flood that hides actual transfer failures.
+        latest = session.scalar(
+            select(Event).where(
+                Event.source_id == source.id,
+                Event.kind == "RAIJU_AUTOSCALE_HOST_GUARD",
+            ).order_by(Event.created_at.desc(), Event.id.desc()).limit(1)
         )
+        now = utcnow()
+        if (latest is None or latest.message != message or
+                (now - latest.created_at).total_seconds() >= 300):
+            event(session, "RAIJU_AUTOSCALE_HOST_GUARD", message, source_id=source.id)
     return chosen
 
 
@@ -2796,6 +2809,13 @@ def transfer_continuous(session, task: Task, settings) -> None:
         # keeping the aggregate stream rate at or below the configured link.
         futures: dict[object, tuple[int, int, int, float]] = {}
         segments: dict[int, TransferLaneSegment] = {}
+        # CONTROL calls complete in milliseconds, but represent hours of WAN
+        # occupancy.  Keep a virtual availability cursor per Raiju slot so
+        # their persisted segments form the same bounded shared lane that a
+        # real transfer would occupy.  The source clock remains held while
+        # I/O is decided, then advances by the lane makespan below.
+        virtual_lane_origin = _continuous_source_now(source) if runtime_context.is_simulation else None
+        virtual_slot_available: dict[int, datetime] = {}
         active_wave_counts: dict[int, int] = {}
         # target item id -> (reserved critical item id, Raiju slot).  The
         # successor is leased durably but is not submitted to the executor
@@ -2812,9 +2832,13 @@ def transfer_continuous(session, task: Task, settings) -> None:
 
         def submit(executor, item: TransferQueueItem, slot: int, rate: float, active_workers: int) -> None:
             item.last_dispatched_at = utcnow()
+            segment_started_at = (
+                virtual_slot_available.get(slot, virtual_lane_origin)
+                if runtime_context.is_simulation else _continuous_source_now(source)
+            )
             segment = TransferLaneSegment(
                 source_id=source.id, wave_id=item.wave_id, queue_item_id=item.id,
-                worker_slot=slot, started_at=_continuous_source_now(source),
+                worker_slot=slot, started_at=segment_started_at,
                 entry_reason=item.decision_reason or "continuous lane dispatch",
                 nearest_expiry_at=item.restore_expires_at,
             )
@@ -2847,7 +2871,8 @@ def transfer_continuous(session, task: Task, settings) -> None:
                 # period the Raiju actually occupied in the virtual world.
                 logical_elapsed = float(obj.transfer_elapsed_seconds or 0) if obj else 0
                 if runtime_context.is_simulation and logical_elapsed > 0:
-                    segment.completed_at = segment.started_at + timedelta(seconds=logical_elapsed)
+                    segment.completed_at = _utc_timestamp(segment.started_at) + timedelta(seconds=logical_elapsed)
+                    virtual_slot_available[segment.worker_slot] = segment.completed_at
                 else:
                     segment.completed_at = _continuous_source_now(source)
                 segment.bytes_transferred = int(obj.size_bytes if error is None and obj else 0)
@@ -3089,6 +3114,16 @@ def transfer_continuous(session, task: Task, settings) -> None:
             wave = session.get(Wave, wave_id)
             if wave:
                 wave.active_transfer_workers = 0
+        if runtime_context.is_simulation and virtual_lane_origin and virtual_slot_available:
+            virtual_lane_end = max(virtual_slot_available.values())
+            virtual_elapsed = max(0.0, (virtual_lane_end - virtual_lane_origin).total_seconds())
+            # Transfer consumes retention in Fujin exactly as it does on the
+            # WAN.  This replaces the former zero-time CONTROL illusion while
+            # still preventing wall-clock worker overhead from aging objects.
+            advance_simulation_clock(
+                session, source, virtual_elapsed,
+                "continuous transfer lane occupancy", anchor,
+            )
         reconcile_continuous_source_waves(session, source)
         refresh_transfer_queue_priorities(session, source.id, now=_continuous_source_now(source))
         session.commit()

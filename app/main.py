@@ -4339,6 +4339,14 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
             select(Wave.source_id, Wave.status).where(Wave.source_id.in_(source_ids))
         ):
             wave_statuses.setdefault(source_id, set()).add(str(status))
+    latest_pipeline_by_source: dict[int, DynamicPipelineRun] = {}
+    if source_ids:
+        for run in session.scalars(
+            select(DynamicPipelineRun)
+            .where(DynamicPipelineRun.source_id.in_(source_ids))
+            .order_by(DynamicPipelineRun.source_id, DynamicPipelineRun.id.desc())
+        ):
+            latest_pipeline_by_source.setdefault(run.source_id, run)
     total_rows = session.execute(
         select(ObjectRecord.source_id, func.count(ObjectRecord.id),
                func.coalesce(func.sum(case((ObjectRecord.state == ObjectState.VERIFIED, 1), else_=0)), 0),
@@ -4389,6 +4397,12 @@ def list_sources(session: Session = Depends(get_session)) -> list[dict]:
              "discovery_objects_inserted": s.discovery_objects_inserted,
              "last_discovery_mode": s.last_discovery_mode, "discovery_generation": s.discovery_generation,
              "discovery_can_resume": bool(s.discovery_continuation_token), "archived_at": s.archived_at,
+             # Inventory and migration are separate lifecycles.  In
+             # particular, DISCOVERED means the inventory is ready; it must
+             # not make an active continuous pipeline look idle.
+             "inventory_status": s.status,
+             "pipeline_status": (latest_pipeline_by_source[s.id].status
+                                 if s.id in latest_pipeline_by_source else "NOT_STARTED"),
              "destination_validation": {"status": s.destination_validation_status, "at": s.destination_validation_at,
                                         "missing": s.destination_missing_count, "size_mismatches": s.destination_size_mismatch_count},
              "migration_status": migration_status(s), "operational_status": operational_status(s),
@@ -4939,7 +4953,14 @@ def source_summary(source_id: int, session: Session = Depends(get_session)) -> d
     delivery_verified = session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.source_id == source_id, ObjectRecord.delivery_integrity_status == "OCI_ACCEPTED")) or 0
     all_transferred = (states.get(ObjectState.TRANSFERRED, 0) + states.get(ObjectState.VERIFIED, 0)) == count
     migration_status = "DESTINATION_DIVERGENT" if source.destination_validation_status == "DIFFERENT" else "COMPLETED" if source.status == "DISCOVERED" and count and (states.get(ObjectState.VERIFIED, 0) == count or (all_transferred and delivery_verified == count)) else "AWAITING_INTEGRITY_VERIFICATION" if source.status == "DISCOVERED" and count and all_transferred else "IN_PROGRESS" if count else "NOT_STARTED"
+    pipeline = session.scalar(
+        select(DynamicPipelineRun).where(DynamicPipelineRun.source_id == source_id)
+        .order_by(DynamicPipelineRun.id.desc()).limit(1)
+    )
     return {"source_id": source_id, "objects": count, "bytes": bytes_total, "object_states": states, "migration_status": migration_status,
+            "pipeline": {"status": pipeline.status if pipeline else "NOT_STARTED",
+                         "run_id": pipeline.id if pipeline else None,
+                         "scheduled_restores": bool(pipeline.scheduled_restores) if pipeline else False},
             "destination_validation": {"status": source.destination_validation_status, "at": source.destination_validation_at,
                                        "missing": source.destination_missing_count, "size_mismatches": source.destination_size_mismatch_count,
                                        "metadata_mismatches": source.destination_metadata_mismatch_count, "extras": source.destination_extra_count,
@@ -5311,6 +5332,80 @@ def percentile_75(values: list[float]) -> float:
     return ordered[min(len(ordered) - 1, math.ceil(len(ordered) * .75) - 1)]
 
 
+def percentile_25(values: list[float]) -> float:
+    """Conservative lower-quartile for a small set of lane observations."""
+    ordered = sorted(value for value in values if value > 0)
+    if not ordered:
+        return 0.0
+    return ordered[max(0, math.ceil(len(ordered) * .25) - 1)]
+
+
+def continuous_lane_capacity_profile(session: Session, source_id: int,
+                                     configured_mbps: int) -> dict:
+    """Return measured aggregate capacity of the durable transfer lane.
+
+    Object elapsed time is deliberately *not* used here.  It is worker work,
+    while the lane needs wall time: with five Raijus, summing object durations
+    can turn one saturated link hour into five hours (or much more after
+    autoscaling).  A completed wave provides one independent lane sample.
+    The configured limit is a hard ceiling even when historic CONTROL data
+    predates virtual-lane serialization and looks faster than the link.
+    """
+    rows = session.execute(
+        select(
+            TransferLaneSegment.wave_id,
+            TransferLaneSegment.started_at,
+            TransferLaneSegment.completed_at,
+            TransferLaneSegment.bytes_transferred,
+            Wave.transfer_completed_virtual_at,
+        )
+        .join(Wave, Wave.id == TransferLaneSegment.wave_id)
+        .where(TransferLaneSegment.source_id == source_id)
+        .order_by(TransferLaneSegment.wave_id, TransferLaneSegment.started_at)
+    )
+    by_wave: dict[int, dict] = {}
+    for wave_id, started_at, completed_at, transferred_bytes, terminal_at in rows:
+        if not started_at or not transferred_bytes:
+            continue
+        item = by_wave.setdefault(wave_id, {"starts": [], "ends": [], "bytes": 0, "terminal": terminal_at})
+        item["starts"].append(started_at)
+        if completed_at and completed_at > started_at:
+            item["ends"].append(completed_at)
+        item["bytes"] += int(transferred_bytes or 0)
+    rates: list[float] = []
+    for item in by_wave.values():
+        starts, ends, terminal = item["starts"], item["ends"], item["terminal"]
+        if terminal and (not ends or terminal > max(ends)):
+            ends.append(terminal)
+        if not starts or not ends:
+            continue
+        elapsed = (max(ends) - min(starts)).total_seconds()
+        if elapsed <= 0 or item["bytes"] <= 0:
+            continue
+        rates.append(item["bytes"] * 8 / elapsed / 1_000_000)
+    observed = percentile_25(rates)
+    ceiling = max(1.0, float(configured_mbps))
+    return {
+        "samples": len(rates),
+        "p25_mbps": observed,
+        # A historic observation never authorizes a plan above the link cap.
+        "effective_mbps": min(ceiling, observed) if observed else ceiling,
+    }
+
+
+def predicted_continuous_lane_seconds(bytes_total: int, predicted_worker_seconds: float,
+                                      settings: "RuntimeSettings", lane_profile: dict) -> float:
+    """Estimate elapsed lane time without multiplying parallel Raiju work."""
+    rate_mbps = max(1.0, float(lane_profile.get("effective_mbps") or settings.max_throughput_mbps))
+    link_seconds = bytes_total * 8 / (rate_mbps * 1_000_000)
+    if lane_profile.get("samples", 0):
+        # The measured lane is authoritative once it exists.  Per-object
+        # logical durations remain useful for diagnostics, never as a second
+        # serial bottleneck in an autoscaled continuous lane.
+        return link_seconds + 30
+    return max(link_seconds, predicted_worker_seconds / RAIJU_MIN_WORKERS) + 30
+
+
 def transfer_history_profiles(session: Session, source_id: int, multipart_part_size_mib: int) -> dict[str, dict]:
     """Return durable P75 per-object elapsed observations for one source.
 
@@ -5374,6 +5469,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
     """Build, but do not persist, deterministic groups for the dynamic planner."""
     settings = runtime_settings(session)
     profiles = transfer_history_profiles(session, source_id, settings.multipart_part_size_mib)
+    lane_profile = continuous_lane_capacity_profile(session, source_id, settings.max_throughput_mbps)
     waves: list[dict] = []
     current_count = 0
     bytes_total = predicted_sum = sample_count = 0
@@ -5384,8 +5480,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
             return
         # Individual estimates represent worker time. Wall time is bounded by
         # aggregate throughput and by worker parallelism, plus a small setup.
-        link_seconds = bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000)
-        wall_seconds = max(link_seconds, predicted_sum / RAIJU_MIN_WORKERS) + 30
+        wall_seconds = predicted_continuous_lane_seconds(bytes_total, predicted_sum, settings, lane_profile)
         waves.append({"bytes": bytes_total, "object_count": current_count,
                       "predicted_transfer_seconds": math.ceil(wall_seconds), "prediction_samples": sample_count,
                       "exclusive": exclusive})
@@ -5399,8 +5494,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
         projected_bytes = bytes_total + size_bytes
         projected_count = current_count + 1
         projected_sum = predicted_sum + predicted
-        projected_wall = max(projected_bytes * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-                             projected_sum / RAIJU_MIN_WORKERS) + 30
+        projected_wall = predicted_continuous_lane_seconds(projected_bytes, projected_sum, settings, lane_profile)
         exceeds = projected_bytes > max_bytes or projected_count > max_objects or projected_wall > target_transfer_seconds
         if current_count and exceeds:
             flush()
@@ -5409,8 +5503,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
             # it is never silently skipped.
             current_count = 1
             bytes_total, predicted_sum, sample_count = size_bytes, predicted, samples
-            one_wall = max(bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-                           predicted_sum / RAIJU_MIN_WORKERS) + 30
+            one_wall = predicted_continuous_lane_seconds(bytes_total, predicted_sum, settings, lane_profile)
             if bytes_total > max_bytes or one_wall > target_transfer_seconds:
                 flush(exclusive=True)
             continue
@@ -5419,7 +5512,7 @@ def dynamic_wave_plan(session: Session, source_id: int, max_bytes: int, target_t
         # count as a confidence indicator; do not inflate it per object.
         bytes_total, predicted_sum, sample_count = projected_bytes, projected_sum, max(sample_count, samples)
     flush()
-    return {"waves": waves, "profiles": profiles, "settings": settings}
+    return {"waves": waves, "profiles": profiles, "lane_profile": lane_profile, "settings": settings}
 
 
 def next_dynamic_wave_plan(session: Session, source_id: int, max_bytes: int,
@@ -5433,6 +5526,7 @@ def next_dynamic_wave_plan(session: Session, source_id: int, max_bytes: int,
     """
     settings = runtime_settings(session)
     profiles = transfer_history_profiles(session, source_id, settings.multipart_part_size_mib)
+    lane_profile = continuous_lane_capacity_profile(session, source_id, settings.max_throughput_mbps)
     object_count = bytes_total = prediction_samples = 0
     predicted_sum = 0.0
     rows = session.execute(select(ObjectRecord.size_bytes).where(
@@ -5443,10 +5537,7 @@ def next_dynamic_wave_plan(session: Session, source_id: int, max_bytes: int,
         projected_bytes = bytes_total + size_bytes
         projected_count = object_count + 1
         projected_sum = predicted_sum + predicted
-        projected_wall = max(
-            projected_bytes * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-            projected_sum / RAIJU_MIN_WORKERS,
-        ) + 30
+        projected_wall = predicted_continuous_lane_seconds(projected_bytes, projected_sum, settings, lane_profile)
         if object_count and (
             projected_bytes > max_bytes or projected_count > max_objects or projected_wall > target_transfer_seconds
         ):
@@ -5461,10 +5552,7 @@ def next_dynamic_wave_plan(session: Session, source_id: int, max_bytes: int,
                      "prediction_samples": prediction_samples, "exclusive": True}, profiles, settings)
     if not object_count:
         return None, profiles, settings
-    wall_seconds = max(
-        bytes_total * 8 / max(1, settings.max_throughput_mbps * 1_000_000),
-        predicted_sum / RAIJU_MIN_WORKERS,
-    ) + 30
+    wall_seconds = predicted_continuous_lane_seconds(bytes_total, predicted_sum, settings, lane_profile)
     return ({"bytes": bytes_total, "object_count": object_count,
              "predicted_transfer_seconds": math.ceil(wall_seconds),
              "prediction_samples": prediction_samples, "exclusive": False}, profiles, settings)

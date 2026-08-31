@@ -181,6 +181,12 @@ def test_real_workers_complete_simulated_discovery_restore_and_transfer(tmp_path
         assert all(item.delivery_integrity_status == "OCI_ACCEPTED" for item in objects)
         assert all(item.delivery_integrity_checksum for item in objects)
         assert all(item.transfer_progress_bytes == item.size_bytes for item in objects)
+        # Fujin must account for lane occupancy in its source-owned clock;
+        # otherwise a fast local worker would make a real transfer consume no
+        # virtual retention time and collapse the flight-board evidence.
+        assert wave.transfer_started_virtual_at is not None
+        assert wave.transfer_completed_virtual_at is not None
+        assert wave.transfer_completed_virtual_at > wave.transfer_started_virtual_at
 
     execution_status = SimulatorAdminClient(base_url).get_execution(execution.id)
     assert execution_status["state"] == "SUCCEEDED"
