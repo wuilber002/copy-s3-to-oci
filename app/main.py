@@ -3607,7 +3607,6 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
                 "source_name": source_name}
     run_ids = [wave.pipeline_run_id for wave, _ in rows if wave.pipeline_run_id is not None]
     runs = list(session.scalars(select(DynamicPipelineRun).where(DynamicPipelineRun.id.in_(run_ids)))) if run_ids else []
-    runs_by_id = {run.id: run for run in runs}
     for run in runs:
         refresh_dynamic_pipeline_run(session, run)
     if runs:
@@ -3731,47 +3730,13 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
                                      elapsed_seconds=restore_progress_seconds)
             if forecast_restore:
                 phases.append(forecast_restore)
-        # A forecast from an earlier planning pass is never allowed to put a
-        # transfer before the restore data is usable.  For progressive
-        # transfer the first available object opens the lane; otherwise only
-        # the final available object does.  This normalization is also what
-        # keeps old persisted plans readable after a scheduler recalculation.
-        readiness_at = (
-            first_available_at if wave.transfer_release_policy == "AS_OBJECTS_AVAILABLE"
-            else available_at
-        ) or expected_available_at
+        # The continuous lane is event driven.  A future transfer window is
+        # not a meaningful forecast: files are admitted as soon as they are
+        # restored and the scheduler can reprioritize them at every free Raiju
+        # slot.  Therefore this board never synthesizes a blue segment from a
+        # wave plan.  Only the durable TransferLaneSegment records created at
+        # actual dispatch time are allowed to draw transfer activity.
         planned_transfer_at = wave.planned_transfer_start_at
-        if readiness_at and planned_transfer_at:
-            planned_transfer_at = max(readiness_at, planned_transfer_at)
-        elif readiness_at:
-            planned_transfer_at = readiness_at
-        if not transfer_started_at and readiness_at and planned_transfer_at:
-            run = runs_by_id.get(wave.pipeline_run_id)
-            ready = phase("BUFFER", readiness_at, planned_transfer_at,
-                          planned=not bool(first_available_at or available_at),
-                          expected_seconds=int(run.restore_safety_seconds or 0) if run else None)
-            if ready:
-                phases.append(ready)
-        transfer_start = transfer_started_at or planned_transfer_at
-        transfer_start_inferred = False
-        # Older simulated executions persisted the completion milestone but
-        # not the start milestone. Keep their timeline readable: the observed
-        # finish plus the durable prediction yields a bounded inferred start.
-        if transfer_completed_at and (
-            not transfer_started_at or transfer_completed_at <= transfer_started_at
-        ):
-            transfer_start = transfer_completed_at - timedelta(
-                seconds=max(1, int(wave.predicted_transfer_seconds or 1))
-            )
-            transfer_start_inferred = True
-        if transfer_started_at and not transfer_start_inferred:
-            transfer_end = transfer_completed_at or effective_now
-        elif transfer_completed_at:
-            transfer_end = transfer_completed_at
-        elif transfer_start:
-            transfer_end = transfer_start + timedelta(seconds=max(1, int(wave.predicted_transfer_seconds or 0)))
-        else:
-            transfer_end = None
         observed_segments = segments_by_wave.get(wave.id, [])
         if observed_segments:
             for segment in observed_segments:
@@ -3784,12 +3749,6 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
                                    nearest_expiry_at=segment.nearest_expiry_at)
                 if item_phase:
                     phases.append(item_phase)
-        else:
-            transfer = phase("TRANSFER", transfer_start, transfer_end,
-                             planned=not bool(transfer_started_at or transfer_completed_at),
-                             expected_seconds=max(1, int(wave.predicted_transfer_seconds or 0)))
-            if transfer:
-                phases.append(transfer)
         status = wave.status
         if transfer_started_at and not transfer_completed_at:
             status = "TRANSFERRING"
@@ -3805,11 +3764,13 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             "completed_at": transfer_completed_at if status in {"COMPLETED", "VERIFIED", "TRANSFERRED"} else None,
             "planned_restore_at": wave.planned_restore_at,
             "expected_restore_available_at": expected_available_at,
+            # Retained only as a durable scheduler datum for APIs and reports;
+            # it is deliberately not rendered as transfer work on this board.
             "planned_transfer_start_at": planned_transfer_at,
             "transfer_started_at": transfer_started_at,
             "transfer_completed_at": transfer_completed_at,
-            "transfer_effective_start_at": transfer_start,
-            "transfer_start_inferred": transfer_start_inferred,
+            "transfer_effective_start_at": transfer_started_at,
+            "transfer_start_inferred": False,
             "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
             "phases": phases,
         })

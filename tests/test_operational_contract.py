@@ -22,7 +22,7 @@ os.environ.setdefault("OCI_RUNTIME_CONFIG_FILE", "/tmp/raijin-test-oci-runtime.j
 
 from datetime import datetime, timedelta, timezone
 
-from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, Task, TaskState, TransferDispatchBatch, TransferLaneSegment, TransferQueueItem, TransferQueueState, Wave, WaveCreate, active_source_scope_conflicts, adaptive_restore_slot_limit, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, enqueue_available_transfer_objects, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, transfer_queue, wave_cost_estimate
+from app.main import AWS_CONNECTION_SCHEMA_VERSION, AwsConnection, Base, CostPricing, CostPricingUpdate, DiscoveryChange, DiscoveryJob, DynamicPipelineRun, DynamicWaveCreate, Event, GlobalAwsPricing, LegacySourceConnectionMigration, OCI_VAULT_SECRET_SEARCH_QUERY, ObjectRecord, ObjectState, RestoreAttempt, RestoreObjectResult, RuntimeSettings, RuntimeSettingsUpdate, Source, SourcePrefix, Task, TaskState, TransferDispatchBatch, TransferLaneSegment, TransferQueueItem, TransferQueueState, Wave, WaveCreate, active_source_scope_conflicts, adaptive_restore_slot_limit, automatic_dynamic_duration_limit, create_dynamic_waves, delete_unexecuted_source_data, destination_provenance_matches, dynamic_schedule_times, dynamic_wave_plan, enqueue_available_transfer_objects, flight_board, internal_rate_value, list_sources, materialize_dynamic_pipeline_horizon, normalize_source_prefixes, observability, operations_overview, parse_aws_connection_payload, percentile_75, predict_object_transfer_seconds, prometheus_metrics, public_rate_value, public_s3_rates_from_catalog, public_transfer_rates_from_catalog, refresh_dynamic_pipeline_run, release_dynamic_restore_horizon, replan_dynamic_pipeline, restore_availability_poll_delay_seconds, restore_queue_details, restore_result_diagnostics, safe_aws_error_summary, safe_oci_error_summary, source_key_in_scope, transfer_queue, wave_cost_estimate
 from app.real_worker import GOVERNANCE_TASK_KINDS, TRANSFER_TASK_KINDS, choose_cooperative_preemption_target, ensure_transfer_task, require_new_restore_approval, restore_expiry_from_head_response, restored_from_head_response, restored_pending_archives_from_head, should_poll_restore_with_head, task_kinds_for_role, validate_restore_preflight
 
 
@@ -705,7 +705,7 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert '@app.get("/api/flight-board")' in source
     assert '@app.get("/api/flight-board/availability")' in source
     assert 'Wave.planner_mode == "DYNAMIC"' in source
-    assert '"QUEUE"' in source and '"RESTORE"' in source and '"BUFFER"' in source and '"TRANSFER"' in source
+    assert '"QUEUE"' in source and '"RESTORE"' in source and '"TRANSFER"' in source
     assert 'id="flight-board-button"' in frontend
     assert 'function showFlightBoard()' in frontend
     assert 'flight-board-legend' in frontend
@@ -726,8 +726,51 @@ def test_dynamic_flight_board_uses_local_planned_and_actual_wave_timing():
     assert 'lane_start = max(lane_start, restore_floor)' in source
     assert '"transfer_lane": {"enabled": True, "phases": transfer_lane_phases}' in source
     assert 'transfer_lane_phases.append({' in source
+    assert 'Only the durable TransferLaneSegment records created at' in source
+    assert 'transfer = phase("TRANSFER", transfer_start, transfer_end,' not in source
     assert 'simulation_transfer_task_active(session, wave)' in Path("app/real_worker.py").read_text()
     assert 'synchronize_simulation_source_clocks(session)' in Path("app/real_worker.py").read_text()
+
+
+def test_flight_board_continuous_lane_uses_only_observed_transfer_segments():
+    """Restore plans must never paint future transfer work in the shared lane."""
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    with Session() as session:
+        source = Source(name="lane-evidence", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        session.add(source); session.flush()
+        observed = Wave(
+            source_id=source.id, name="observed", max_bytes=1024, restore_days=1,
+            restore_tier="BULK", planner_mode="DYNAMIC", status="TRANSFERRING",
+            planned_restore_at=now - timedelta(hours=2), planned_transfer_start_at=now - timedelta(hours=1),
+        )
+        planned_only = Wave(
+            source_id=source.id, name="planned-only", max_bytes=1024, restore_days=1,
+            restore_tier="BULK", planner_mode="DYNAMIC", status="RESTORE_SCHEDULED",
+            planned_restore_at=now + timedelta(hours=1), planned_transfer_start_at=now + timedelta(hours=49),
+        )
+        session.add_all([observed, planned_only]); session.flush()
+        obj = ObjectRecord(source_id=source.id, wave_id=observed.id, object_key="observed.bin", size_bytes=1024, state=ObjectState.TRANSFERRING)
+        session.add(obj); session.flush()
+        item = TransferQueueItem(source_id=source.id, wave_id=observed.id, object_id=obj.id, size_bytes=1024)
+        session.add(item); session.flush()
+        segment = TransferLaneSegment(
+            source_id=source.id, wave_id=observed.id, queue_item_id=item.id,
+            started_at=now - timedelta(minutes=7), completed_at=now - timedelta(minutes=2),
+            bytes_transferred=1024, object_count=1,
+        )
+        session.add(segment); session.commit()
+
+        board = flight_board(source_id=source.id, run_id=None, session=session)
+
+        lane = board["transfer_lane"]["phases"]
+        assert len(lane) == 1
+        assert lane[0]["wave_name"] == "observed"
+        assert lane[0]["planned"] is False
+        by_name = {wave["wave_name"]: wave for wave in board["waves"]}
+        assert not [phase for phase in by_name["planned-only"]["phases"] if phase["kind"] == "TRANSFER"]
 
 
 def test_simulation_clock_advances_only_through_durable_decisions():
