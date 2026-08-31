@@ -73,12 +73,17 @@ no modo isolado, delega as integrações simuladas ao FUJIN.
 - O Raikou prioriza objetos já legíveis por expiração, duração prevista,
   viabilidade dentro da janela, tamanho e proteção contra starvation. Lotes
   normais têm até 100 objetos ou 1 GiB; urgências críticas usam micro-lotes de
-  até 20 objetos ou 256 MiB e fazem preempção cooperativa somente entre objetos
-  ou partes multipart seguras. Cada lote de despacho, motivo, prioridade,
-  capacidade Raiju e intervalo executado ficam persistidos para auditoria. A
-  cada vaga Raiju liberada, a prioridade e a capacidade são recalculadas e a
-  parcela livre do limite de throughput é distribuída sem interromper I/O em
-  curso. Somente waves sem submissão AWS podem ser
+  até 20 objetos ou 256 MiB. Em urgência crítica, o Raikou reserva o próximo
+  slot seguro para o item crítico e o Raiju selecionado conclui o **objeto
+  atual** antes do handoff; nunca há interrupção de streaming ou de multipart
+  em andamento. Reserva, sucessor, motivo e execução do handoff são duráveis
+  e auditáveis. Cada lote de despacho, prioridade, capacidade Raiju e intervalo
+  executado também ficam persistidos. A cada vaga Raiju liberada, a prioridade
+  e a capacidade são recalculadas e a parcela livre do limite de throughput é
+  distribuída sem interromper I/O em curso. A admissão, a atualização de
+  prioridade, o claim e a recuperação de leases usam páginas delimitadas, para
+  que uma source com milhões de objetos não seja carregada integralmente em
+  memória. Somente waves sem submissão AWS podem ser
   reempacotadas ou ter horários alterados; Batch Jobs aceitos permanecem como
   evidência e não são recriados automaticamente.
 - A transferência interna inicia com cinco **Raijus**, aumenta ou reduz a

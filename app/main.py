@@ -42,6 +42,13 @@ from app.runtime_context import RAIJIN_SERVICE_VERSION, SIMULATOR_SERVICE_VERSIO
 from app.simulator_admin import SimulatorAdminClient, SimulatorAdminError
 
 RAIJU_MIN_WORKERS = 5
+# The continuous lane must stay bounded even when a source contains millions
+# of restored objects.  These are intentionally internal implementation
+# pages, not operator-facing batch limits: Raikou still dispatches only the
+# configured 100/20-object batches.
+TRANSFER_LANE_ADMISSION_PAGE_SIZE = 1_000
+TRANSFER_LANE_PRIORITY_REFRESH_PAGE_SIZE = 1_000
+TRANSFER_LANE_CLAIM_CANDIDATE_PAGE_SIZE = 256
 
 
 def utcnow() -> datetime:
@@ -618,6 +625,11 @@ class TransferQueueItem(Base):
     retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     dispatch_batch_id: Mapped[int | None] = mapped_column(ForeignKey("transfer_dispatch_batches.id"), nullable=True, index=True)
     preemption_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    # A critical item can be reserved for the Raiju that is closest to a safe
+    # object boundary.  Both sides are durable so a process restart cannot
+    # turn a cooperative handoff into an invisible best-effort decision.
+    preemption_successor_item_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True, index=True)
+    preemption_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     decision_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     priority_details_json: Mapped[str] = mapped_column(Text, default="{}")
     last_dispatched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
@@ -1321,6 +1333,8 @@ def create_schema() -> None:
         lane_columns = {
             "dispatch_batch_id": "BIGINT",
             "preemption_cooldown_until": "TIMESTAMP WITH TIME ZONE",
+            "preemption_successor_item_id": "BIGINT",
+            "preemption_requested_at": "TIMESTAMP WITH TIME ZONE",
         }
         for column, sql_type in lane_columns.items():
             if column not in existing_lane_columns:
@@ -1633,22 +1647,42 @@ def enqueue_available_transfer_objects(session: Session, wave: Wave,
     """
     settings = runtime_settings(session)
     observed_at = observed_at or utcnow()
-    restored = list(session.scalars(select(ObjectRecord).where(
-        ObjectRecord.wave_id == wave.id,
-        ObjectRecord.state == ObjectState.RESTORED,
-    )))
+    # Never materialize an entire restored wave in Python. A large Deep
+    # Archive wave can release millions of objects over time; each Raikou pass
+    # admits one bounded page and the next pass continues idempotently.
+    queued_object = aliased(TransferQueueItem)
+    restored = list(session.scalars(
+        select(ObjectRecord)
+        .outerjoin(
+            queued_object,
+            and_(queued_object.wave_id == ObjectRecord.wave_id,
+                 queued_object.object_id == ObjectRecord.id),
+        )
+        .where(
+            ObjectRecord.wave_id == wave.id,
+            ObjectRecord.state == ObjectState.RESTORED,
+            queued_object.id.is_(None),
+        )
+        .order_by(ObjectRecord.id)
+        .limit(TRANSFER_LANE_ADMISSION_PAGE_SIZE)
+    ))
     if not restored:
         return 0
-    existing_ids = set(session.scalars(select(TransferQueueItem.object_id).where(
-        TransferQueueItem.wave_id == wave.id,
-        TransferQueueItem.object_id.in_([obj.id for obj in restored]),
-    )))
     created = 0
-    total_wave_objects = max(1, session.scalar(select(func.count(ObjectRecord.id)).where(ObjectRecord.wave_id == wave.id)) or 1)
-    restored_ratio = len(restored) / total_wave_objects
+    # The page size must not distort the availability signal.  Calculate the
+    # whole-wave ratio inside PostgreSQL rather than treating this 1,000-row
+    # admission page as the complete observed availability of a large wave.
+    total_wave_objects, available_wave_objects = session.execute(
+        select(
+            func.count(ObjectRecord.id),
+            func.coalesce(func.sum(case((ObjectRecord.state.in_([
+                ObjectState.RESTORED, ObjectState.TRANSFERRING,
+                ObjectState.TRANSFERRED, ObjectState.VERIFIED,
+            ]), 1), else_=0)), 0),
+        ).where(ObjectRecord.wave_id == wave.id)
+    ).one()
+    restored_ratio = int(available_wave_objects or 0) / max(1, int(total_wave_objects or 0))
     for obj in restored:
-        if obj.id in existing_ids:
-            continue
         score, band, reason, details = transfer_priority(
             obj.restore_expires_at, float(obj.planned_transfer_seconds or 0), settings, observed_at,
             wave_available_ratio=restored_ratio, source_business_priority=wave.source.business_priority,
@@ -1692,7 +1726,20 @@ def refresh_transfer_queue_priorities(session: Session, source_id: int | None = 
     reference_now = now or utcnow()
     if reference_now.tzinfo is None:
         reference_now = reference_now.replace(tzinfo=timezone.utc)
-    items = list(session.scalars(query))
+    # A priority refresh happens before every free Raiju slot. Refreshing all
+    # source rows would eventually turn a 100-object dispatch into a full
+    # queue scan. The order gives expiry precedence even if an old score has
+    # not been refreshed in this pass; the bounded page then recalculates the
+    # candidates that can actually be claimed next.
+    items = list(session.scalars(
+        query.order_by(
+            TransferQueueItem.restore_expires_at.is_(None),
+            TransferQueueItem.restore_expires_at,
+            TransferQueueItem.priority_score.desc(),
+            TransferQueueItem.available_at,
+            TransferQueueItem.id,
+        ).limit(TRANSFER_LANE_PRIORITY_REFRESH_PAGE_SIZE)
+    ))
     if not items:
         return 0
     wave_ids = {item.wave_id for item in items}
@@ -3169,6 +3216,12 @@ def restore_timing(session: Session, wave_id: int) -> dict:
 
 def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Session | None = None) -> dict:
     """Safe, local-only restore diagnostics used by the dashboard queue API."""
+    task_created_at = task.created_at
+    if task_created_at and task_created_at.tzinfo is None:
+        # SQLite test/local runtimes can return a naive value for a timezone
+        # column. The durable timestamp is UTC, so normalize before deriving
+        # the display-only wait duration.
+        task_created_at = task_created_at.replace(tzinfo=timezone.utc)
     attempt = session.scalar(select(RestoreAttempt).where(
         RestoreAttempt.wave_id == wave.id
     ).order_by(RestoreAttempt.id.desc()).limit(1)) if session is not None else None
@@ -3183,7 +3236,7 @@ def restore_queue_details(wave: Wave, task: Task, now: datetime, session: Sessio
         "last_poll_at": wave.last_poll_at,
         "poll_count": int(wave.poll_count or 0),
         "next_attempt_at": task.available_at if task.state == TaskState.READY else None,
-        "waiting_seconds": max(0, int((now - task.created_at).total_seconds())) if task.kind in {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE"} else 0,
+        "waiting_seconds": max(0, int((now - task_created_at).total_seconds())) if task_created_at and task.kind in {"SUBMIT_BATCH_RESTORE", "POLL_RESTORE"} else 0,
         "last_error": task.error,
         "availability_poll_interval_seconds": restore_availability_poll_delay_seconds(
             attempt.completed_at if attempt else None, now, wave.restore_tier,
@@ -3234,17 +3287,6 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
         if previous is None or score > previous_score:
             by_wave[task.wave_id] = task
 
-    def elapsed_seconds(objects: list[ObjectRecord]) -> int:
-        elapsed = 0.0
-        for obj in objects:
-            value = float(obj.transfer_elapsed_seconds or 0)
-            # Waves created before the accumulated-duration field retain an
-            # accurate useful fallback from their recorded start/end stamps.
-            if value <= 0 and obj.transfer_started_at and obj.transferred_at:
-                value = max(0, (obj.transferred_at - obj.transfer_started_at).total_seconds())
-            elapsed += value
-        return int(elapsed)
-
     # A continuous dispatcher is source-scoped, while queue ownership remains
     # object/wave-scoped.  Include every wave that has durable lane work even
     # when the current dispatcher happens to be anchored to another wave.
@@ -3283,6 +3325,41 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
     wave_models = {
         wave.id: wave for wave in session.scalars(select(Wave).where(Wave.id.in_(wave_ids)))
     } if wave_ids else {}
+    # The queue dashboard is a read model. Do not load every object in every
+    # active wave merely to render a handful of totals; a 10 TB wave may have
+    # millions of rows. In-flight object detail is bounded by the Raiju pool.
+    object_totals = {
+        int(wave_id): {
+            "total_files": int(total_files or 0),
+            "transferred_files": int(transferred_files or 0),
+            "total_bytes": int(total_bytes or 0),
+            "transferred_bytes": int(transferred_bytes or 0),
+            "elapsed_seconds": int(elapsed or 0),
+        }
+        for wave_id, total_files, transferred_files, total_bytes, transferred_bytes, elapsed in session.execute(
+            select(
+                ObjectRecord.wave_id,
+                func.count(ObjectRecord.id),
+                func.coalesce(func.sum(case((ObjectRecord.state.in_([
+                    ObjectState.TRANSFERRED, ObjectState.VERIFIED,
+                ]), 1), else_=0)), 0),
+                func.coalesce(func.sum(ObjectRecord.size_bytes), 0),
+                func.coalesce(func.sum(case((ObjectRecord.state.in_([
+                    ObjectState.TRANSFERRED, ObjectState.VERIFIED,
+                ]), ObjectRecord.size_bytes), else_=0)), 0),
+                func.coalesce(func.sum(ObjectRecord.transfer_elapsed_seconds), 0),
+            ).where(ObjectRecord.wave_id.in_(wave_ids)).group_by(ObjectRecord.wave_id)
+        )
+    } if wave_ids else {}
+    in_flight_by_wave: dict[int, list[ObjectRecord]] = {}
+    if wave_ids:
+        for obj in session.scalars(
+            select(ObjectRecord).where(
+                ObjectRecord.wave_id.in_(wave_ids),
+                ObjectRecord.state == ObjectState.TRANSFERRING,
+            ).order_by(ObjectRecord.wave_id, ObjectRecord.id)
+        ):
+            in_flight_by_wave.setdefault(int(obj.wave_id), []).append(obj)
     waves = []
     for wave_id in wave_ids:
         task = by_wave.get(wave_id)
@@ -3290,10 +3367,23 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
         if wave is None:
             continue
         lane = lane_by_wave.get(wave_id, {})
-        objects = list(session.scalars(select(ObjectRecord).where(ObjectRecord.wave_id == wave.id).order_by(ObjectRecord.id)))
-        completed = [obj for obj in objects if obj.state in {ObjectState.TRANSFERRED, ObjectState.VERIFIED}]
-        in_flight = [obj for obj in objects if obj.state == ObjectState.TRANSFERRING]
+        totals = object_totals.get(wave.id, {})
+        in_flight = in_flight_by_wave.get(wave.id, [])
         active = bool(lane.get("states", {}).get(TransferQueueState.LEASED))
+        # Task state describes the worker lease (READY/RUNNING); it is not the
+        # lifecycle state of the wave.  Keep both in the API so a queued poll
+        # cannot visually downgrade a submitted restore from RESTORING to
+        # READY in the operator console.
+        if active:
+            operational_state = "RESTORE + TRANSFER" if wave.status == "RESTORING" else "TRANSFERRING"
+        elif wave.status in {"RESTORE_REQUESTED", "RESTORE_REQUEST_ACCEPTED", "RESTORING"}:
+            operational_state = "RESTORING"
+        elif wave.status == "RESTORE_SCHEDULED":
+            operational_state = "RESTORE SCHEDULED"
+        elif wave.status == "RESTORED":
+            operational_state = "READY FOR TRANSFER"
+        else:
+            operational_state = wave.status
         workers = []
         capacity = RAIJU_MIN_WORKERS
         for slot in range(capacity):
@@ -3310,6 +3400,7 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
         waves.append({
             "wave_id": wave.id, "wave_name": wave.name, "source_id": wave.source_id, "source_name": wave.source.name,
             "status": wave.status,
+            "operational_state": operational_state,
             "task_kind": "TRANSFER_CONTINUOUS" if lane and active else (task.kind if task else "TRANSFER_CONTINUOUS"),
             "task_state": (TaskState.RUNNING if active else (task.state if task else TaskState.READY)),
             "available_at": lane.get("available_at") or (task.available_at if task else wave.planned_transfer_start_at) or now,
@@ -3324,10 +3415,10 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
                 "next_attempt_at": None, "waiting_seconds": 0, "last_error": None,
                 "earliest_expiry_at": lane.get("earliest_expiry_at"),
             },
-            "transferred_files": len(completed), "total_files": len(objects),
-            "transferred_bytes": sum(obj.size_bytes for obj in completed),
-            "total_bytes": sum(obj.size_bytes for obj in objects),
-            "elapsed_seconds": elapsed_seconds(objects), "workers": workers if active else [],
+            "transferred_files": totals.get("transferred_files", 0), "total_files": totals.get("total_files", 0),
+            "transferred_bytes": totals.get("transferred_bytes", 0),
+            "total_bytes": totals.get("total_bytes", 0),
+            "elapsed_seconds": totals.get("elapsed_seconds", 0), "workers": workers if active else [],
             "continuous_lane": lane,
         })
     waves.sort(key=lambda item: (not item["active"], item["available_at"], item["wave_id"]))
@@ -3378,6 +3469,60 @@ def transfer_queue(session: Session = Depends(get_session)) -> dict:
         ).group_by(TransferQueueItem.priority_band)
     ))
     lane_totals["priority_bands"] = {str(band): int(count or 0) for band, count in priority_rows}
+    # A handoff is a durable reservation, not merely a transient event. Show
+    # it in the read model so operators can distinguish "critical work is
+    # waiting" from "critical work already owns the next safe Raiju slot".
+    lane_totals["handoff_reservations"] = int(session.scalar(
+        select(func.count(TransferQueueItem.id)).where(
+            TransferQueueItem.state == TransferQueueState.LEASED,
+            TransferQueueItem.preemption_successor_item_id.is_not(None),
+        )
+    ) or 0)
+    # The queue screen must explain what Raikou will do next without causing
+    # another AWS call.  This is a read of the durable lane after the most
+    # recent priority refresh performed by governance/dispatch.
+    next_item = session.scalar(
+        select(TransferQueueItem)
+        .join(Wave, Wave.id == TransferQueueItem.wave_id)
+        .join(Source, Source.id == TransferQueueItem.source_id)
+        .where(
+            TransferQueueItem.state.in_([
+                TransferQueueState.READY,
+                TransferQueueState.RETRY_WAIT,
+                TransferQueueState.MULTIPART_RESUME,
+            ]),
+            or_(TransferQueueItem.retry_at.is_(None), TransferQueueItem.retry_at <= now),
+            Wave.status != "PAUSED",
+            Source.archived_at.is_(None),
+        )
+        .order_by(
+            TransferQueueItem.priority_score.desc(),
+            TransferQueueItem.restore_expires_at.is_(None),
+            TransferQueueItem.restore_expires_at,
+            TransferQueueItem.available_at,
+            TransferQueueItem.id,
+        )
+        .limit(1)
+    )
+    if next_item:
+        next_wave = session.get(Wave, next_item.wave_id)
+        next_source = session.get(Source, next_item.source_id)
+        lane_totals["next_decision"] = {
+            "state": "READY_FOR_DISPATCH",
+            "item_id": next_item.id,
+            "source_id": next_item.source_id,
+            "source_name": next_source.name if next_source else None,
+            "wave_id": next_item.wave_id,
+            "wave_name": next_wave.name if next_wave else None,
+            "priority_score": int(next_item.priority_score or 0),
+            "priority_band": next_item.priority_band,
+            "reason": next_item.decision_reason,
+            "size_bytes": int(next_item.size_bytes or 0),
+            "restore_expires_at": next_item.restore_expires_at,
+            "predicted_transfer_seconds": round(float(next_item.predicted_transfer_seconds or 0), 2),
+        }
+    else:
+        lane_totals["next_decision"] = {"state": "NO_ELIGIBLE_ITEM"}
     oldest_available_at = session.scalar(select(func.min(TransferQueueItem.available_at)).where(
         TransferQueueItem.state.in_([
         TransferQueueState.AVAILABLE, TransferQueueState.READY,
@@ -3668,6 +3813,21 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
             "phases": phases,
         })
+    # A continuous-transfer pipeline has one shared transfer lane. Keep the
+    # per-wave phases for restore observability, but also publish transfer
+    # windows as a first-class lane so the UI does not imply isolated slots.
+    # Wave identity remains on every segment for the hover explanation.
+    transfer_lane_phases: list[dict] = []
+    for board_wave in board_waves:
+        for phase_item in board_wave["phases"]:
+            if phase_item["kind"] != "TRANSFER":
+                continue
+            transfer_lane_phases.append({
+                **phase_item,
+                "wave_id": board_wave["wave_id"],
+                "wave_name": board_wave["wave_name"],
+            })
+    transfer_lane_phases.sort(key=lambda item: (item["start_at"], item["end_at"], item["wave_id"]))
     timeline_points = [point for wave in board_waves for phase_item in wave["phases"] for point in (phase_item["start_at"], phase_item["end_at"])]
     # Once processing starts, the time origin is immutable: it is the first
     # observed AWS restore submission for this source/run.  It must not drift
@@ -3678,7 +3838,9 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         if wave["started_at"] is not None
     ]
     timeline_start = min(submitted_points) if submitted_points else (min(timeline_points) if timeline_points else now)
-    return {"waves": board_waves, "generated_at": now, "source_id": source_id,
+    return {"waves": board_waves,
+            "transfer_lane": {"enabled": True, "phases": transfer_lane_phases},
+            "generated_at": now, "source_id": source_id,
             "source_name": source_name,
             "timeline_start_at": timeline_start,
             "timeline_end_at": max(timeline_points) if timeline_points else now + timedelta(hours=1),

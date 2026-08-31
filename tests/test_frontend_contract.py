@@ -281,6 +281,10 @@ def test_continuous_lane_queue_exposes_priority_and_idle_diagnosis():
     assert "priority_bands" in page
     assert "oldest_wait_seconds" in page
     assert "idle_diagnosis" in page
+    assert "next_decision" in page
+    assert "Próxima decisão Raikou:" in page
+    assert "handoff_reservations" in page
+    assert "handoff(s) crítico(s) reservado(s)" in page
     assert "Prioridades:" in page
 
 
@@ -542,6 +546,9 @@ def test_flight_board_modal_has_only_one_vertical_scroll_container():
     assert "#flight-board-modal .modal-panel{display:flex;flex-direction:column" in page
     assert "max-height:calc(100vh - 2rem);overflow:hidden" in page
     assert "#flight-board-content{min-height:0;max-height:none;overflow-y:auto;overflow-x:hidden}" in page
+    assert "Lane contínua de transferência" in page
+    assert "flight-board-transfer-lane" in page
+    assert "filter(phase=>phase.kind!=='TRANSFER')" in page
 
 
 def test_refresh_restores_the_current_view_and_selected_source_without_duplicate_loads():
