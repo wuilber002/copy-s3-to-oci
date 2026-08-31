@@ -6078,15 +6078,25 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
                 Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
             ).limit(1)) is not None
             # Once a simulated wave begins, its virtual timestamp is the
-            # authoritative lane position.  Planned timestamps are merely
-            # forecasts and must not pull it backward.
-            lane_start = observed_virtual_start or planned_start
-            if (wave.status == "RESTORE_SCHEDULED" and not has_batch_task
-                    and observed_virtual_start is None):
+            # authoritative lane position.  For a submitted restore that has
+            # not produced an object yet, the only defensible transfer floor
+            # is its real request plus the tier service window.  A stale plan
+            # must never push that work out by days.
+            if observed_virtual_start:
+                lane_start = observed_virtual_start
+            elif wave.first_restore_available_virtual_at:
+                lane_start = wave.first_restore_available_virtual_at
+            elif wave.restore_requested_virtual_at:
+                lane_start = wave.restore_requested_virtual_at + timedelta(
+                    seconds=restore_service_window_seconds(wave.restore_tier)
+                )
+            elif wave.status == "RESTORE_SCHEDULED" and not has_batch_task:
                 # An unsubmitted horizon entry is intentionally mutable. Its
                 # former calendar slot is an output of this planner, never an
                 # input that can keep the rest of the lane stranded.
                 lane_start = scheduler_now
+            else:
+                lane_start = planned_start
             # A submitted restore is immutable evidence.  A merely planned
             # restore is not: preserving it as a floor recursively pins every
             # later wave in the old calendar (the root cause of distant 48h

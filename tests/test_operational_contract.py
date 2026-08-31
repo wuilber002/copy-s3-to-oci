@@ -1036,6 +1036,29 @@ def test_dynamic_replan_does_not_pin_unsubmitted_wave_to_an_old_calendar_slot():
         assert future.planned_restore_at == initial
 
 
+def test_dynamic_replan_anchors_submitted_restore_to_its_actual_service_window():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    initial = datetime(2026, 8, 25, 12, 0)
+    with Session() as session:
+        source = Source(id=990, name="submitted-calendar", s3_bucket="source", aws_region="us-east-1",
+                        destination_bucket="destination", backend_kind="SIMULATED", simulation_fidelity="CONTROL")
+        settings = RuntimeSettings(id=1, max_throughput_mbps=1100)
+        run = DynamicPipelineRun(id=991, source_id=source.id, status="SCHEDULED", scheduled_restores=True,
+                                 restore_safety_seconds=0)
+        restoring = Wave(id=992, source_id=source.id, pipeline_run_id=run.id, name="restoring", max_bytes=1,
+                         restore_days=1, restore_tier="BULK", status="RESTORING", planner_mode="DYNAMIC",
+                         predicted_transfer_seconds=60, planned_restore_at=initial + timedelta(days=8),
+                         planned_transfer_start_at=initial + timedelta(days=10),
+                         restore_requested_virtual_at=initial)
+        session.add_all([source, settings, run, restoring]); session.flush()
+        session.add(Task(wave_id=restoring.id, kind="SUBMIT_BATCH_RESTORE", state=TaskState.SUCCEEDED))
+        session.flush()
+        assert replan_dynamic_pipeline(session, settings, now=initial) == 1
+        assert restoring.planned_transfer_start_at == initial + timedelta(hours=48)
+
+
 def test_connection_api_limits_are_durable_and_used_by_workers():
     source = Path("app/main.py").read_text(encoding="utf-8")
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")
