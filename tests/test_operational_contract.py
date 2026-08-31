@@ -1010,6 +1010,32 @@ def test_dynamic_replan_uses_control_mode_logical_elapsed_time():
         assert "simulated logical transfer duration" in event.message
 
 
+def test_dynamic_replan_does_not_pin_unsubmitted_wave_to_an_old_calendar_slot():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    initial = datetime(2026, 8, 25, 12, 0)
+    with Session() as session:
+        source = Source(id=980, name="mutable-calendar", s3_bucket="source", aws_region="us-east-1",
+                        destination_bucket="destination", backend_kind="SIMULATED", simulation_fidelity="CONTROL")
+        settings = RuntimeSettings(id=1, max_throughput_mbps=1100)
+        run = DynamicPipelineRun(id=981, source_id=source.id, status="SCHEDULED", scheduled_restores=True,
+                                 restore_safety_seconds=0)
+        completed = Wave(id=982, source_id=source.id, pipeline_run_id=run.id, name="done", max_bytes=1,
+                         restore_days=1, restore_tier="BULK", status="COMPLETED", planner_mode="DYNAMIC",
+                         predicted_transfer_seconds=300, planned_transfer_start_at=initial,
+                         transfer_started_virtual_at=initial,
+                         transfer_completed_virtual_at=initial + timedelta(seconds=300))
+        future = Wave(id=983, source_id=source.id, pipeline_run_id=run.id, name="mutable", max_bytes=1,
+                      restore_days=1, restore_tier="BULK", status="RESTORE_SCHEDULED", planner_mode="DYNAMIC",
+                      predicted_transfer_seconds=60, planned_restore_at=initial + timedelta(days=20),
+                      planned_transfer_start_at=initial + timedelta(days=22))
+        session.add_all([source, settings, run, completed, future]); session.flush()
+        assert replan_dynamic_pipeline(session, settings, now=initial) == 1
+        assert future.planned_transfer_start_at == initial + timedelta(seconds=300)
+        assert future.planned_restore_at == initial
+
+
 def test_connection_api_limits_are_durable_and_used_by_workers():
     source = Path("app/main.py").read_text(encoding="utf-8")
     worker = Path("app/real_worker.py").read_text(encoding="utf-8")

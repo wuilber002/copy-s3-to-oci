@@ -3794,10 +3794,10 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             completed = board_timestamp(segment.completed_at)
             if completed and completed > start:
                 end = completed
-            elif terminal_at and terminal_at > start:
+            elif terminal_at is not None:
                 # Older CONTROL runs recorded a zero-width segment for every
                 # object while preserving the wave's virtual completion.
-                end = terminal_at
+                end = max(start + timedelta(seconds=1), terminal_at)
             elif logical_elapsed > 0:
                 end = start + timedelta(seconds=logical_elapsed)
             elif completed is None and effective_now > start:
@@ -5994,8 +5994,8 @@ def observed_transfer_lane_window(session: Session, wave: Wave) -> tuple[datetim
         starts.append(started_at)
         if completed_at and completed_at > started_at:
             ends.append(completed_at)
-        elif wave.transfer_completed_virtual_at and wave.transfer_completed_virtual_at > started_at:
-            ends.append(wave.transfer_completed_virtual_at)
+        elif wave.transfer_completed_virtual_at is not None:
+            ends.append(max(started_at, wave.transfer_completed_virtual_at))
         elif float(logical_elapsed or 0) > 0:
             ends.append(started_at + timedelta(seconds=float(logical_elapsed)))
         else:
@@ -6074,13 +6074,26 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             elif actual_start and actual_end and actual_end >= actual_start:
                 duration_seconds = max(1, int((actual_end - actual_start).total_seconds()))
                 observed_basis = "observed transfer timestamps"
+            has_batch_task = session.scalar(select(Task.id).where(
+                Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
+            ).limit(1)) is not None
             # Once a simulated wave begins, its virtual timestamp is the
             # authoritative lane position.  Planned timestamps are merely
             # forecasts and must not pull it backward.
             lane_start = observed_virtual_start or planned_start
-            # A planned transfer is never allowed to precede the known or
-            # planned restore request. This is a hard chronology invariant.
-            restore_floor = wave.restore_requested_virtual_at or wave.planned_restore_at
+            if (wave.status == "RESTORE_SCHEDULED" and not has_batch_task
+                    and observed_virtual_start is None):
+                # An unsubmitted horizon entry is intentionally mutable. Its
+                # former calendar slot is an output of this planner, never an
+                # input that can keep the rest of the lane stranded.
+                lane_start = scheduler_now
+            # A submitted restore is immutable evidence.  A merely planned
+            # restore is not: preserving it as a floor recursively pins every
+            # later wave in the old calendar (the root cause of distant 48h
+            # forecasts such as wave #68).
+            restore_floor = wave.restore_requested_virtual_at
+            if restore_floor is None and has_batch_task:
+                restore_floor = wave.planned_restore_at
             if restore_floor:
                 lane_start = max(lane_start, restore_floor)
             constrained_by_prior_wave = bool(cursor and cursor > lane_start)
@@ -6095,9 +6108,6 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             else:
                 cursor = start + timedelta(seconds=duration_seconds)
             cursor_basis = observed_basis
-            has_batch_task = session.scalar(select(Task.id).where(
-                Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
-            ).limit(1)) is not None
             # A transfer forecast can safely be fixed even after its restore
             # was submitted. The restore timestamp itself is immutable once a
             # Batch task exists because changing it would falsify evidence.
