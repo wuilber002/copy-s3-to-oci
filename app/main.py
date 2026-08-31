@@ -49,6 +49,9 @@ RAIJU_MIN_WORKERS = 5
 TRANSFER_LANE_ADMISSION_PAGE_SIZE = 1_000
 TRANSFER_LANE_PRIORITY_REFRESH_PAGE_SIZE = 1_000
 TRANSFER_LANE_CLAIM_CANDIDATE_PAGE_SIZE = 256
+# Changing lane accounting changes only mutable forecasts.  Submitted restore
+# requests and observed transfer evidence remain immutable.
+CONTINUOUS_LANE_FORECAST_VERSION = "v8-lane-capacity"
 
 
 def utcnow() -> datetime:
@@ -6119,13 +6122,16 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
         scheduler_now = now or source_scheduler_clock(run.source).effective_now
         run_changed = False
         latest_profiles = transfer_history_profiles(session, run.source_id, settings.multipart_part_size_mib)
+        lane_profile = continuous_lane_capacity_profile(session, run.source_id, settings.max_throughput_mbps)
         latest_samples = sum(value["samples"] for value in latest_profiles.values())
         # A new completed transfer gives the packing model new evidence. Only
         # then recompose unsubmitted waves; routine scheduler cycles merely
         # adjust their times and do not churn object assignments.
-        if latest_samples != int(run.historical_samples or 0):
+        forecast_model_changed = run.planner_version != CONTINUOUS_LANE_FORECAST_VERSION
+        if latest_samples != int(run.historical_samples or 0) or forecast_model_changed:
             repacked = repackage_unsubmitted_dynamic_waves(session, settings, run, scheduler_now)
             run.historical_samples = latest_samples
+            run.planner_version = CONTINUOUS_LANE_FORECAST_VERSION
             changed += repacked
             run_changed = bool(repacked)
         # Pipeline sequence is the materialization order. Ordering by an old
@@ -6169,6 +6175,29 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             elif actual_start and actual_end and actual_end >= actual_start:
                 duration_seconds = max(1, int((actual_end - actual_start).total_seconds()))
                 observed_basis = "observed transfer timestamps"
+            elif not observed_virtual_start and not actual_start:
+                # A restore submission is immutable, but its future delivery
+                # estimate is not.  Reforecast it from the aggregate lane
+                # contract so a former per-object/worker model cannot keep
+                # the remaining horizon stranded for days.
+                wave_bytes = int(session.scalar(select(func.coalesce(func.sum(ObjectRecord.size_bytes), 0)).where(
+                    ObjectRecord.wave_id == wave.id
+                )) or 0)
+                duration_seconds = max(1, math.ceil(predicted_continuous_lane_seconds(
+                    wave_bytes, 0, settings, lane_profile,
+                )))
+                if duration_seconds != int(wave.predicted_transfer_seconds or 0):
+                    prior_duration = int(wave.predicted_transfer_seconds or 0)
+                    wave.predicted_transfer_seconds = duration_seconds
+                    wave.prediction_samples = max(int(wave.prediction_samples or 0), int(lane_profile["samples"] or 0))
+                    run_changed = True
+                    record_event(
+                        session, "DYNAMIC_WAVE_REFORECAST",
+                        f"Wave '{wave.name}' transfer forecast {prior_duration}s -> {duration_seconds}s "
+                        f"from the {int(lane_profile['effective_mbps'])} Mbps continuous-lane contract",
+                        source_id=wave.source_id, wave_id=wave.id,
+                    )
+                observed_basis = "continuous lane capacity forecast"
             has_batch_task = session.scalar(select(Task.id).where(
                 Task.wave_id == wave.id, Task.kind == "SUBMIT_BATCH_RESTORE"
             ).limit(1)) is not None
