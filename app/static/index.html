@@ -642,6 +642,7 @@ refreshAll();
      Raiju actually starts their transfer. */
   function flightBoardTransferSchedule(w){
     const start=w.transfer_started_at;
+    if(!start&&w.transfer_queue_projected_start_at)return `<b>Fila pronta:</b> ${flightBoardDate(w.transfer_queue_projected_start_at)} → ${flightBoardDate(w.transfer_queue_projected_end_at)} <small class="hint">(previsto)</small>`;
     if(!start)return '<span class="hint">Aguardando objeto restaurado e admissão na lane contínua.</span>';
     return `<b>Início observado:</b> ${flightBoardDate(start)}<br>`+
       `<b>Concluída:</b> ${flightBoardDate(w.transfer_completed_at)}`;
@@ -652,7 +653,7 @@ refreshAll();
     const start=new Date(d.timeline_start_at).getTime();
     const end=Math.max(start+1,new Date(d.timeline_end_at).getTime());
     const transferPhases=d.transfer_lane?.phases||[];
-    const transferLane=`<div class="flight-board-row flight-board-transfer-lane"><div class="flight-board-label" title="Registra somente transferências efetivamente iniciadas por um Raiju; previsões de wave não são desenhadas nesta lane.">Lane contínua de transferência</div><div class="flight-board-track">${transferPhases.map(phase=>flightBoardBar(phase,start,end)).join('')}</div></div>${transferPhases.length?'':'<p class="hint flight-board-empty">Nenhuma transferência observada nesta source ainda.</p>'}`;
+    const transferLane=`<div class="flight-board-row flight-board-transfer-lane"><div class="flight-board-label" title="Barras sólidas são períodos observados, consolidados a partir dos segmentos persistidos da lane. Barras listradas projetam somente objetos já restaurados e aguardando um Raiju; waves ainda em restore não reservam uma janela azul.">Lane contínua de transferência</div><div class="flight-board-track">${transferPhases.map(phase=>flightBoardBar(phase,start,end)).join('')}</div></div>${transferPhases.length?'':'<p class="hint flight-board-empty">Nenhuma transferência observada nem objeto pronto aguardando Raiju nesta source.</p>'}`;
     const chart=waves.map(w=>`<div class="flight-board-row flight-board-restore-row"><div class="flight-board-label" title="#${w.wave_id}: ${escape(w.wave_name)}">${identity(w)}</div><div class="flight-board-track">${(w.phases||[]).filter(phase=>phase.kind!=='TRANSFER').map(phase=>flightBoardBar(phase,start,end)).join('')}</div></div>`).join('');
     const rows=waves.map(w=>`<tr><td>${identity(w)}</td><td><span class="queue-state">${escape(w.status)}</span></td><td><b>Início:</b> ${flightBoardDate(w.started_at)}${w.started_at?' (executado)':''}<br><b>Disponibilidade esperada:</b> ${flightBoardDate(w.expected_restore_available_at)}</td><td>${flightBoardTransferSchedule(w)}</td></tr>`).join('');
     $('#flight-board-title').textContent=title;
@@ -664,14 +665,14 @@ refreshAll();
       if(!flightBoardSourceId)return say('Não há source dinâmica na fila para exibir.',true);
       const d=await api(`/api/flight-board?source_id=${flightBoardSourceId}`);
       if(!(d.waves||[]).length)return say('Não há waves dinâmicas para exibir nesta source.',true);
-      renderFlightBoardModal(d,`Inventário de bordo — ${d.source_name||d.waves[0].source_name}`,'Linha do tempo prevista e observada das waves dinâmicas desta source. Barras listradas são previsões; barras sólidas representam trabalho iniciado ou observado.');
+      renderFlightBoardModal(d,`Inventário de bordo — ${d.source_name||d.waves[0].source_name}`,'A lane contínua consolida os períodos de transferência observados a partir dos segmentos persistidos. Barras azuis listradas projetam apenas o backlog já restaurado na fila aguardando Raiju; waves em restore não recebem previsão de transferência.');
     }catch(e){say(`Inventário de bordo: ${e.message}`,true)}
   };
   showPipelineHistoryFlightBoard=async function(runId){
     try{
       const d=await api(`/api/flight-board?run_id=${runId}`);
       if(!(d.waves||[]).length)return say('Não há waves registradas nesta execução.',true);
-      renderFlightBoardModal(d,`Histórico de bordo — execução #${runId}`,'Linha do tempo persistida desta execução do pipeline dinâmico. Barras listradas representam o plano; barras sólidas, as fases observadas.');
+      renderFlightBoardModal(d,`Histórico de bordo — execução #${runId}`,'Linha do tempo persistida desta execução. A lane consolida transferências observadas; seu trecho listrado, quando existir, é calculado exclusivamente da fila de objetos restaurados aguardando Raiju.');
     }catch(e){say(`Histórico de bordo: ${e.message}`,true)}
   };
 </script>

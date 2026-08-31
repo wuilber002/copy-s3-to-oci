@@ -3625,11 +3625,19 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
     latest_tasks: dict[int, Task] = {}
     for task in session.scalars(select(Task).where(Task.wave_id.in_(wave_ids)).order_by(Task.wave_id, Task.id.desc())):
         latest_tasks.setdefault(task.wave_id, task)
-    segments_by_wave: dict[int, list[TransferLaneSegment]] = {}
-    for segment in session.scalars(select(TransferLaneSegment).where(
-        TransferLaneSegment.wave_id.in_(wave_ids)
-    ).order_by(TransferLaneSegment.started_at, TransferLaneSegment.id)):
-        segments_by_wave.setdefault(segment.wave_id, []).append(segment)
+    # A segment is the durable transfer-lane evidence.  CONTROL simulations
+    # created before the lane recorded the logical elapsed duration can have a
+    # zero-width segment; the linked object still retains its measured logical
+    # duration, which lets this read model faithfully recover the interval.
+    segments_by_wave: dict[int, list[tuple[TransferLaneSegment, float]]] = {}
+    for segment, elapsed_seconds in session.execute(
+        select(TransferLaneSegment, ObjectRecord.transfer_elapsed_seconds)
+        .join(TransferQueueItem, TransferQueueItem.id == TransferLaneSegment.queue_item_id)
+        .outerjoin(ObjectRecord, ObjectRecord.id == TransferQueueItem.object_id)
+        .where(TransferLaneSegment.wave_id.in_(wave_ids))
+        .order_by(TransferLaneSegment.started_at, TransferLaneSegment.id)
+    ):
+        segments_by_wave.setdefault(segment.wave_id, []).append((segment, float(elapsed_seconds or 0)))
     # The board is an observability endpoint and must remain available while a
     # large simulation is busy.  In particular, do not perform one clock HTTP
     # call per wave: ``dict.setdefault`` evaluates its value argument before
@@ -3666,11 +3674,18 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             # live clock again once the simulator is responsive.
             source_clock_now[row_source.id] = persisted_now
 
+    def board_timestamp(value: datetime | None) -> datetime | None:
+        """SQLite test rows are naive; API timestamps are always UTC-aware."""
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+
     def phase(kind: str, start: datetime | None, end: datetime | None, *, planned: bool = False,
               expected_seconds: int | None = None, elapsed_seconds: int | None = None,
               bytes_transferred: int = 0, object_count: int = 0,
               entry_reason: str | None = None, exit_reason: str | None = None,
               nearest_expiry_at: datetime | None = None) -> dict | None:
+        start, end = board_timestamp(start), board_timestamp(end)
         if not start or not end or end <= start:
             return None
         return {
@@ -3737,18 +3752,6 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
         # wave plan.  Only the durable TransferLaneSegment records created at
         # actual dispatch time are allowed to draw transfer activity.
         planned_transfer_at = wave.planned_transfer_start_at
-        observed_segments = segments_by_wave.get(wave.id, [])
-        if observed_segments:
-            for segment in observed_segments:
-                end = segment.completed_at or effective_now
-                item_phase = phase("TRANSFER", segment.started_at, end,
-                                   expected_seconds=max(1, int((end - segment.started_at).total_seconds())),
-                                   bytes_transferred=int(segment.bytes_transferred or 0),
-                                   object_count=int(segment.object_count or 1),
-                                   entry_reason=segment.entry_reason, exit_reason=segment.exit_reason,
-                                   nearest_expiry_at=segment.nearest_expiry_at)
-                if item_phase:
-                    phases.append(item_phase)
         status = wave.status
         if transfer_started_at and not transfer_completed_at:
             status = "TRANSFERRING"
@@ -3774,21 +3777,130 @@ def flight_board(source_id: int | None = Query(default=None, ge=1),
             "predicted_transfer_seconds": int(wave.predicted_transfer_seconds or 0),
             "phases": phases,
         })
-    # A continuous-transfer pipeline has one shared transfer lane. Keep the
-    # per-wave phases for restore observability, but also publish transfer
-    # windows as a first-class lane so the UI does not imply isolated slots.
-    # Wave identity remains on every segment for the hover explanation.
-    transfer_lane_phases: list[dict] = []
-    for board_wave in board_waves:
-        for phase_item in board_wave["phases"]:
-            if phase_item["kind"] != "TRANSFER":
-                continue
-            transfer_lane_phases.append({
-                **phase_item,
-                "wave_id": board_wave["wave_id"],
-                "wave_name": board_wave["wave_name"],
+    # A continuous-transfer pipeline has one shared transfer lane.  Collapse
+    # object records into the union of their durable intervals: rendering tens
+    # of thousands of tiny object bars hides the period the lane was actually
+    # busy and makes the browser unusable.  The union keeps exact persisted
+    # boundaries, byte/object totals and all participating wave identities.
+    wave_by_id = {wave.id: wave for wave, _source in rows}
+    board_by_id = {wave["wave_id"]: wave for wave in board_waves}
+    observed_intervals: list[dict] = []
+    for wave_id, entries in segments_by_wave.items():
+        board_wave = board_by_id[wave_id]
+        terminal_at = board_timestamp(board_wave.get("transfer_completed_at"))
+        effective_now = board_timestamp(source_clock_now.get(wave_by_id[wave_id].source_id, now))
+        for segment, logical_elapsed in entries:
+            start = board_timestamp(segment.started_at)
+            completed = board_timestamp(segment.completed_at)
+            if completed and completed > start:
+                end = completed
+            elif terminal_at and terminal_at > start:
+                # Older CONTROL runs recorded a zero-width segment for every
+                # object while preserving the wave's virtual completion.
+                end = terminal_at
+            elif logical_elapsed > 0:
+                end = start + timedelta(seconds=logical_elapsed)
+            elif completed is None and effective_now > start:
+                end = effective_now
+            else:
+                # Keep a durable instantaneous event visible without claiming
+                # that it occupied an unrecorded interval.
+                end = start + timedelta(seconds=1)
+            observed_intervals.append({
+                "start_at": start, "end_at": end, "wave_ids": {wave_id},
+                "bytes_transferred": int(segment.bytes_transferred or 0),
+                "object_count": int(segment.object_count or 1),
+                "nearest_expiry_at": segment.nearest_expiry_at,
+                "segment_count": 1,
             })
-    transfer_lane_phases.sort(key=lambda item: (item["start_at"], item["end_at"], item["wave_id"]))
+
+    observed_intervals.sort(key=lambda item: (item["start_at"], item["end_at"]))
+    merged_observed: list[dict] = []
+    for interval in observed_intervals:
+        if merged_observed and interval["start_at"] <= merged_observed[-1]["end_at"]:
+            current = merged_observed[-1]
+            current["end_at"] = max(current["end_at"], interval["end_at"])
+            current["wave_ids"].update(interval["wave_ids"])
+            current["bytes_transferred"] += interval["bytes_transferred"]
+            current["object_count"] += interval["object_count"]
+            current["segment_count"] += interval["segment_count"]
+            expiry = interval["nearest_expiry_at"]
+            if expiry and (current["nearest_expiry_at"] is None or expiry < current["nearest_expiry_at"]):
+                current["nearest_expiry_at"] = expiry
+        else:
+            merged_observed.append(interval)
+
+    transfer_lane_phases: list[dict] = []
+    for interval in merged_observed:
+        involved = sorted(interval["wave_ids"])
+        labels = [f"#{wave_id}: {board_by_id[wave_id]['wave_name']}" for wave_id in involved]
+        transfer_lane_phases.append({
+            "kind": "TRANSFER", "start_at": interval["start_at"], "end_at": interval["end_at"],
+            "planned": False,
+            "expected_seconds": max(1, int((interval["end_at"] - interval["start_at"]).total_seconds())),
+            "elapsed_seconds": max(1, int((interval["end_at"] - interval["start_at"]).total_seconds())),
+            "bytes_transferred": interval["bytes_transferred"], "object_count": interval["object_count"],
+            "wave_id": involved[0] if len(involved) == 1 else None,
+            "wave_name": board_by_id[involved[0]]["wave_name"] if len(involved) == 1 else None,
+            "entry_reason": f"{interval['segment_count']} segmento(s) observados na lane; " + ", ".join(labels),
+                "exit_reason": "janela observada consolidada",
+            "nearest_expiry_at": interval["nearest_expiry_at"],
+        })
+
+    # Predictions on the lane are deliberately restricted to work already
+    # available in the durable queue.  A restoring wave does not reserve a
+    # blue window: only a ready object can form a queued-lane projection.
+    eligible_states = [
+        TransferQueueState.AVAILABLE, TransferQueueState.READY,
+        TransferQueueState.MULTIPART_RESUME,
+    ]
+    queued_items = list(session.scalars(
+        select(TransferQueueItem).where(
+            TransferQueueItem.wave_id.in_(wave_ids),
+            or_(
+                TransferQueueItem.state.in_(eligible_states),
+                and_(TransferQueueItem.state == TransferQueueState.RETRY_WAIT,
+                     or_(TransferQueueItem.retry_at.is_(None), TransferQueueItem.retry_at <= now)),
+            ),
+        ).order_by(
+            TransferQueueItem.priority_score.desc(),
+            TransferQueueItem.restore_expires_at.is_(None),
+            TransferQueueItem.restore_expires_at,
+            TransferQueueItem.available_at, TransferQueueItem.id,
+        )
+    ))
+    projection_by_wave: dict[int, dict] = {}
+    settings = runtime_settings(session)
+    if queued_items:
+        source_nows = [board_timestamp(source_clock_now.get(wave_by_id[item.wave_id].source_id, now)) for item in queued_items]
+        cursor = max(source_nows)
+        rate_bps = max(1.0, float(settings.max_throughput_mbps) * 1_000_000 / 8)
+        for item in queued_items:
+            seconds = max(1, math.ceil(int(item.size_bytes or 0) / rate_bps))
+            start, end = cursor, cursor + timedelta(seconds=seconds)
+            cursor = end
+            prior = projection_by_wave.get(item.wave_id)
+            if prior is None:
+                prior = projection_by_wave[item.wave_id] = {
+                    "kind": "TRANSFER", "start_at": start, "end_at": end, "planned": True,
+                    "expected_seconds": seconds, "elapsed_seconds": 0,
+                    "bytes_transferred": int(item.size_bytes or 0), "object_count": 1,
+                    "wave_id": item.wave_id, "wave_name": board_by_id[item.wave_id]["wave_name"],
+                    "entry_reason": "projeção da fila pronta aguardando Raiju",
+                    "exit_reason": None, "nearest_expiry_at": item.restore_expires_at,
+                }
+            else:
+                prior["end_at"] = end
+                prior["expected_seconds"] += seconds
+                prior["bytes_transferred"] += int(item.size_bytes or 0)
+                prior["object_count"] += 1
+                if item.restore_expires_at and (prior["nearest_expiry_at"] is None or item.restore_expires_at < prior["nearest_expiry_at"]):
+                    prior["nearest_expiry_at"] = item.restore_expires_at
+        for wave_id, projection in projection_by_wave.items():
+            board_by_id[wave_id]["transfer_queue_projected_start_at"] = projection["start_at"]
+            board_by_id[wave_id]["transfer_queue_projected_end_at"] = projection["end_at"]
+            transfer_lane_phases.append(projection)
+    transfer_lane_phases.sort(key=lambda item: (item["start_at"], item["end_at"], bool(item["planned"])))
     timeline_points = [point for wave in board_waves for phase_item in wave["phases"] for point in (phase_item["start_at"], phase_item["end_at"])]
     # Once processing starts, the time origin is immutable: it is the first
     # observed AWS restore submission for this source/run.  It must not drift
@@ -5857,6 +5969,40 @@ def repackage_unsubmitted_dynamic_waves(session: Session, settings: RuntimeSetti
     return changed
 
 
+def observed_transfer_lane_window(session: Session, wave: Wave) -> tuple[datetime | None, datetime | None]:
+    """Return the measured shared-lane window for one wave.
+
+    The lane is the operational clock for a continuous pipeline.  Summing
+    per-object durations and dividing by a fixed worker floor is not a lane
+    measurement: it can turn one saturated link hour into many days whenever
+    Raikou scales above the minimum worker count.  Older CONTROL records with
+    zero-width object segments are recovered from the durable virtual wave
+    completion or the logical object duration.
+    """
+    rows = list(session.execute(
+        select(TransferLaneSegment.started_at, TransferLaneSegment.completed_at,
+               ObjectRecord.transfer_elapsed_seconds)
+        .join(TransferQueueItem, TransferQueueItem.id == TransferLaneSegment.queue_item_id)
+        .outerjoin(ObjectRecord, ObjectRecord.id == TransferQueueItem.object_id)
+        .where(TransferLaneSegment.wave_id == wave.id)
+    ))
+    if not rows:
+        return None, None
+    starts: list[datetime] = []
+    ends: list[datetime] = []
+    for started_at, completed_at, logical_elapsed in rows:
+        starts.append(started_at)
+        if completed_at and completed_at > started_at:
+            ends.append(completed_at)
+        elif wave.transfer_completed_virtual_at and wave.transfer_completed_virtual_at > started_at:
+            ends.append(wave.transfer_completed_virtual_at)
+        elif float(logical_elapsed or 0) > 0:
+            ends.append(started_at + timedelta(seconds=float(logical_elapsed)))
+        else:
+            ends.append(started_at)
+    return min(starts), max(ends)
+
+
 def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: datetime | None = None) -> int:
     """Adapt only unsubmitted dynamic waves to durable observed timings.
 
@@ -5905,25 +6051,23 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             simulated = wave.source.backend_kind == "SIMULATED"
             observed_virtual_start = wave.transfer_started_virtual_at if simulated else None
             observed_virtual_end = wave.transfer_completed_virtual_at if simulated else None
+            lane_observed_start, lane_observed_end = observed_transfer_lane_window(session, wave)
             duration_seconds = max(1, int(wave.predicted_transfer_seconds or 1))
             observed_basis = "prediction"
-            # CONTROL transfers intentionally complete in milliseconds of real
-            # time while returning the duration imposed by the virtual network.
-            # Convert per-object logical work to one transfer-lane wall time so
-            # degraded/oscillating profiles can move later restore windows.
-            if (
-                simulated
-                and wave.source.simulation_fidelity == "CONTROL"
-                and elapsed_sum
-            ):
+            if lane_observed_start and lane_observed_end and lane_observed_end >= lane_observed_start:
+                duration_seconds = max(1, int((lane_observed_end - lane_observed_start).total_seconds()))
+                observed_virtual_start, observed_virtual_end = lane_observed_start, lane_observed_end
+                observed_basis = "observed continuous lane segments"
+            # Compatibility only: older CONTROL evidence may predate the
+            # transfer-lane table entirely.  Once a lane segment exists the
+            # branch above is mandatory, because summing object work is not a
+            # measurement of a saturated, autoscaled shared lane.
+            elif simulated and wave.source.simulation_fidelity == "CONTROL" and elapsed_sum:
                 duration_seconds = max(
                     1,
-                    math.ceil(max(
-                        float(elapsed_max or 0),
-                        float(elapsed_sum) / RAIJU_MIN_WORKERS,
-                    )),
+                    math.ceil(max(float(elapsed_max or 0), float(elapsed_sum) / RAIJU_MIN_WORKERS)),
                 )
-                observed_basis = "simulated logical transfer duration"
+                observed_basis = "legacy simulated logical transfer duration"
             elif observed_virtual_start and observed_virtual_end and observed_virtual_end >= observed_virtual_start:
                 duration_seconds = max(1, int((observed_virtual_end - observed_virtual_start).total_seconds()))
                 observed_basis = "observed simulated virtual milestones"
@@ -5944,7 +6088,7 @@ def replan_dynamic_pipeline(session: Session, settings: RuntimeSettings, now: da
             start = max(lane_start, cursor) if cursor else lane_start
             if observed_virtual_end:
                 cursor = max(start, observed_virtual_end)
-            elif observed_basis == "simulated logical transfer duration" and actual_end:
+            elif observed_basis == "legacy simulated logical transfer duration" and actual_end:
                 cursor = start + timedelta(seconds=duration_seconds)
             elif actual_end:
                 cursor = max(start, actual_end)

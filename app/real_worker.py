@@ -2840,7 +2840,16 @@ def transfer_continuous(session, task: Task, settings) -> None:
             item.lease_expires_at = None
             segment = segments.get(item_id)
             if segment:
-                segment.completed_at = _continuous_source_now(source)
+                # CONTROL transfer calls return a logical duration while the
+                # worker itself completes in milliseconds.  Persist that
+                # duration on the lane segment instead of writing a zero-width
+                # interval; the board and adaptive scheduler must see the
+                # period the Raiju actually occupied in the virtual world.
+                logical_elapsed = float(obj.transfer_elapsed_seconds or 0) if obj else 0
+                if runtime_context.is_simulation and logical_elapsed > 0:
+                    segment.completed_at = segment.started_at + timedelta(seconds=logical_elapsed)
+                else:
+                    segment.completed_at = _continuous_source_now(source)
                 segment.bytes_transferred = int(obj.size_bytes if error is None and obj else 0)
             if error is None and obj and obj.state == ObjectState.TRANSFERRED:
                 item.state, item.transferred_at = TransferQueueState.TRANSFERRED, utcnow()

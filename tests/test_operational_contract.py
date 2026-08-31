@@ -754,7 +754,8 @@ def test_flight_board_continuous_lane_uses_only_observed_transfer_segments():
         session.add_all([observed, planned_only]); session.flush()
         obj = ObjectRecord(source_id=source.id, wave_id=observed.id, object_key="observed.bin", size_bytes=1024, state=ObjectState.TRANSFERRING)
         session.add(obj); session.flush()
-        item = TransferQueueItem(source_id=source.id, wave_id=observed.id, object_id=obj.id, size_bytes=1024)
+        item = TransferQueueItem(source_id=source.id, wave_id=observed.id, object_id=obj.id,
+                                 size_bytes=1024, state=TransferQueueState.TRANSFERRED)
         session.add(item); session.flush()
         segment = TransferLaneSegment(
             source_id=source.id, wave_id=observed.id, queue_item_id=item.id,
@@ -771,6 +772,49 @@ def test_flight_board_continuous_lane_uses_only_observed_transfer_segments():
         assert lane[0]["planned"] is False
         by_name = {wave["wave_name"]: wave for wave in board["waves"]}
         assert not [phase for phase in by_name["planned-only"]["phases"] if phase["kind"] == "TRANSFER"]
+
+
+def test_flight_board_projects_only_durable_ready_backlog_and_recovers_zero_width_segments():
+    engine = create_engine("sqlite+pysqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    with Session() as session:
+        session.add(RuntimeSettings(max_throughput_mbps=1000)); session.flush()
+        source = Source(name="lane-backlog", s3_bucket="source", aws_region="us-east-1", destination_bucket="destination")
+        session.add(source); session.flush()
+        completed = Wave(source_id=source.id, name="completed", max_bytes=1024, restore_days=1,
+                         restore_tier="BULK", planner_mode="DYNAMIC", status="COMPLETED",
+                         transfer_started_virtual_at=now - timedelta(minutes=10),
+                         transfer_completed_virtual_at=now - timedelta(minutes=5))
+        ready = Wave(source_id=source.id, name="ready", max_bytes=1024, restore_days=1,
+                     restore_tier="BULK", planner_mode="DYNAMIC", status="RESTORED")
+        session.add_all([completed, ready]); session.flush()
+        transferred_object = ObjectRecord(source_id=source.id, wave_id=completed.id, object_key="done", size_bytes=1000,
+                                          state=ObjectState.TRANSFERRED, transfer_elapsed_seconds=20,
+                                          transferred_at=now - timedelta(minutes=5))
+        ready_object = ObjectRecord(source_id=source.id, wave_id=ready.id, object_key="next", size_bytes=125_000_000,
+                                    state=ObjectState.RESTORED)
+        session.add_all([transferred_object, ready_object]); session.flush()
+        transferred_item = TransferQueueItem(source_id=source.id, wave_id=completed.id, object_id=transferred_object.id,
+                                             size_bytes=1000, state=TransferQueueState.TRANSFERRED)
+        ready_item = TransferQueueItem(source_id=source.id, wave_id=ready.id, object_id=ready_object.id,
+                                       size_bytes=125_000_000, state=TransferQueueState.READY)
+        session.add_all([transferred_item, ready_item]); session.flush()
+        session.add(TransferLaneSegment(source_id=source.id, wave_id=completed.id, queue_item_id=transferred_item.id,
+                                        started_at=now - timedelta(minutes=10), completed_at=now - timedelta(minutes=10),
+                                        bytes_transferred=1000))
+        session.commit()
+
+        board = flight_board(source_id=source.id, run_id=None, session=session)
+        phases = board["transfer_lane"]["phases"]
+        observed = next(item for item in phases if not item["planned"])
+        projected = next(item for item in phases if item["planned"])
+        assert observed["start_at"] == now - timedelta(minutes=10)
+        assert observed["end_at"] == now - timedelta(minutes=5)
+        assert projected["wave_name"] == "ready"
+        assert projected["bytes_transferred"] == 125_000_000
+        assert board["waves"][1]["transfer_queue_projected_start_at"] == projected["start_at"]
 
 
 def test_simulation_clock_advances_only_through_durable_decisions():
