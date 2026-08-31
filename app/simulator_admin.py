@@ -58,6 +58,9 @@ class SimulatorAdminClient:
     def create_execution(self, scenario_id: str) -> dict:
         return self._request("POST", f"/v1/scenarios/{scenario_id}/executions", {})
 
+    def list_scenario_executions(self, scenario_id: str) -> list[dict]:
+        return self._request("GET", f"/v1/scenarios/{scenario_id}/executions")
+
     def get_execution(self, execution_id: str) -> dict:
         return self._request("GET", f"/v1/executions/{execution_id}")
 

@@ -314,6 +314,21 @@ def create_execution(scenario_id: str) -> dict:
         raise HTTPException(status_code=503, detail=str(error)) from error
 
 
+@app.get("/v1/scenarios/{scenario_id}/executions")
+def list_scenario_executions(scenario_id: str) -> list[dict]:
+    return [
+        {
+            "id": execution.id,
+            "scenario_id": execution.scenario_id,
+            "correlation_id": execution.correlation_id,
+            "state": execution.state,
+            "snapshot": json.loads(execution.immutable_snapshot_json),
+            "created_at": execution.created_at,
+        }
+        for execution in store().list_scenario_executions(scenario_id)
+    ]
+
+
 @app.get("/v1/executions/{execution_id}/clock")
 def execution_clock(execution_id: str) -> dict:
     try:

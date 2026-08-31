@@ -432,6 +432,16 @@ class SimulatorStore:
         with self.sessions() as session:
             return session.get(SimulationExecution, execution_id)
 
+    def list_scenario_executions(self, scenario_id: str) -> list[SimulationExecution]:
+        """List durable executions so Raijin can recover an interrupted bind."""
+        self.require_current_schema()
+        with self.sessions() as session:
+            return list(session.scalars(
+                select(SimulationExecution)
+                .where(SimulationExecution.scenario_id == scenario_id)
+                .order_by(SimulationExecution.created_at.desc())
+            ))
+
     def execution_report(self, execution_id: str) -> dict:
         """Return compact, durable simulator-side evidence for one execution."""
         self.require_current_schema()

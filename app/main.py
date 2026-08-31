@@ -195,6 +195,13 @@ class Source(Base):
     simulation_project_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     simulation_fidelity: Mapped[str | None] = mapped_column(String(16), nullable=True)
     destination_bucket: Mapped[str] = mapped_column(String(255))
+    # Compatibility only.  Transfer strategy now belongs to each wave or to
+    # the continuous pipeline, but older PostgreSQL deployments retain this
+    # non-null source column.  Keep it populated without exposing it again in
+    # the source UI or allowing it to influence scheduling.
+    legacy_transfer_strategy: Mapped[str] = mapped_column(
+        "transfer_strategy", String(32), default="AFTER_ALL_RESTORED"
+    )
     status: Mapped[str] = mapped_column(String(32), default="CONFIGURED")
     # A business ordering is intentionally only a tie-breaker.  Deadline risk
     # always wins, but an operator can make one source preferred when several
@@ -2486,6 +2493,65 @@ def update_simulation_template(template_id: str, payload: SimulationTemplateWrit
     )
 
 
+def recover_orphaned_simulation_sources(session: Session, admin: SimulatorAdminClient | None = None) -> int:
+    """Bind completed Fujin executions left behind by an interrupted source insert.
+
+    Fujin owns immutable scenario/catalog creation while Raijin owns the
+    operational source row.  A database schema or transient control-plane
+    failure between those two commits must be recoverable, not consume a
+    scenario name forever.  Only materialized executions without an existing
+    source are adopted; no cloud state is changed.
+    """
+    if not runtime_context.is_simulation:
+        return 0
+    admin = admin or SimulatorAdminClient(runtime_context.simulator_base_url)
+    existing_scenarios = set(session.scalars(select(Source.simulation_scenario_id).where(
+        Source.backend_kind == "SIMULATED", Source.simulation_scenario_id.is_not(None)
+    )))
+    existing_names = set(session.scalars(select(Source.name)))
+    recovered = 0
+    for scenario in admin.list_scenarios():
+        scenario_id = scenario["id"]
+        if scenario_id in existing_scenarios or scenario["name"] in existing_names:
+            continue
+        executions = admin.list_scenario_executions(scenario_id)
+        if not executions:
+            continue
+        execution = executions[0]
+        snapshot = execution.get("snapshot") or {}
+        materialization = (snapshot.get("configuration") or {}).get("_materialization") or {}
+        if not materialization:
+            continue
+        prefixes = normalize_source_prefixes(materialization.get("prefixes") or [])
+        source = Source(
+            name=scenario["name"],
+            s3_bucket=materialization["source_bucket"],
+            s3_prefix=prefixes[0],
+            aws_region=materialization["region"],
+            aws_bucket_region=materialization["region"],
+            destination_bucket=materialization["destination_bucket"],
+            backend_kind="SIMULATED",
+            simulation_scenario_id=scenario_id,
+            simulation_execution_id=execution["id"],
+            simulation_correlation_id=execution["correlation_id"],
+            simulation_tenant_id=str(uuid.uuid4()),
+            simulation_project_id=str(uuid.uuid4()),
+            simulation_fidelity=scenario["fidelity"],
+        )
+        session.add(source)
+        session.flush()
+        session.add_all(SourcePrefix(source_id=source.id, prefix=prefix) for prefix in prefixes)
+        record_event(session, "SIMULATED_SOURCE_RECOVERED",
+                     f"Recovered Raijin source for existing Fujin scenario '{source.name}' after interrupted binding.",
+                     source_id=source.id)
+        existing_scenarios.add(scenario_id)
+        existing_names.add(source.name)
+        recovered += 1
+    if recovered:
+        session.commit()
+    return recovered
+
+
 @app.post("/api/simulation/scenarios", status_code=201)
 def create_simulation_scenario(
     payload: SimulationScenarioBootstrap, session: Session = Depends(get_session)
@@ -2577,11 +2643,12 @@ def simulation_source_or_404(session: Session, source_id: int) -> Source:
 @app.get("/api/simulation/sources")
 def simulation_sources(session: Session = Depends(get_session)) -> list[dict]:
     require_simulation_mode()
+    admin = SimulatorAdminClient(runtime_context.simulator_base_url)
+    recover_orphaned_simulation_sources(session, admin)
     rows = list(session.scalars(select(Source).where(
         Source.backend_kind == "SIMULATED"
     ).order_by(Source.archived_at.is_not(None), Source.id.desc())))
     result = []
-    admin = SimulatorAdminClient(runtime_context.simulator_base_url)
     scenarios = {item["id"]: item for item in admin.list_scenarios()}
     for source in rows:
         objects, size = session.execute(select(
@@ -4334,6 +4401,10 @@ def delete_aws_connection(connection_id: int, session: Session = Depends(get_ses
 
 @app.get("/api/sources")
 def list_sources(session: Session = Depends(get_session)) -> list[dict]:
+    if runtime_context.is_simulation:
+        # Returning to Migration must show a source created in Fujin without
+        # requiring a full-browser reload, even if a prior bind was cut off.
+        recover_orphaned_simulation_sources(session)
     sources = list(session.scalars(select(Source).where(Source.archived_at.is_(None)).order_by(Source.id)))
     source_ids = [s.id for s in sources]
     wave_statuses: dict[int, set[str]] = {}
